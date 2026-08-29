@@ -80,18 +80,33 @@ fi
 WHO=$(gh api user --jq .login 2>/dev/null || echo '?')
 
 if ! gh repo view ospina-company/handbook --json name >/dev/null 2>&1; then
+  # "Not in the org" and "in the org but no handbook" need different asks.
+  if gh api "orgs/ospina-company/members/$WHO" >/dev/null 2>&1; then IN_ORG=1; else IN_ORG=0; fi
   say ""
   say "  ------------------------------------------------------------------"
   say "  You are signed in as: $WHO"
   say ""
-  say "  That account does not have access to Ospina's repositories yet."
-  say "  This is expected the first time. Two steps:"
-  say ""
-  say "    1. Send Carlos your GitHub username:  $WHO"
-  say "       (hi@ospinacompany.com)"
-  say ""
-  say "    2. He sends an invite. Accept it here:"
-  say "       https://github.com/orgs/ospina-company/invitation"
+  if [ "$IN_ORG" -eq 0 ]; then
+    say "  You are not a member of the ospina-company organization yet."
+    say "  This is expected on a first run. Two steps:"
+    say ""
+    say "    1. Send Carlos your GitHub username:  $WHO"
+    say "       (hi@ospinacompany.com)"
+    say ""
+    say "    2. He sends an invite. Accept it here:"
+    say "       https://github.com/orgs/ospina-company/invitation"
+  else
+    say "  You ARE in the ospina-company organization, but your team does not"
+    say "  have access to the 'handbook' repository. Setup cannot continue"
+    say "  without it: handbook holds the conventions, the agent skills and"
+    say "  this bootstrap itself."
+    say ""
+    say "  This is a blocker, not something you can work around."
+    say ""
+    say "  Ask Carlos to add 'handbook' with Read access to your team:"
+    say "    hi@ospinacompany.com"
+    say "    https://github.com/orgs/ospina-company/teams"
+  fi
   say ""
   say "  Then run this same command again and it will finish the setup."
   say "  ------------------------------------------------------------------"

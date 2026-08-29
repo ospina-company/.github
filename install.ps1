@@ -159,18 +159,36 @@ $who = (& gh api user --jq .login 2>$null)
 
 & gh repo view ospina-company/handbook --json name *> $null
 if ($LASTEXITCODE -ne 0) {
+  # Distinguish "not in the org" from "in the org, but the team is missing
+  # handbook". They need completely different things asked for.
+  & gh api "orgs/ospina-company/members/$who" *> $null
+  $inOrg = ($LASTEXITCODE -eq 0)
+
   Say ""
   Say "  ------------------------------------------------------------------"
   Say "  You are signed in as: $who"
   Say ""
-  Say "  That account does not have access to Ospina's repositories yet."
-  Say "  This is expected the first time. Two steps:"
-  Say ""
-  Say "    1. Send Carlos your GitHub username:  $who"
-  Say "       (hi@ospinacompany.com)"
-  Say ""
-  Say "    2. He sends an invite. Accept it here:"
-  Say "       https://github.com/orgs/ospina-company/invitation"
+  if (-not $inOrg) {
+    Say "  You are not a member of the ospina-company organization yet."
+    Say "  This is expected on a first run. Two steps:"
+    Say ""
+    Say "    1. Send Carlos your GitHub username:  $who"
+    Say "       (hi@ospinacompany.com)"
+    Say ""
+    Say "    2. He sends an invite. Accept it here:"
+    Say "       https://github.com/orgs/ospina-company/invitation"
+  } else {
+    Say "  You ARE in the ospina-company organization, but your team does not"
+    Say "  have access to the 'handbook' repository. Setup cannot continue"
+    Say "  without it: handbook holds the conventions, the agent skills and"
+    Say "  this bootstrap itself."
+    Say ""
+    Say "  This is a blocker, not something you can work around."
+    Say ""
+    Say "  Ask Carlos to add 'handbook' with Read access to your team:"
+    Say "    hi@ospinacompany.com"
+    Say "    https://github.com/orgs/ospina-company/teams"
+  }
   Say ""
   Say "  Then run this same command again and it will finish the setup:"
   Say "    irm https://raw.githubusercontent.com/ospina-company/.github/main/install.ps1 | iex"
