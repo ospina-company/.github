@@ -1,0 +1,88 @@
+name: Installer smoke test
+
+# This repo is public, so Actions minutes here are free and unlimited. That is
+# the only reason we can afford to test on a real Windows runner at all.
+on:
+  push:
+    paths: [ 'install.ps1', 'install.sh', '.github/workflows/installer-smoke.yml' ]
+  pull_request:
+    paths: [ 'install.ps1', 'install.sh' ]
+  workflow_dispatch:
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Parse install.ps1 with the real PowerShell parser
+        shell: powershell
+        run: |
+          $errors = $null
+          $null = [System.Management.Automation.Language.Parser]::ParseFile(
+                    "install.ps1", [ref]$null, [ref]$errors)
+          if ($errors.Count -gt 0) {
+            $errors | ForEach-Object { Write-Host "::error::$($_.Message) at line $($_.Extent.StartLineNumber)" }
+            exit 1
+          }
+          Write-Host "install.ps1 parses cleanly under PowerShell $($PSVersionTable.PSVersion)"
+
+      - name: PSScriptAnalyzer
+        shell: powershell
+        continue-on-error: true
+        run: |
+          Install-Module PSScriptAnalyzer -Force -Scope CurrentUser -ErrorAction SilentlyContinue
+          Invoke-ScriptAnalyzer -Path install.ps1 -Severity Error,Warning |
+            Format-Table -AutoSize | Out-String | Write-Host
+
+      - name: Helper functions behave on real Windows
+        shell: powershell
+        run: |
+          # Load the script's functions without running the installer body.
+          $src = Get-Content install.ps1 -Raw
+          $body = $src.Substring(0, $src.IndexOf('Say ""' + [Environment]::NewLine + 'Say "Ospina workspace setup"'))
+          Invoke-Expression $body
+
+          Refresh-Path
+          if (-not $env:Path) { Write-Host "::error::Refresh-Path produced an empty PATH"; exit 1 }
+          Write-Host "Refresh-Path ok"
+
+          $bash = Find-GitBash
+          if (-not $bash) { Write-Host "::error::Find-GitBash found nothing on a runner that has Git"; exit 1 }
+          Write-Host "Find-GitBash -> $bash"
+          & $bash -c "echo bash works: \$(uname -s)"
+
+      - name: Windows path conversion is correct
+        shell: powershell
+        run: |
+          foreach ($p in @('C:\Ospina\handbook','D:\Users\carlo\Repositories\handbook')) {
+            $drive = $p.Substring(0,1).ToLower()
+            $rest  = $p.Substring(2) -replace '\\','/'
+            $unix  = "/$drive$rest"
+            Write-Host "$p -> $unix"
+            if ($unix -notmatch '^/[a-z]/') { Write-Host "::error::bad conversion for $p"; exit 1 }
+          }
+
+      - name: bootstrap.sh Windows branch runs under Git Bash
+        shell: powershell
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $bash = Join-Path $env:ProgramFiles 'Git\bin\bash.exe'
+          git clone --depth 1 https://github.com/ospina-company/handbook.git "$env:RUNNER_TEMP\hb" 2>&1 | Out-Null
+          if (-not (Test-Path "$env:RUNNER_TEMP\hb\bootstrap.sh")) {
+            Write-Host "::notice::handbook is private and unreachable from this runner; skipping"
+            exit 0
+          }
+          $unix = "/" + ($env:RUNNER_TEMP.Substring(0,1).ToLower()) + ($env:RUNNER_TEMP.Substring(2) -replace '\\','/')
+          & $bash -lc "sh '$unix/hb/bootstrap.sh' --check --no-install --no-clone"
+
+  posix:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Shellcheck + POSIX syntax
+        run: |
+          bash -n install.sh && echo "install.sh parses"
+          sudo apt-get update -qq && sudo apt-get install -y shellcheck -qq
+          shellcheck -S warning install.sh || true

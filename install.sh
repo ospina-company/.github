@@ -53,13 +53,51 @@ step "GitHub sign-in"
 if gh auth status >/dev/null 2>&1; then
   say "  ok       signed in as $(gh api user --jq .login 2>/dev/null || echo '?')"
 else
+  say "  You need a GitHub account for this. It is free."
+  say ""
+  printf '  Do you already have a GitHub account? (y/n) '
+  read -r has </dev/tty || has=""
+  case "$has" in
+    [Yy]*) : ;;
+    *)
+      say ""
+      say "  Opening the GitHub signup page. Create the account, then come back"
+      say "  here and run this same command again."
+      (command -v open >/dev/null && open "https://github.com/signup") 2>/dev/null \
+        || (command -v xdg-open >/dev/null && xdg-open "https://github.com/signup") 2>/dev/null \
+        || say "  https://github.com/signup"
+      say ""
+      say "  Command to re-run:"
+      say "    /bin/bash -c \"\$(curl -fsSL https://raw.githubusercontent.com/ospina-company/.github/main/install.sh)\""
+      exit 0
+      ;;
+  esac
+  say ""
   say "  A browser window will open. Choose GitHub.com, then HTTPS."
-  gh auth login || die "GitHub sign-in did not complete."
+  gh auth login || die "GitHub sign-in did not complete. Run 'gh auth login' and try again."
 fi
 
-gh repo view ospina-company/handbook --json name >/dev/null 2>&1 \
-  || die "Your account cannot see ospina-company/handbook.
-  Ask Carlos to add you to the org and grant handbook access, then re-run."
+WHO=$(gh api user --jq .login 2>/dev/null || echo '?')
+
+if ! gh repo view ospina-company/handbook --json name >/dev/null 2>&1; then
+  say ""
+  say "  ------------------------------------------------------------------"
+  say "  You are signed in as: $WHO"
+  say ""
+  say "  That account does not have access to Ospina's repositories yet."
+  say "  This is expected the first time. Two steps:"
+  say ""
+  say "    1. Send Carlos your GitHub username:  $WHO"
+  say "       (hi@ospinacompany.com)"
+  say ""
+  say "    2. He sends an invite. Accept it here:"
+  say "       https://github.com/orgs/ospina-company/invitation"
+  say ""
+  say "  Then run this same command again and it will finish the setup."
+  say "  ------------------------------------------------------------------"
+  exit 0
+fi
+say "  ok       access to Ospina repositories confirmed"
 
 # ---------------------------------------------------------------- workspace
 step "Workspace location"
