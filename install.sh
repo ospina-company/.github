@@ -116,20 +116,61 @@ say "  ok       access to Ospina repositories confirmed"
 
 # ---------------------------------------------------------------- workspace
 step "Workspace location"
-DEFAULT_WS="$HOME/Ospina"
+
+# Offer places that already exist on this machine rather than inventing one.
 if [ -n "${OSPINA_WORKSPACE:-}" ]; then
   WS="$OSPINA_WORKSPACE"
   say "  using OSPINA_WORKSPACE=$WS"
 else
-  printf '  Where should the repositories live? [%s] ' "$DEFAULT_WS"
-  read -r reply </dev/tty || reply=""
-  WS="${reply:-$DEFAULT_WS}"
+  CANDS=""
+  add_cand() {
+    # Skip anything a sync client owns: git and sync both write .git.
+    case "$1" in
+      *iCloud*|*Dropbox*|*"Google Drive"*|*OneDrive*) return 0 ;;
+    esac
+    # macOS filesystems are case-insensitive, so ~/Projects and ~/projects are
+    # one directory that pwd will happily report under either name. Compare the
+    # inode, which is the only thing that actually settles it.
+    _id=$(ls -di "$(dirname "$1")" 2>/dev/null | awk '{print $1}')
+    for existing in $CANDS; do
+      _eid=$(ls -di "$(dirname "$existing")" 2>/dev/null | awk '{print $1}')
+      [ -n "$_id" ] && [ "$_eid" = "$_id" ] && return 0
+    done
+    CANDS="$CANDS $1"
+    N=$((N+1))
+    printf '    %d) %-44s %s\n' "$N" "$1" "$2"
+  }
+
+  say ""
+  say "  Where should the Ospina repositories live?"
+  say ""
+  N=0
+  for d in Software/Projects Projects projects Developer dev code repos git src; do
+    [ -d "$HOME/$d" ] && add_cand "$HOME/$d/Ospina" "inside your existing $d folder"
+  done
+  add_cand "$HOME/Ospina" "in your home folder (will be created)"
+  say "    $((N+1))) somewhere else, type a path"
+  say ""
+  printf '  Choice [1]: '
+  read -r pick </dev/tty || pick=""
+  [ -z "$pick" ] && pick=1
+
+  if [ "$pick" -eq "$pick" ] 2>/dev/null && [ "$pick" -ge 1 ] && [ "$pick" -le "$N" ]; then
+    i=0
+    for c in $CANDS; do i=$((i+1)); [ "$i" -eq "$pick" ] && WS="$c"; done
+  elif [ "$pick" -eq "$((N+1))" ] 2>/dev/null; then
+    printf '  Full path: '
+    read -r WS </dev/tty || WS=""
+    [ -z "$WS" ] && die "No path given."
+  else
+    WS="$pick"
+  fi
 fi
 WS="${WS/#\~/$HOME}"
 mkdir -p "$WS"
+WS=$(CDPATH= cd -- "$WS" && pwd)
 say "  workspace: $WS"
 
-# ----------------------------------------------------------------- handbook
 step "Handbook"
 if [ -d "$WS/handbook/.git" ]; then
   say "  ok       already cloned, updating"
@@ -142,4 +183,4 @@ fi
 # ---------------------------------------------------------------- handoff
 step "Running bootstrap"
 say ""
-exec sh "$WS/handbook/bootstrap.sh" "$@"
+exec sh "$WS/handbook/bootstrap.sh" --no-login "$@"

@@ -12,7 +12,13 @@ $ErrorActionPreference = 'Stop'
 
 function Say  ($m) { Write-Host $m }
 function Step ($m) { Write-Host ""; Write-Host "==> $m" -ForegroundColor Cyan }
-function Die  ($m) { Write-Host ""; Write-Host "ERROR: $m" -ForegroundColor Red; exit 1 }
+# Never call exit in this script. It is run with `irm ... | iex`, which
+# evaluates in the caller's session, so exit closes the user's PowerShell window
+# and takes every message we just printed with it. Throw, and let the wrapper
+# catch and print.
+class OspinaStop : System.Exception { OspinaStop([string]$m) : base($m) {} }
+function Die  ($m) { throw [OspinaStop]::new($m) }
+function Stop-Here { throw [OspinaStop]::new('') }
 function Have ($c) { $null -ne (Get-Command $c -ErrorAction SilentlyContinue) }
 
 # PowerShell 5.1 turns anything a native command writes to stderr into an error
@@ -79,6 +85,8 @@ function Find-GitBash {
   }
   return $null
 }
+
+function Invoke-OspinaInstall {
 
 Say ""
 Say "Ospina workspace setup"
@@ -173,7 +181,7 @@ if ($authed) {
     Say ""
     Say "  Command to re-run:"
     Say "    irm https://raw.githubusercontent.com/ospina-company/.github/main/install.ps1 | iex"
-    exit 0
+    return
   }
   Say ""
   Say "  A browser window will open. Choose GitHub.com, then HTTPS, then"
@@ -218,29 +226,96 @@ if ((Invoke-Native gh @('repo','view','ospina-company/handbook','--json','name')
   Say "  Then run this same command again and it will finish the setup:"
   Say "    irm https://raw.githubusercontent.com/ospina-company/.github/main/install.ps1 | iex"
   Say "  ------------------------------------------------------------------"
-  exit 0
+  return
 }
 Say "  ok       access to Ospina repositories confirmed"
 
 # ----------------------------------------------------------------- workspace
 Step "Workspace location"
-# Keep the root short. Deep client paths still push against Windows path limits
-# even with core.longpaths set, and OneDrive-synced folders corrupt .git.
-$default = "C:\Ospina"
+
+# Offer places that already exist and make sense on this machine, rather than
+# inventing one path and hoping. A free-text prompt puts the burden on someone
+# who has no idea what the constraints are.
+function Get-WorkspaceCandidates {
+  $home_ = $env:USERPROFILE
+  $od    = $env:OneDrive
+  $out   = @()
+
+  function Add-Candidate($path, $why, $rank) {
+    if (-not $path) { return }
+    # OneDrive and Dropbox sync clients write into .git concurrently with git
+    # and corrupt repositories. Never offer a synced location.
+    if ($od -and $path.StartsWith($od, 'OrdinalIgnoreCase')) { return }
+    if ($path -match '(?i)onedrive|dropbox|google drive|box sync') { return }
+    $script:cands += [pscustomobject]@{
+      Path = $path; Why = $why; Rank = $rank; Exists = (Test-Path $path)
+    }
+  }
+
+  $script:cands = @()
+  # Existing developer folders first: if one of these is here, it is where this
+  # person already keeps code.
+  foreach ($d in @('Repositories','repos','source\repos','Projects','projects','dev','code','git','Developer')) {
+    $full = Join-Path $home_ $d
+    if (Test-Path $full) { Add-Candidate (Join-Path $full 'Ospina') "inside your existing $d folder" 10 }
+  }
+  # A short root on the system drive. Shortest paths, which matters on Windows.
+  Add-Candidate 'C:\Ospina' 'short path, avoids Windows path-length limits' 20
+  # Home directory.
+  Add-Candidate (Join-Path $home_ 'Ospina') 'in your home folder' 30
+  # A roomier non-system drive, if one exists.
+  Get-PSDrive -PSProvider FileSystem -ErrorAction SilentlyContinue |
+    Where-Object { $_.Name -match '^[D-Z]$' -and $_.Free -gt 20GB } |
+    Sort-Object Free -Descending | Select-Object -First 1 | ForEach-Object {
+      Add-Candidate ("{0}:\Ospina" -f $_.Name) ("more free space ({0:N0} GB)" -f ($_.Free/1GB)) 15
+    }
+  $script:cands | Sort-Object Rank, Path | Group-Object Path | ForEach-Object { $_.Group[0] }
+}
+
 if ($env:OSPINA_WORKSPACE) {
   $ws = $env:OSPINA_WORKSPACE
   Say "  using OSPINA_WORKSPACE=$ws"
 } else {
-  $reply = Read-Host "  Where should the repositories live? [$default]"
-  $ws = if ([string]::IsNullOrWhiteSpace($reply)) { $default } else { $reply }
+  $cands = @(Get-WorkspaceCandidates)
+  $sysFree = (Get-PSDrive -Name ($env:SystemDrive.TrimEnd(':')) -ErrorAction SilentlyContinue).Free
+  if ($sysFree) { Say ("  $($env:SystemDrive) has {0:N0} GB free" -f ($sysFree/1GB)) }
+  if ($env:OneDrive) { Say "  OneDrive is active, so synced folders are excluded (they corrupt git)" }
+  Say ""
+  Say "  Where should the Ospina repositories live?"
+  Say ""
+  for ($i = 0; $i -lt $cands.Count; $i++) {
+    $c = $cands[$i]
+    $tag = if ($c.Exists) { "" } else { " (will be created)" }
+    Say ("    {0}) {1,-42} {2}{3}" -f ($i+1), $c.Path, $c.Why, $tag)
+  }
+  Say ("    {0}) somewhere else, type a path" -f ($cands.Count + 1))
+  Say ""
+  $pick = Read-Host "  Choice [1]"
+  if ([string]::IsNullOrWhiteSpace($pick)) { $pick = '1' }
+
+  if ($pick -as [int] -and [int]$pick -ge 1 -and [int]$pick -le $cands.Count) {
+    $ws = $cands[[int]$pick - 1].Path
+  } elseif ($pick -as [int] -and [int]$pick -eq ($cands.Count + 1)) {
+    $ws = Read-Host "  Full path"
+    if ([string]::IsNullOrWhiteSpace($ws)) { Die "No path given." }
+  } else {
+    # Treat anything else as a literal path, so typing one still works.
+    $ws = $pick
+  }
+  $ws = [Environment]::ExpandEnvironmentVariables($ws)
+  if ($env:OneDrive -and $ws.StartsWith($env:OneDrive, 'OrdinalIgnoreCase')) {
+    Say ""
+    Say "  WARNING: that path is inside OneDrive. Sync clients and git both write" 
+    Say "  to .git and will eventually corrupt the repositories."
+    $ok = Read-Host "  Use it anyway? (y/n)"
+    if ($ok -notmatch '^[Yy]') { Die "Pick a path outside OneDrive and run the command again." }
+  }
 }
-if ($ws -match 'OneDrive|Dropbox') {
-  Say "  WARNING: cloud-synced folders corrupt git repositories. Consider $default instead."
-}
+
 New-Item -ItemType Directory -Force -Path $ws | Out-Null
+$ws = (Resolve-Path $ws).Path
 Say "  workspace: $ws"
 
-# ------------------------------------------------------------------ handbook
 Step "Handbook"
 $hb = Join-Path $ws 'handbook'
 if (Test-Path (Join-Path $hb '.git')) {
@@ -284,4 +359,24 @@ try {
 } finally {
   Remove-Item Env:\GH_TOKEN -ErrorAction SilentlyContinue
 }
-exit $rc
+
+} # end Invoke-OspinaInstall
+
+try {
+  Invoke-OspinaInstall
+}
+catch [OspinaStop] {
+  if ($_.Exception.Message) {
+    Write-Host ""
+    Write-Host "ERROR: $($_.Exception.Message)" -ForegroundColor Red
+  }
+}
+catch {
+  Write-Host ""
+  Write-Host "Unexpected error: $($_.Exception.Message)" -ForegroundColor Red
+  Write-Host "  at $($_.InvocationInfo.ScriptLineNumber): $($_.InvocationInfo.Line.Trim())" -ForegroundColor DarkGray
+}
+finally {
+  Write-Host ""
+  Write-Host "This window stays open so you can read the output above." -ForegroundColor DarkGray
+}
