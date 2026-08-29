@@ -16,9 +16,11 @@ function Step ($m) { Write-Host ""; Write-Host "==> $m" -ForegroundColor Cyan }
 # evaluates in the caller's session, so exit closes the user's PowerShell window
 # and takes every message we just printed with it. Throw, and let the wrapper
 # catch and print.
-class OspinaStop : System.Exception { OspinaStop([string]$m) : base($m) {} }
-function Die  ($m) { throw [OspinaStop]::new($m) }
-function Stop-Here { throw [OspinaStop]::new('') }
+# A sentinel prefix rather than a custom exception class: PowerShell classes are
+# resolved at parse time, which behaves inconsistently when the script arrives
+# as a string through Invoke-Expression.
+$OSPINA_HALT = '[ospina-halt] '
+function Die ($m) { throw ($OSPINA_HALT + $m) }
 function Have ($c) { $null -ne (Get-Command $c -ErrorAction SilentlyContinue) }
 
 # PowerShell 5.1 turns anything a native command writes to stderr into an error
@@ -365,16 +367,16 @@ try {
 try {
   Invoke-OspinaInstall
 }
-catch [OspinaStop] {
-  if ($_.Exception.Message) {
-    Write-Host ""
-    Write-Host "ERROR: $($_.Exception.Message)" -ForegroundColor Red
-  }
-}
 catch {
+  $msg = $_.Exception.Message
   Write-Host ""
-  Write-Host "Unexpected error: $($_.Exception.Message)" -ForegroundColor Red
-  Write-Host "  at $($_.InvocationInfo.ScriptLineNumber): $($_.InvocationInfo.Line.Trim())" -ForegroundColor DarkGray
+  if ($msg -and $msg.StartsWith($OSPINA_HALT)) {
+    Write-Host ("ERROR: " + $msg.Substring($OSPINA_HALT.Length)) -ForegroundColor Red
+  } else {
+    Write-Host "Unexpected error: $msg" -ForegroundColor Red
+    Write-Host "  at line $($_.InvocationInfo.ScriptLineNumber): $($_.InvocationInfo.Line.Trim())" -ForegroundColor DarkGray
+    Write-Host "  Please send this to Carlos: hi@ospinacompany.com" -ForegroundColor DarkGray
+  }
 }
 finally {
   Write-Host ""

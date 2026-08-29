@@ -49,6 +49,7 @@ jobs:
             $args[0] -is [System.Management.Automation.Language.FunctionDefinitionAst]
           }, $true)
           Write-Host "loading $($fns.Count) function definitions"
+          $OSPINA_HALT = '[ospina-halt] '
           foreach ($f in $fns) { Invoke-Expression $f.Extent.Text }
 
           Refresh-Path
@@ -73,6 +74,8 @@ jobs:
           $fns = $ast.FindAll({
             $args[0] -is [System.Management.Automation.Language.FunctionDefinitionAst]
           }, $true)
+          # Die references $OSPINA_HALT, which lives outside any function.
+          $OSPINA_HALT = '[ospina-halt] '
           foreach ($f in $fns) { Invoke-Expression $f.Extent.Text }
 
           $ErrorActionPreference = 'Stop'
