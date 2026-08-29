@@ -262,5 +262,26 @@ $drive  = $full.Substring(0,1).ToLower()
 $rest   = $full.Substring(2) -replace '\\','/'
 $hbUnix = "/$drive$rest"
 Say "  handbook (git bash path): $hbUnix"
-$rc = Invoke-Native $bash @('-lc', "sh '$hbUnix/bootstrap.sh'") -Interactive
+
+# Hand the credential to the child explicitly. Git Bash starts as a login shell
+# and its profile sanitises the environment, so gh inside bash cannot always
+# find the config it just wrote from PowerShell. Without this, bootstrap.sh sees
+# an unauthenticated gh and starts a SECOND interactive login, which cannot
+# complete from a nested shell and hangs on
+# "please complete authentication in your browser".
+$tok = Invoke-Native-Capture gh @('auth','token')
+if ($tok) {
+  $env:GH_TOKEN = $tok
+  Say "  passing your GitHub credential to the bootstrap step"
+} else {
+  Say "  could not read a gh token; the bootstrap step may ask you to sign in again"
+}
+
+# --no-login is belt and braces: even if the credential does not survive, the
+# child must never start a login it has no way to finish.
+try {
+  $rc = Invoke-Native $bash @('-lc', "sh '$hbUnix/bootstrap.sh' --no-login") -Interactive
+} finally {
+  Remove-Item Env:\GH_TOKEN -ErrorAction SilentlyContinue
+}
 exit $rc
