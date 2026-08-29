@@ -60,6 +60,41 @@ jobs:
           Write-Host "Find-GitBash -> $bash"
           & $bash -c "echo bash works: \$(uname -s)"
 
+      - name: Native stderr does not kill the script (regression)
+        shell: powershell
+        run: |
+          # The bug this guards: PowerShell 5.1 converts native stderr into an
+          # error record, and under $ErrorActionPreference='Stop' that terminates
+          # the script. `gh auth status` on a machine that is NOT logged in
+          # writes to stderr and exits non-zero, which is an answer rather than a
+          # failure. CI missed it originally because the runner is authenticated.
+          $ast = [System.Management.Automation.Language.Parser]::ParseFile(
+                   (Resolve-Path install.ps1), [ref]$null, [ref]$null)
+          $fns = $ast.FindAll({
+            $args[0] -is [System.Management.Automation.Language.FunctionDefinitionAst]
+          }, $true)
+          foreach ($f in $fns) { Invoke-Expression $f.Extent.Text }
+
+          $ErrorActionPreference = 'Stop'
+
+          # A native command that writes to stderr and exits non-zero.
+          $rc = Invoke-Native cmd @('/c','echo boom 1>&2 & exit 3')
+          if ($rc -ne 3) { Write-Host "::error::expected exit 3, got $rc"; exit 1 }
+          Write-Host "Invoke-Native survived native stderr, returned $rc"
+
+          # The real case: gh with no credentials at all.
+          $env:GH_TOKEN = ''
+          $env:GITHUB_TOKEN = ''
+          $env:GH_CONFIG_DIR = (Join-Path $env:RUNNER_TEMP 'empty-gh')
+          New-Item -ItemType Directory -Force -Path $env:GH_CONFIG_DIR | Out-Null
+          $rc = Invoke-Native gh @('auth','status')
+          if ($rc -eq 0) { Write-Host "::warning::gh still authenticated; weaker assertion" }
+          Write-Host "unauthenticated gh auth status returned $rc without terminating"
+
+          $out = Invoke-Native-Capture cmd @('/c','echo hello')
+          if ($out -ne 'hello') { Write-Host "::error::capture returned '$out'"; exit 1 }
+          Write-Host "Invoke-Native-Capture returned '$out'"
+
       - name: Windows path conversion is correct
         shell: powershell
         run: |

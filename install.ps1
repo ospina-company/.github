@@ -15,6 +15,35 @@ function Step ($m) { Write-Host ""; Write-Host "==> $m" -ForegroundColor Cyan }
 function Die  ($m) { Write-Host ""; Write-Host "ERROR: $m" -ForegroundColor Red; exit 1 }
 function Have ($c) { $null -ne (Get-Command $c -ErrorAction SilentlyContinue) }
 
+# PowerShell 5.1 turns anything a native command writes to stderr into an error
+# record, and with $ErrorActionPreference = 'Stop' that terminates the script
+# even when the command only printed a diagnostic. `gh auth status` on a machine
+# that is not logged in does exactly that, and it is not a failure: it is the
+# answer. Judge native tools by exit code, never by whether they wrote to stderr.
+function Invoke-Native-Capture {
+  # Same stderr problem, but we want stdout back as a string.
+  param([Parameter(Mandatory)][string] $Exe, [string[]] $Arguments = @())
+  $prev = $ErrorActionPreference
+  $ErrorActionPreference = 'Continue'
+  try { return (& $Exe @Arguments 2>$null | Select-Object -First 1) }
+  finally { $ErrorActionPreference = $prev }
+}
+
+function Invoke-Native {
+  param(
+    [Parameter(Mandatory)][string] $Exe,
+    [string[]] $Arguments = @(),
+    [switch]   $Interactive   # leave stdin/stdout attached, e.g. gh auth login
+  )
+  $prev = $ErrorActionPreference
+  $ErrorActionPreference = 'Continue'
+  try {
+    if ($Interactive) { & $Exe @Arguments }
+    else              { & $Exe @Arguments 2>&1 | Out-Null }
+    return $LASTEXITCODE
+  } finally { $ErrorActionPreference = $prev }
+}
+
 function Refresh-Path {
   # winget writes the new PATH to the registry; this session still holds the old
   # one. Rebuild from Machine + User so freshly installed tools are callable now
@@ -88,16 +117,14 @@ $pkgs = @(
 foreach ($p in $pkgs) {
   if (Have $p.Cmd) { Say "  ok       $($p.Cmd)"; continue }
   Say "  install  $($p.Cmd)  ($($p.Id))"
-  winget install --id $p.Id --exact --silent `
-                 --accept-package-agreements --accept-source-agreements | Out-Null
-  $code = $LASTEXITCODE
+  $code = Invoke-Native winget @('install','--id',$p.Id,'--exact','--silent',
+            '--accept-package-agreements','--accept-source-agreements')
   Refresh-Path
   # A managed laptop often blocks machine-wide installs. User scope needs no admin.
   if (-not (Have $p.Cmd)) {
     Say "  retry    $($p.Cmd) with user-scope install (no admin required)"
-    winget install --id $p.Id --exact --silent --scope user `
-                   --accept-package-agreements --accept-source-agreements | Out-Null
-    $code = $LASTEXITCODE
+    $code = Invoke-Native winget @('install','--id',$p.Id,'--exact','--silent',
+              '--scope','user','--accept-package-agreements','--accept-source-agreements')
     Refresh-Path
   }
   if (Have $p.Cmd) {
@@ -130,9 +157,9 @@ Say "  ok       git bash at $bash"
 
 # ---------------------------------------------------------------------- auth
 Step "GitHub sign-in"
-& gh auth status *> $null
-if ($LASTEXITCODE -eq 0) {
-  $who = (& gh api user --jq .login 2>$null)
+$authed = (Invoke-Native gh @('auth','status')) -eq 0
+if ($authed) {
+  $who = (Invoke-Native-Capture gh @('api','user','--jq','.login'))
   Say "  ok       signed in as $who"
 } else {
   Say "  You need a GitHub account for this. It is free."
@@ -151,18 +178,16 @@ if ($LASTEXITCODE -eq 0) {
   Say ""
   Say "  A browser window will open. Choose GitHub.com, then HTTPS, then"
   Say "  'Login with a web browser' and paste the code shown here."
-  & gh auth login
-  if ($LASTEXITCODE -ne 0) { Die "GitHub sign-in did not complete. Run 'gh auth login' and try again." }
+  $rc = Invoke-Native gh @('auth','login') -Interactive
+  if ($rc -ne 0) { Die "GitHub sign-in did not complete. Run 'gh auth login' and try again." }
 }
 
-$who = (& gh api user --jq .login 2>$null)
+$who = (Invoke-Native-Capture gh @('api','user','--jq','.login'))
 
-& gh repo view ospina-company/handbook --json name *> $null
-if ($LASTEXITCODE -ne 0) {
+if ((Invoke-Native gh @('repo','view','ospina-company/handbook','--json','name')) -ne 0) {
   # Distinguish "not in the org" from "in the org, but the team is missing
   # handbook". They need completely different things asked for.
-  & gh api "orgs/ospina-company/members/$who" *> $null
-  $inOrg = ($LASTEXITCODE -eq 0)
+  $inOrg = (Invoke-Native gh @('api',"orgs/ospina-company/members/$who")) -eq 0
 
   Say ""
   Say "  ------------------------------------------------------------------"
@@ -220,10 +245,11 @@ Step "Handbook"
 $hb = Join-Path $ws 'handbook'
 if (Test-Path (Join-Path $hb '.git')) {
   Say "  ok       already cloned, updating"
-  & git -C $hb pull -q --ff-only 2>$null
+  $null = Invoke-Native git @('-C',$hb,'pull','-q','--ff-only')
 } else {
-  & gh repo clone ospina-company/handbook $hb -- -q
-  if ($LASTEXITCODE -ne 0) { Die "Could not clone the handbook." }
+  if ((Invoke-Native gh @('repo','clone','ospina-company/handbook',$hb,'--','-q')) -ne 0) {
+    Die "Could not clone the handbook."
+  }
   Say "  cloned   $hb"
 }
 
@@ -236,4 +262,5 @@ $drive  = $full.Substring(0,1).ToLower()
 $rest   = $full.Substring(2) -replace '\\','/'
 $hbUnix = "/$drive$rest"
 Say "  handbook (git bash path): $hbUnix"
-& $bash -lc "sh '$hbUnix/bootstrap.sh'"
+$rc = Invoke-Native $bash @('-lc', "sh '$hbUnix/bootstrap.sh'") -Interactive
+exit $rc
