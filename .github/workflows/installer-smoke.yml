@@ -74,11 +74,16 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           $bash = Join-Path $env:ProgramFiles 'Git\bin\bash.exe'
-          git clone --depth 1 https://github.com/ospina-company/handbook.git "$env:RUNNER_TEMP\hb" 2>&1 | Out-Null
+          # git writes progress to stderr, which PowerShell turns into error
+          # records for native commands. Silence both streams and judge by the
+          # filesystem instead.
+          $ErrorActionPreference = 'Continue'
+          cmd /c "git clone --depth 1 https://github.com/ospina-company/handbook.git `"$env:RUNNER_TEMP\hb`" >NUL 2>&1"
           if (-not (Test-Path "$env:RUNNER_TEMP\hb\bootstrap.sh")) {
-            Write-Host "::notice::handbook is private and unreachable from this runner; skipping"
+            Write-Host "::notice::handbook is private and not readable with the default runner token, so the bootstrap step is skipped. install.ps1 itself is fully covered by the steps above."
             exit 0
           }
+          $ErrorActionPreference = 'Stop'
           $unix = "/" + ($env:RUNNER_TEMP.Substring(0,1).ToLower()) + ($env:RUNNER_TEMP.Substring(2) -replace '\\','/')
           & $bash -lc "sh '$unix/hb/bootstrap.sh' --check --no-install --no-clone"
 
