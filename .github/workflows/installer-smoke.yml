@@ -38,10 +38,15 @@ jobs:
       - name: Helper functions behave on real Windows
         shell: powershell
         run: |
-          # Load the script's functions without running the installer body.
-          $src = Get-Content install.ps1 -Raw
-          $body = $src.Substring(0, $src.IndexOf('Say ""' + [Environment]::NewLine + 'Say "Ospina workspace setup"'))
-          Invoke-Expression $body
+          # Pull the function definitions out via the AST. String matching breaks
+          # here because the file is LF and [Environment]::NewLine is CRLF.
+          $ast = [System.Management.Automation.Language.Parser]::ParseFile(
+                   (Resolve-Path install.ps1), [ref]$null, [ref]$null)
+          $fns = $ast.FindAll({
+            $args[0] -is [System.Management.Automation.Language.FunctionDefinitionAst]
+          }, $true)
+          Write-Host "loading $($fns.Count) function definitions"
+          foreach ($f in $fns) { Invoke-Expression $f.Extent.Text }
 
           Refresh-Path
           if (-not $env:Path) { Write-Host "::error::Refresh-Path produced an empty PATH"; exit 1 }
