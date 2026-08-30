@@ -336,6 +336,30 @@ function Install-CodexBinary {
   }
 }
 
+function Get-ClaudeNativePath {
+  if (-not $env:USERPROFILE) { return $null }
+  $p = Join-Path $env:USERPROFILE '.local\bin\claude.exe'
+  if (Test-Path $p) { return $p }
+  return $null
+}
+
+function Test-Claude {
+  # The native installer writes ~/.local/bin/claude.exe and adds that folder to
+  # the user PATH, but the running session does not always pick it up. Check the
+  # known location too, or a good install looks like a failed one.
+  if (Have claude) { return $true }
+  return ($null -ne (Get-ClaudeNativePath))
+}
+
+function Add-UserPathEntry {
+  param([Parameter(Mandatory)][string]$Dir)
+  $userPath = [Environment]::GetEnvironmentVariable('Path','User')
+  if (($userPath -split ';') -notcontains $Dir) {
+    [Environment]::SetEnvironmentVariable('Path', (($userPath.TrimEnd(';') + ';' + $Dir).TrimStart(';')), 'User')
+  }
+  if (($env:Path -split ';') -notcontains $Dir) { $env:Path = "$env:Path;$Dir" }
+}
+
 function Test-Codex {
   if (Have codex) { return $true }
   # npm global installs land in a prefix that is not always on PATH, and a tool
@@ -413,7 +437,7 @@ function Install-T3Code {
 $agents = @(
   @{ Name = 'T3 Code';     Test = { Test-T3Code };  Install = { Install-T3Code }
      Manual = 'download from https://t3.codes/download' },
-  @{ Name = 'Claude Code'; Test = { Have claude }
+  @{ Name = 'Claude Code'; Test = { Test-Claude }
      Manual = 'irm https://claude.ai/install.ps1 | iex'
      Install = {
        # The native installer, deliberately not winget. T3 Code updates Claude by
@@ -426,7 +450,17 @@ $agents = @(
        try {
          & ([scriptblock]::Create((Invoke-RestMethod 'https://claude.ai/install.ps1')))
          Refresh-Path
-         return (Have claude)
+         # Finish the job rather than telling the reader to open a new terminal:
+         # if the binary is where the native installer puts it but is not
+         # callable, put its folder on PATH ourselves.
+         if (-not (Have claude)) {
+           $native = Get-ClaudeNativePath
+           if ($native) {
+             Add-UserPathEntry (Split-Path $native -Parent)
+             Say ("          added {0} to your PATH" -f (Split-Path $native -Parent))
+           }
+         }
+         return (Test-Claude)
        } catch {
          Say ("          native install failed: {0}" -f $_.Exception.Message)
          Say  "          Fallback: winget install Anthropic.ClaudeCode"
