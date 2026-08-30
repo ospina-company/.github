@@ -166,6 +166,37 @@ already installed.
   }
 }
 
+# Several of the repositories a partner clones are pnpm / Next.js projects, and
+# npm resolves to npm.ps1. Under the default Restricted policy none of them can
+# be built or run. That makes this a prerequisite for the work itself, not a
+# detail of installing one agent.
+if ((Get-ExecutionPolicy) -eq 'Restricted') {
+  Say ""
+  Say "  PowerShell's execution policy is Restricted."
+  Say "  That blocks .ps1 files, and npm on Windows is npm.ps1, so npm and pnpm"
+  Say "  cannot run at all. Several Ospina repositories are Node projects and"
+  Say "  will not build until this is changed."
+  Say ""
+  Say "  The standard developer setting, for your account only. It still refuses"
+  Say "  unsigned scripts downloaded from the internet:"
+  Say "    Set-ExecutionPolicy -Scope CurrentUser -ExecutionPolicy RemoteSigned"
+  Say ""
+  if (Ask-YesNo "  Apply it now?") {
+    try {
+      Set-ExecutionPolicy -Scope CurrentUser -ExecutionPolicy RemoteSigned -Force
+      Say ("  ok       execution policy is now {0}" -f (Get-ExecutionPolicy -Scope CurrentUser))
+    } catch {
+      Say ("  note     could not change it: {0}" -f $_.Exception.Message)
+      Say  "           Node tooling will not work until you set it yourself."
+    }
+  } else {
+    Say "  note     left as Restricted. npm and pnpm will not run, so the Node"
+    Say "           repositories cannot be built until you change it."
+  }
+} else {
+  Say ("  ok       execution policy: {0}" -f (Get-ExecutionPolicy))
+}
+
 # Git Bash is what actually runs the bootstrap script.
 $bash = Find-GitBash
 if (-not $bash) {
@@ -257,8 +288,8 @@ Say "  You bring your own Claude or Codex subscription; Ospina does not provide 
 Say ""
 
 function Ask-YesNo ($question) {
-  # Default yes: this is how the workflow is set up, so the common answer
-  # should be the one you get by pressing Enter.
+  # Default yes: this is how the workflow is set up, so the common answer should
+  # be the one you get by pressing Enter.
   $a = Read-Host "$question [Y/n]"
   return ([string]::IsNullOrWhiteSpace($a) -or $a -match '^[Yy]')
 }
@@ -272,6 +303,39 @@ function Test-Npm {
   return (Invoke-Native cmd @('/c','npm','--version')) -eq 0
 }
 
+function Install-CodexBinary {
+  # Codex publishes a standalone executable per architecture, which removes the
+  # Node and execution-policy dependency entirely.
+  try {
+    $arch = if ($env:PROCESSOR_ARCHITECTURE -eq 'ARM64') { 'aarch64' } else { 'x86_64' }
+    $want = "codex-$arch-pc-windows-msvc.exe"
+    Say "          finding the latest Codex release..."
+    $rel = Invoke-RestMethod 'https://api.github.com/repos/openai/codex/releases/latest' `
+                             -Headers @{ 'User-Agent' = 'ospina-installer' }
+    $asset = $rel.assets | Where-Object { $_.name -eq $want } | Select-Object -First 1
+    if (-not $asset) { throw "no $want in the latest release" }
+
+    $dir = Join-Path $env:LOCALAPPDATA 'Programs\codex'
+    New-Item -ItemType Directory -Force -Path $dir | Out-Null
+    $dest = Join-Path $dir 'codex.exe'
+    Say ("          downloading {0} ({1} MB)..." -f $want, [int]($asset.size/1MB))
+    Invoke-WebRequest $asset.browser_download_url -OutFile $dest -UseBasicParsing
+
+    # Put it on PATH for this account and for this session.
+    $userPath = [Environment]::GetEnvironmentVariable('Path','User')
+    if (($userPath -split ';') -notcontains $dir) {
+      [Environment]::SetEnvironmentVariable('Path', (($userPath.TrimEnd(';') + ';' + $dir).TrimStart(';')), 'User')
+      Say "          added $dir to your PATH"
+    }
+    $env:Path = "$env:Path;$dir"
+    return $true
+  } catch {
+    Say ("          standalone install failed: {0}" -f $_.Exception.Message)
+    Say  "          Install manually: https://github.com/openai/codex/releases/latest"
+    return $false
+  }
+}
+
 function Test-Codex {
   if (Have codex) { return $true }
   # npm global installs land in a prefix that is not always on PATH, and a tool
@@ -282,6 +346,8 @@ function Test-Codex {
       if (Test-Path (Join-Path $prefix $n)) { return $true }
     }
   }
+  # The standalone build lands here.
+  if ($env:LOCALAPPDATA -and (Test-Path (Join-Path $env:LOCALAPPDATA 'Programs\codex\codex.exe'))) { return $true }
   return $false
 }
 
@@ -377,43 +443,12 @@ $agents = @(
          Say "          running: npm install -g @openai/codex"
          (Invoke-Native cmd @('/c','npm','install','-g','@openai/codex') -Interactive) -eq 0
        }
-       elseif (Have npm) {
-         # npm is on PATH but will not run. On Windows that is nearly always the
-         # execution policy blocking npm.ps1, which breaks npm for this account
-         # generally, not just for us.
-         Say ""
-         Say "          npm is installed but cannot run in PowerShell."
-         Say ("          Execution policy for this user: {0}" -f (Get-ExecutionPolicy -Scope CurrentUser))
-         Say  "          Windows blocks npm.ps1 under the default Restricted policy."
-         Say  "          This affects every npm command you run, not only this installer."
-         Say ""
-         Say  "          The standard developer fix, which applies to your account only"
-         Say  "          and still blocks unsigned scripts downloaded from the internet:"
-         Say  "            Set-ExecutionPolicy -Scope CurrentUser -ExecutionPolicy RemoteSigned"
-         Say ""
-         if (Ask-YesNo "           Apply that now?") {
-           try {
-             Set-ExecutionPolicy -Scope CurrentUser -ExecutionPolicy RemoteSigned -Force
-             Say ("          execution policy is now {0}" -f (Get-ExecutionPolicy -Scope CurrentUser))
-             if (Test-Npm) {
-               Say "          npm works now, installing Codex"
-               Say "          running: npm install -g @openai/codex"
-               return (Invoke-Native cmd @('/c','npm','install','-g','@openai/codex') -Interactive) -eq 0
-             }
-             Say "          npm still does not run. Open a new terminal and re-run."
-           } catch {
-             Say ("          could not change the policy: {0}" -f $_.Exception.Message)
-           }
-         } else {
-           Say "          skipped. Codex needs a working npm; the rest of setup continues."
-         }
-         $false
-       }
        else {
-         Say "          Codex installs through npm, and Node.js is not present."
-         Say "          Install Node.js first: winget install OpenJS.NodeJS"
-         Say "          then: npm install -g @openai/codex"
-         $false
+         # npm is unusable or absent. Codex publishes standalone Windows
+         # binaries, so there is no need to send the reader off to install Node
+         # and come back.
+         Say "          npm is not usable here, so installing the standalone build."
+         Install-CodexBinary
        }
      } }
 )
