@@ -159,7 +159,9 @@ jobs:
           # Presence is not usability. npm resolves to npm.ps1, which the default
           # Restricted policy refuses to run, so Get-Command finding it proves
           # nothing about whether it works.
-          if ($src -match 'if \(Have npm\)') {
+          # Negative lookbehind: "elseif (Have npm)" is the legitimate branch that
+          # detects npm present-but-broken. Only a bare "if (Have npm)" gate is wrong.
+          if ($src -match '(?<!else)if \(Have npm\)') {
             Write-Host "::error::npm is gated on Have npm; use the functional Test-Npm check instead"
             $fail = 1
           } else { Write-Host "npm is checked functionally" }
