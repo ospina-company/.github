@@ -258,6 +258,14 @@ else
 fi
 rm -f "${CANDFILE:-}" 2>/dev/null || true
 WS="${WS/#\~/$HOME}"
+# Apply the sync-folder rule to every route into WS, not just the menu: a path
+# from OSPINA_WORKSPACE or typed by hand can land in a synced folder too.
+case "$WS" in
+  *iCloud*|*Dropbox*|*"Google Drive"*|*OneDrive*)
+    die "That workspace is inside a cloud-synced folder.
+  Sync clients and git both write to .git and will corrupt the repositories.
+  Choose a path outside iCloud, Dropbox, Google Drive and OneDrive." ;;
+esac
 mkdir -p "$WS"
 WS=$(CDPATH= cd -- "$WS" && pwd)
 say "  workspace: $WS"
@@ -270,7 +278,11 @@ if [ -d "$WS/handbook/.git" ]; then
   git -C "$WS/handbook" pull -q --ff-only \
     || say "  ${DIM}could not update the handbook; continuing with the existing copy${RESET}"
 else
-  gh repo clone ospina-company/handbook "$WS/handbook" -- -q
+  gh repo clone ospina-company/handbook "$WS/handbook" -- -q \
+    || die "Could not clone the handbook into $WS/handbook.
+  Check your connection and that you still have access:
+    gh repo view ospina-company/handbook
+  Then re-run this command."
   say "  cloned   $WS/handbook"
 fi
 

@@ -8,6 +8,9 @@
 #
 # Read before running. Safe to re-run: every step checks before it acts.
 
+# Saved and restored in the wrapper: this evaluates in the caller's session,
+# so leaving their preference changed is a side effect they did not ask for.
+$OspinaPrevEAP = $ErrorActionPreference
 $ErrorActionPreference = 'Stop'
 
 function Say  { param([string]$m, [string]$ForegroundColor)
@@ -463,7 +466,12 @@ if (Test-Path (Join-Path $hb '.git')) {
 Step "Running bootstrap"
 Say ""
 # Convert C:\Ospina\handbook to /c/Ospina/handbook for Git Bash.
-$full   = (Resolve-Path $hb).Path
+$full = (Resolve-Path $hb).Path
+# Git Bash addresses drives as /c/..., so a UNC path has no representation here
+# and the conversion below would silently produce nonsense.
+if ($full -notmatch '^[A-Za-z]:\\') {
+  Die "The workspace must be on a drive letter, not a network path.`n  Got: $full`n  Re-run and choose a local path such as C:\Ospina."
+}
 $drive  = $full.Substring(0,1).ToLower()
 $rest   = $full.Substring(2) -replace '\\','/'
 $hbUnix = "/$drive$rest"
@@ -475,6 +483,8 @@ Say "  handbook (git bash path): $hbUnix"
 # an unauthenticated gh and starts a SECOND interactive login, which cannot
 # complete from a nested shell and hangs on
 # "please complete authentication in your browser".
+$hadPrevToken = Test-Path Env:\GH_TOKEN
+$prevToken    = if ($hadPrevToken) { $env:GH_TOKEN } else { $null }
 $tok = Invoke-Native-Capture gh @('auth','token')
 if ($tok) {
   $env:GH_TOKEN = $tok
@@ -491,7 +501,11 @@ if ($tok) {
 try {
   $rc = Invoke-Native $bash @('-lc', "sh '$hbUnix/bootstrap.sh' --no-login") -Interactive
 } finally {
-  Remove-Item Env:\GH_TOKEN -ErrorAction SilentlyContinue
+  # Restore whatever the caller had. This script runs in their session, so
+  # deleting a variable we did not set would be a side effect they never asked
+  # for.
+  if ($hadPrevToken) { $env:GH_TOKEN = $prevToken }
+  else { Remove-Item Env:\GH_TOKEN -ErrorAction SilentlyContinue }
 }
 
 # bootstrap.sh exits non-zero when it finished with warnings, which is not
@@ -521,6 +535,7 @@ catch {
   }
 }
 finally {
+  $ErrorActionPreference = $OspinaPrevEAP
   Write-Host ""
   Write-Host "This window stays open so you can read the output above." -ForegroundColor DarkGray
 }
