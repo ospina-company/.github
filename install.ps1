@@ -336,6 +336,27 @@ function Install-CodexBinary {
   }
 }
 
+function Resolve-OnPath {
+  # A tool that exists but is not callable is a PATH problem, and the installer
+  # knows where it put things. Fix it here rather than telling the reader to
+  # open a new terminal and hope.
+  param(
+    [Parameter(Mandatory)][string] $Command,
+    [Parameter(Mandatory)][string[]] $Directories
+  )
+  if (Have $Command) { return $true }
+  foreach ($dir in ($Directories | Where-Object { $_ })) {
+    foreach ($ext in @('.exe','.cmd','.ps1','')) {
+      if (Test-Path (Join-Path $dir ($Command + $ext))) {
+        Add-UserPathEntry $dir
+        Say ("          added {0} to your PATH" -f $dir)
+        return (Have $Command)
+      }
+    }
+  }
+  return $false
+}
+
 function Get-ClaudeNativePath {
   if (-not $env:USERPROFILE) { return $null }
   $p = Join-Path $env:USERPROFILE '.local\bin\claude.exe'
@@ -435,9 +456,9 @@ function Install-T3Code {
 }
 
 $agents = @(
-  @{ Name = 'T3 Code';     Test = { Test-T3Code };  Install = { Install-T3Code }
+  @{ Name = 'T3 Code'; Command = $null;     Test = { Test-T3Code };  Install = { Install-T3Code }
      Manual = 'download from https://t3.codes/download' },
-  @{ Name = 'Claude Code'; Test = { Test-Claude }
+  @{ Name = 'Claude Code'; Command = 'claude'; Test = { Test-Claude }
      Manual = 'irm https://claude.ai/install.ps1 | iex'
      Install = {
        # The native installer, deliberately not winget. T3 Code updates Claude by
@@ -453,13 +474,9 @@ $agents = @(
          # Finish the job rather than telling the reader to open a new terminal:
          # if the binary is where the native installer puts it but is not
          # callable, put its folder on PATH ourselves.
-         if (-not (Have claude)) {
-           $native = Get-ClaudeNativePath
-           if ($native) {
-             Add-UserPathEntry (Split-Path $native -Parent)
-             Say ("          added {0} to your PATH" -f (Split-Path $native -Parent))
-           }
-         }
+         $null = Resolve-OnPath -Command 'claude' -Directories @(
+           (Join-Path $env:USERPROFILE '.local\bin')
+         )
          return (Test-Claude)
        } catch {
          Say ("          native install failed: {0}" -f $_.Exception.Message)
@@ -468,7 +485,7 @@ $agents = @(
          return $false
        }
      } },
-  @{ Name = 'Codex';       Test = { Test-Codex }; Manual = 'npm install -g @openai/codex';
+  @{ Name = 'Codex'; Command = 'codex';       Test = { Test-Codex }; Manual = 'npm install -g @openai/codex';
      Diagnose = {
        # npm can install into a prefix that is not on PATH. Show where it went.
        $prefix = Invoke-Native-Capture cmd @('/c','npm','prefix','-g')
@@ -493,7 +510,13 @@ $agents = @(
          # run that printed "installed" while npm had done nothing useful, and
          # left no evidence to work from.
          Say "          running: npm install -g @openai/codex"
-         (Invoke-Native cmd @('/c','npm','install','-g','@openai/codex') -Interactive) -eq 0
+         $rc = Invoke-Native cmd @('/c','npm','install','-g','@openai/codex') -Interactive
+         if ($rc -ne 0) { return $false }
+         # npm's global prefix is frequently absent from PATH on Windows.
+         Resolve-OnPath -Command 'codex' -Directories @(
+           (Invoke-Native-Capture cmd @('/c','npm','prefix','-g')),
+           (Join-Path $env:LOCALAPPDATA 'Programs\codex')
+         )
        }
        else {
          # npm is unusable or absent. Codex publishes standalone Windows
@@ -528,7 +551,13 @@ foreach ($a in $agents) {
     # report success while leaving nothing callable, and claiming "installed"
     # then means the next run asks again with no explanation.
     if (& $a.Test) {
-      Say ("  ok       {0,-14} installed" -f $a.Name)
+      $cmdName = $a.Command
+      if ($cmdName -and -not (Have $cmdName)) {
+        Say ("  note     {0,-14} installed, but '{1}' is not callable in this" -f $a.Name, $cmdName)
+        Say  "           session yet. Open a NEW terminal and it will work."
+      } else {
+        Say ("  ok       {0,-14} installed" -f $a.Name)
+      }
     } elseif ($okAgent) {
       Say ("  note     {0,-14} the installer reported success, but the command is" -f $a.Name)
       Say  "           not callable yet. This is usually PATH: open a NEW terminal"
