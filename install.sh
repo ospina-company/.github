@@ -191,7 +191,7 @@ for _agent in "T3 Code|have_t3|install_t3" "Claude Code|have_claude|install_clau
     if $_inst || $_test; then printf '  ok       %-14s installed\n' "$_name"
     else printf '  note     %-14s not installed; a new terminal may be needed\n' "$_name"; fi
   else
-    say "           skipped. Install later from https://t3.codes if you change your mind."
+    say "           skipped. Re-run this command later and it will offer again."
   fi
 done
 say ""

@@ -93,7 +93,11 @@ foreach ($t in 'git','gh','vale','winget','tailscale') {
     $src = (Get-Command $t).Source
     # A binary under the user profile was installed for this account, so it is
     # not evidence that the machine provides it to everyone.
-    $userScoped = $src -and $src.StartsWith($env:USERPROFILE, 'OrdinalIgnoreCase')
+    # WindowsApps holds app execution aliases, which Windows provides. A binary
+    # there sits under the profile but was not installed by this account.
+    $isAlias    = $src -and $src -match '(?i)\\Microsoft\\WindowsApps\\'
+    $userScoped = $src -and -not $isAlias -and
+                  $src.StartsWith($env:USERPROFILE, 'OrdinalIgnoreCase')
     Line 'NOTE' $t ("{0}  [{1}]" -f $src, $(if ($userScoped) { 'this user' } else { 'machine-wide' }))
     if ($t -ne 'winget' -and -not $userScoped) { $inherited++ }
   } else {

@@ -366,6 +366,18 @@ Step "Workspace location"
 # Offer places that already exist and make sense on this machine, rather than
 # inventing one path and hoping. A free-text prompt puts the burden on someone
 # who has no idea what the constraints are.
+function Test-SyncedPath {
+  # One definition, used by the menu, the OSPINA_WORKSPACE route and the typed
+  # path. Sync clients and git both write to .git and eventually corrupt it, so
+  # every route has to apply the same rule.
+  param([string]$Path)
+  if (-not $Path) { return $false }
+  foreach ($root in @($env:OneDrive, $env:OneDriveCommercial, $env:OneDriveConsumer)) {
+    if ($root -and $Path.StartsWith($root, 'OrdinalIgnoreCase')) { return $true }
+  }
+  return ($Path -match '(?i)onedrive|dropbox|google drive|box sync')
+}
+
 function Get-WorkspaceCandidates {
   $home_ = $env:USERPROFILE
   $od    = $env:OneDrive
@@ -375,8 +387,7 @@ function Get-WorkspaceCandidates {
     if (-not $path) { return }
     # OneDrive and Dropbox sync clients write into .git concurrently with git
     # and corrupt repositories. Never offer a synced location.
-    if ($od -and $path.StartsWith($od, 'OrdinalIgnoreCase')) { return }
-    if ($path -match '(?i)onedrive|dropbox|google drive|box sync') { return }
+    if (Test-SyncedPath $path) { return }
     $script:cands += [pscustomobject]@{
       Path = $path; Why = $why; Rank = $rank; Exists = (Test-Path $path)
     }
@@ -406,8 +417,8 @@ if ($env:OSPINA_WORKSPACE) {
   $ws = $env:OSPINA_WORKSPACE
   Say "  using OSPINA_WORKSPACE=$ws"
   # The env-var route must not skip the sync-folder check the menu applies.
-  if ($env:OneDrive -and $ws.StartsWith($env:OneDrive, 'OrdinalIgnoreCase')) {
-    Die "OSPINA_WORKSPACE points inside OneDrive. Sync clients and git both write to .git and will corrupt the repositories. Choose a path outside OneDrive."
+  if (Test-SyncedPath $ws) {
+    Die "OSPINA_WORKSPACE points inside a cloud-synced folder. Sync clients and git both write to .git and will corrupt the repositories. Choose a path outside OneDrive, Dropbox, Google Drive and Box."
   }
 } else {
   $cands = @(Get-WorkspaceCandidates)
@@ -437,12 +448,12 @@ if ($env:OSPINA_WORKSPACE) {
     $ws = $pick
   }
   $ws = [Environment]::ExpandEnvironmentVariables($ws)
-  if ($env:OneDrive -and $ws.StartsWith($env:OneDrive, 'OrdinalIgnoreCase')) {
+  if (Test-SyncedPath $ws) {
     Say ""
-    Say "  WARNING: that path is inside OneDrive. Sync clients and git both write" 
-    Say "  to .git and will eventually corrupt the repositories."
+    Say "  WARNING: that path is inside a cloud-synced folder. Sync clients and git"
+    Say "  both write to .git and will eventually corrupt the repositories."
     $ok = Read-Host "  Use it anyway? (y/n)"
-    if ($ok -notmatch '^[Yy]') { Die "Pick a path outside OneDrive and run the command again." }
+    if ($ok -notmatch '^[Yy]') { Die "Pick a path outside OneDrive, Dropbox, Google Drive and Box, then run the command again." }
   }
 }
 
