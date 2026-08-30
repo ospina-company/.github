@@ -97,7 +97,12 @@ else
   gh auth login || die "GitHub sign-in did not complete. Run 'gh auth login' and try again."
 fi
 
-WHO=$(gh api user --jq .login 2>/dev/null || echo '?')
+WHO=$(gh api user --jq .login 2>/dev/null || true)
+if [ -z "$WHO" ]; then
+  die "Signed in, but GitHub did not return your username.
+  Check your connection and run: gh auth status
+  Then re-run this command."
+fi
 
 if ! gh repo view ospina-company/handbook --json name >/dev/null 2>&1; then
   # "Not in the org" and "in the org but no handbook" need different asks.
@@ -159,7 +164,17 @@ install_t3() {
 }
 install_claude() {
   if [ "$PLATFORM" = mac ] && have brew; then brew install --cask claude-code >/dev/null 2>&1
-  else curl -fsSL https://claude.ai/install.sh | bash >/dev/null 2>&1; fi
+  else
+    # Download first, then run, so the script that executes is a file that can
+    # be inspected afterwards rather than a stream piped straight into a shell.
+    _ci="${TMPDIR:-/tmp}/claude-install.$$.sh"
+    if curl -fsSL https://claude.ai/install.sh -o "$_ci"; then
+      bash "$_ci" >/dev/null 2>&1; _rc=$?
+      rm -f "$_ci"; return $_rc
+    else
+      return 1
+    fi
+  fi
 }
 install_codex() {
   if have brew; then brew install codex >/dev/null 2>&1

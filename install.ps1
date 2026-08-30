@@ -69,11 +69,12 @@ function Refresh-Path {
 function Find-GitBash {
   # Git for Windows can land in several places depending on whether winget
   # installed it machine-wide or per-user, so do not assume Program Files.
-  $candidates = @(
-    (Join-Path $env:ProgramFiles 'Git\bin\bash.exe'),
-    (Join-Path ${env:ProgramFiles(x86)} 'Git\bin\bash.exe'),
-    (Join-Path $env:LOCALAPPDATA 'Programs\Git\bin\bash.exe')
-  )
+  # ProgramFiles(x86) does not exist on every edition, and Join-Path on a null
+  # root throws rather than returning nothing.
+  $roots = @($env:ProgramFiles, ${env:ProgramFiles(x86)}) | Where-Object { $_ }
+  $candidates = @()
+  foreach ($r in $roots) { $candidates += (Join-Path $r 'Git\bin\bash.exe') }
+  if ($env:LOCALAPPDATA) { $candidates += (Join-Path $env:LOCALAPPDATA 'Programs\Git\bin\bash.exe') }
   # Ask the registry where Git for Windows put itself.
   foreach ($key in @('HKLM:\SOFTWARE\GitForWindows','HKCU:\SOFTWARE\GitForWindows')) {
     try {
@@ -281,6 +282,23 @@ function Install-T3Code {
     $out = Join-Path $env:TEMP $asset.name
     Say "          downloading $($asset.name)..."
     Invoke-WebRequest $asset.browser_download_url -OutFile $out -UseBasicParsing
+    # This is a downloaded executable, so check what signed it before running.
+    # The publisher name is not asserted here because it is not documented
+    # anywhere authoritative; an unsigned or broken signature asks first.
+    $sig = Get-AuthenticodeSignature -FilePath $out
+    if ($sig.Status -eq 'Valid') {
+      Say ("          signature: valid, signed by {0}" -f $sig.SignerCertificate.Subject)
+    } else {
+      Say ""
+      Say ("          WARNING: the downloaded installer's signature is '{0}'." -f $sig.Status)
+      Say  "          It came from the official pingdotgg/t3code releases, but it is"
+      Say  "          not carrying a signature Windows trusts."
+      if (-not (Ask-YesNo "           Run it anyway?")) {
+        Remove-Item $out -ErrorAction SilentlyContinue
+        Say "          skipped. Install manually from https://t3.codes/download"
+        return $false
+      }
+    }
     Say "          running the installer..."
     Start-Process -FilePath $out -ArgumentList '/S' -Wait
     Remove-Item $out -ErrorAction SilentlyContinue
