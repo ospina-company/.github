@@ -10,7 +10,8 @@
 
 $ErrorActionPreference = 'Stop'
 
-function Say  ($m) { Write-Host $m }
+function Say  { param([string]$m, [string]$ForegroundColor)
+  if ($ForegroundColor) { Write-Host $m -ForegroundColor $ForegroundColor } else { Write-Host $m } }
 function Step ($m) { Write-Host ""; Write-Host "==> $m" -ForegroundColor Cyan }
 # Never call exit in this script. It is run with `irm ... | iex`, which
 # evaluates in the caller's session, so exit closes the user's PowerShell window
@@ -46,7 +47,11 @@ function Invoke-Native {
   $prev = $ErrorActionPreference
   $ErrorActionPreference = 'Continue'
   try {
-    if ($Interactive) { & $Exe @Arguments }
+    # Out-Host, not a bare call. Assigning the result of this function would
+    # otherwise capture the child's stdout into the variable instead of showing
+    # it, which silently hid every line bootstrap.sh printed. stderr was
+    # unaffected, which is why gh's prompts appeared and bash's output did not.
+    if ($Interactive) { & $Exe @Arguments | Out-Host }
     else              { & $Exe @Arguments 2>&1 | Out-Null }
     return $LASTEXITCODE
   } finally { $ErrorActionPreference = $prev }
@@ -350,6 +355,9 @@ $tok = Invoke-Native-Capture gh @('auth','token')
 if ($tok) {
   $env:GH_TOKEN = $tok
   Say "  passing your GitHub credential to the bootstrap step"
+  Say ""
+  Say "  Cloning can take several minutes depending on how many repositories"
+  Say "  you have access to. Progress appears below." -ForegroundColor DarkGray
 } else {
   Say "  could not read a gh token; the bootstrap step may ask you to sign in again"
 }
