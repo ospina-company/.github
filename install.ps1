@@ -413,9 +413,27 @@ function Install-T3Code {
 $agents = @(
   @{ Name = 'T3 Code';     Test = { Test-T3Code };  Install = { Install-T3Code }
      Manual = 'download from https://t3.codes/download' },
-  @{ Name = 'Claude Code'; Test = { Have claude }; Manual = 'winget install Anthropic.ClaudeCode';
-     Install = { (Invoke-Native winget @('install','--id','Anthropic.ClaudeCode','--exact','--silent',
-                   '--accept-package-agreements','--accept-source-agreements')) -eq 0 } },
+  @{ Name = 'Claude Code'; Test = { Have claude }
+     Manual = 'irm https://claude.ai/install.ps1 | iex'
+     Install = {
+       # The native installer, deliberately not winget. T3 Code updates Claude by
+       # running its native update command, and only offers that when the binary
+       # sits at ~/.local/bin/claude.exe, which is where the native installer puts
+       # it. A winget install lands outside that path, so T3 falls back to
+       # manual-only, and Anthropic documents that the native update command does
+       # not update a winget-managed install either. Native also self-updates.
+       Say "          running the official native installer..."
+       try {
+         & ([scriptblock]::Create((Invoke-RestMethod 'https://claude.ai/install.ps1')))
+         Refresh-Path
+         return (Have claude)
+       } catch {
+         Say ("          native install failed: {0}" -f $_.Exception.Message)
+         Say  "          Fallback: winget install Anthropic.ClaudeCode"
+         Say  "          (note: a winget install cannot be updated from T3 Code)"
+         return $false
+       }
+     } },
   @{ Name = 'Codex';       Test = { Test-Codex }; Manual = 'npm install -g @openai/codex';
      Diagnose = {
        # npm can install into a prefix that is not on PATH. Show where it went.
@@ -447,7 +465,13 @@ $agents = @(
          # npm is unusable or absent. Codex publishes standalone Windows
          # binaries, so there is no need to send the reader off to install Node
          # and come back.
-         Say "          npm is not usable here, so installing the standalone build."
+         Say ""
+         Say "          npm is not usable here, so the standalone build is the only"
+         Say "          option. Note the trade: T3 Code can only update Codex in one"
+         Say "          click when it was installed through a package manager, so a"
+         Say "          standalone build has to be updated by hand."
+         Say "          Fixing the execution policy and using npm avoids that."
+         Say ""
          Install-CodexBinary
        }
      } }
