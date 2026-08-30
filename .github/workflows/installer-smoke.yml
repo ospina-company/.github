@@ -98,6 +98,48 @@ jobs:
           if ($out -ne 'hello') { Write-Host "::error::capture returned '$out'"; exit 1 }
           Write-Host "Invoke-Native-Capture returned '$out'"
 
+      - name: Structural guards for known regressions
+        shell: powershell
+        run: |
+          $src = Get-Content install.ps1 -Raw
+          $fail = 0
+
+          # npm on Windows resolves to npm.ps1, which the default Restricted
+          # execution policy refuses to run. It must be invoked through cmd.
+          if ($src -match "Invoke-Native npm ") {
+            Write-Host "::error::install.ps1 calls npm directly; use cmd /c npm so the execution policy does not block npm.ps1"
+            $fail = 1
+          }
+
+          # Installing an optional agent must not be able to abort the run.
+          $agentBlock = [regex]::Match($src, '(?s)foreach \(\$a in \$agents\).*?\n\}')
+          if (-not $agentBlock.Success) {
+            Write-Host "::error::could not find the agent loop to check"; $fail = 1
+          } elseif ($agentBlock.Value -notmatch 'try\s*\{' -or $agentBlock.Value -notmatch 'catch\s*\{') {
+            Write-Host "::error::the agent install loop has no try/catch; one failing agent would abort the whole setup"
+            $fail = 1
+          } else {
+            Write-Host "agent loop is guarded by try/catch"
+          }
+
+          # exit inside an iex-delivered script closes the user's window.
+          $bad = Select-String -Path install.ps1 -Pattern '^\s*exit\s' -AllMatches
+          if ($bad) {
+            $bad | ForEach-Object { Write-Host "::error::bare exit at line $($_.LineNumber) closes the user's PowerShell window under iex" }
+            $fail = 1
+          } else { Write-Host "no bare exit calls" }
+
+          # Terminal output must be ASCII: PS 5.1's console codepage mangles UTF-8.
+          foreach ($f in @('install.ps1','preflight.ps1')) {
+            $bytes = [IO.File]::ReadAllBytes((Resolve-Path $f))
+            if ($bytes | Where-Object { $_ -gt 127 }) {
+              Write-Host "::error::$f contains non-ASCII bytes, which PowerShell 5.1 renders as mojibake"
+              $fail = 1
+            }
+          }
+          if ($fail) { exit 1 }
+          Write-Host "all structural guards passed"
+
       - name: Windows path conversion is correct
         shell: powershell
         run: |

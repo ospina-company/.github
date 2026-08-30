@@ -300,7 +300,12 @@ $agents = @(
                    '--accept-package-agreements','--accept-source-agreements')) -eq 0 } },
   @{ Name = 'Codex';       Test = { Have codex };
      Install = {
-       if (Have npm) { (Invoke-Native npm @('install','-g','@openai/codex')) -eq 0 }
+       if (Have npm) {
+         # Go through cmd. On Windows `npm` resolves to npm.ps1, and a machine
+         # on the default Restricted execution policy refuses to run it, which
+         # is not something a partner should have to diagnose.
+         (Invoke-Native cmd @('/c','npm','install','-g','@openai/codex')) -eq 0
+       }
        else {
          Say "          Codex installs through npm, and Node.js is not present."
          Say "          Install Node.js first: winget install OpenJS.NodeJS"
@@ -313,13 +318,22 @@ $agents = @(
 foreach ($a in $agents) {
   if (& $a.Test) { Say ("  ok       {0,-14} already installed" -f $a.Name); continue }
   Say ("  --       {0,-14} not found" -f $a.Name)
-  if (Ask-YesNo "           Install $($a.Name)?") {
+  if (-not (Ask-YesNo "           Install $($a.Name)?")) {
+    Say  "           skipped. You can re-run this command later and it will offer again."
+    continue
+  }
+  # Installing an agent is optional. A failure here must never take the rest of
+  # the setup down with it: the repositories and conventions matter more, and
+  # an agent can be installed by hand afterwards.
+  try {
     $okAgent = & $a.Install
     Refresh-Path
     if ($okAgent -or (& $a.Test)) { Say ("  ok       {0,-14} installed" -f $a.Name) }
     else { Say ("  note     {0,-14} not installed; a new terminal may be needed" -f $a.Name) }
-  } else {
-    Say ("           skipped. Install later from https://t3.codes if you change your mind.")
+  } catch {
+    Say ("  note     {0,-14} install failed, continuing without it" -f $a.Name)
+    Say ("           reason: {0}" -f $_.Exception.Message)
+    Say  "           Setup continues. Install it later and re-run this command."
   }
 }
 Say ""
