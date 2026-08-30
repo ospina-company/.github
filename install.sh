@@ -242,17 +242,24 @@ else
   read -r pick </dev/tty || pick=""
   [ -z "$pick" ] && pick=1
 
-  if [ "$pick" -eq "$pick" ] 2>/dev/null && [ "$pick" -ge 1 ] && [ "$pick" -le "$N" ]; then
-    i=0
-    while IFS= read -r c; do
-      [ -n "$c" ] || continue
-      i=$((i+1)); [ "$i" -eq "$pick" ] && WS="$c"
-    done < "$CANDFILE"
-  elif [ "$pick" -eq "$((N+1))" ] 2>/dev/null; then
-    printf '  Full path: '
-    read -r WS </dev/tty || WS=""
-    [ -z "$WS" ] && die "No path given."
+  if [ "$pick" -eq "$pick" ] 2>/dev/null; then
+    # Numeric input is a menu choice. A number outside the menu is a mistake,
+    # not a directory named "9".
+    if [ "$pick" -ge 1 ] && [ "$pick" -le "$N" ]; then
+      i=0
+      while IFS= read -r c; do
+        [ -n "$c" ] || continue
+        i=$((i+1)); [ "$i" -eq "$pick" ] && WS="$c"
+      done < "$CANDFILE"
+    elif [ "$pick" -eq "$((N+1))" ]; then
+      printf '  Full path: '
+      read -r WS </dev/tty || WS=""
+      [ -z "$WS" ] && die "No path given."
+    else
+      die "$pick is not one of the choices. Re-run and pick 1 to $((N+1))."
+    fi
   else
+    # Non-numeric input is treated as a literal path.
     WS="$pick"
   fi
 fi

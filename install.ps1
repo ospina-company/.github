@@ -61,12 +61,17 @@ function Invoke-Native {
 }
 
 function Refresh-Path {
+  # Merge, do not replace. A tool that added itself to this process's PATH only
+  # would otherwise disappear the moment we rebuild from the registry.
   # winget writes the new PATH to the registry; this session still holds the old
   # one. Rebuild from Machine + User so freshly installed tools are callable now
   # instead of only after a restart.
   $machine = [Environment]::GetEnvironmentVariable('Path','Machine')
   $user    = [Environment]::GetEnvironmentVariable('Path','User')
-  $env:Path = (@($machine, $user) | Where-Object { $_ }) -join ';'
+  $merged = @($machine, $user, $env:Path) | Where-Object { $_ } |
+            ForEach-Object { $_ -split ';' } | Where-Object { $_ } |
+            Select-Object -Unique
+  $env:Path = ($merged -join ';')
 }
 
 function Find-GitBash {
@@ -206,7 +211,10 @@ $who = (Invoke-Native-Capture gh @('api','user','--jq','.login'))
 if ((Invoke-Native gh @('repo','view','ospina-company/handbook','--json','name')) -ne 0) {
   # Distinguish "not in the org" from "in the org, but the team is missing
   # handbook". They need completely different things asked for.
-  $inOrg = (Invoke-Native gh @('api',"orgs/ospina-company/members/$who")) -eq 0
+  # Without a login there is no membership endpoint to ask about; treat it as
+  # "not a member" so the reader gets the invite path rather than a bad request.
+  $inOrg = $false
+  if ($who) { $inOrg = (Invoke-Native gh @('api',"orgs/ospina-company/members/$who")) -eq 0 }
 
   Say ""
   Say "  ------------------------------------------------------------------"
@@ -438,13 +446,19 @@ if ($env:OSPINA_WORKSPACE) {
   $pick = Read-Host "  Choice [1]"
   if ([string]::IsNullOrWhiteSpace($pick)) { $pick = '1' }
 
-  if ($pick -as [int] -and [int]$pick -ge 1 -and [int]$pick -le $cands.Count) {
-    $ws = $cands[[int]$pick - 1].Path
-  } elseif ($pick -as [int] -and [int]$pick -eq ($cands.Count + 1)) {
-    $ws = Read-Host "  Full path"
-    if ([string]::IsNullOrWhiteSpace($ws)) { Die "No path given." }
+  if ($pick -as [int]) {
+    $n = [int]$pick
+    if ($n -ge 1 -and $n -le $cands.Count) {
+      $ws = $cands[$n - 1].Path
+    } elseif ($n -eq ($cands.Count + 1)) {
+      $ws = Read-Host "  Full path"
+      if ([string]::IsNullOrWhiteSpace($ws)) { Die "No path given." }
+    } else {
+      # A number outside the menu is a mistyped choice, not a directory called "9".
+      Die "$n is not one of the choices. Re-run and pick 1 to $($cands.Count + 1)."
+    }
   } else {
-    # Treat anything else as a literal path, so typing one still works.
+    # Non-numeric input is treated as a literal path, so typing one still works.
     $ws = $pick
   }
   $ws = [Environment]::ExpandEnvironmentVariables($ws)
