@@ -263,6 +263,19 @@ function Ask-YesNo ($question) {
   return ([string]::IsNullOrWhiteSpace($a) -or $a -match '^[Yy]')
 }
 
+function Test-Codex {
+  if (Have codex) { return $true }
+  # npm global installs land in a prefix that is not always on PATH, and a tool
+  # that exists but cannot be found would otherwise be reinstalled every run.
+  $prefix = Invoke-Native-Capture cmd @('/c','npm','prefix','-g')
+  if ($prefix) {
+    foreach ($n in @('codex.cmd','codex.ps1','codex')) {
+      if (Test-Path (Join-Path $prefix $n)) { return $true }
+    }
+  }
+  return $false
+}
+
 function Test-T3Code {
   if (Have t3) { return $true }
   $paths = @(
@@ -323,17 +336,37 @@ function Install-T3Code {
 }
 
 $agents = @(
-  @{ Name = 'T3 Code';     Test = { Test-T3Code };  Install = { Install-T3Code } },
-  @{ Name = 'Claude Code'; Test = { Have claude };
+  @{ Name = 'T3 Code';     Test = { Test-T3Code };  Install = { Install-T3Code }
+     Manual = 'download from https://t3.codes/download' },
+  @{ Name = 'Claude Code'; Test = { Have claude }; Manual = 'winget install Anthropic.ClaudeCode';
      Install = { (Invoke-Native winget @('install','--id','Anthropic.ClaudeCode','--exact','--silent',
                    '--accept-package-agreements','--accept-source-agreements')) -eq 0 } },
-  @{ Name = 'Codex';       Test = { Have codex };
+  @{ Name = 'Codex';       Test = { Test-Codex }; Manual = 'npm install -g @openai/codex';
+     Diagnose = {
+       # npm can install into a prefix that is not on PATH. Show where it went.
+       $prefix = Invoke-Native-Capture cmd @('/c','npm','prefix','-g')
+       if ($prefix) {
+         Say ("           npm global prefix: {0}" -f $prefix)
+         $cand = Join-Path $prefix 'codex.cmd'
+         if (Test-Path $cand) {
+           Say  "           codex.cmd IS there, so this is a PATH problem. Add that"
+           Say  "           folder to PATH, or open a new terminal."
+         } else {
+           Say  "           codex.cmd is NOT there, so the install did not complete."
+         }
+       }
+     };
      Install = {
        if (Have npm) {
          # Go through cmd. On Windows `npm` resolves to npm.ps1, and a machine
          # on the default Restricted execution policy refuses to run it, which
          # is not something a partner should have to diagnose.
-         (Invoke-Native cmd @('/c','npm','install','-g','@openai/codex')) -eq 0
+         #
+         # -Interactive so npm's own output is visible. Swallowing it produced a
+         # run that printed "installed" while npm had done nothing useful, and
+         # left no evidence to work from.
+         Say "          running: npm install -g @openai/codex"
+         (Invoke-Native cmd @('/c','npm','install','-g','@openai/codex') -Interactive) -eq 0
        }
        else {
          Say "          Codex installs through npm, and Node.js is not present."
@@ -357,8 +390,21 @@ foreach ($a in $agents) {
   try {
     $okAgent = & $a.Install
     Refresh-Path
-    if ($okAgent -or (& $a.Test)) { Say ("  ok       {0,-14} installed" -f $a.Name) }
-    else { Say ("  note     {0,-14} not installed; a new terminal may be needed" -f $a.Name) }
+    # Trust the check, not the installer's exit code. A package manager can
+    # report success while leaving nothing callable, and claiming "installed"
+    # then means the next run asks again with no explanation.
+    if (& $a.Test) {
+      Say ("  ok       {0,-14} installed" -f $a.Name)
+    } elseif ($okAgent) {
+      Say ("  note     {0,-14} the installer reported success, but the command is" -f $a.Name)
+      Say  "           not callable yet. This is usually PATH: open a NEW terminal"
+      Say  "           and run this command again to confirm."
+      if ($a.Manual) { Say ("           If it persists, install by hand: {0}" -f $a.Manual) }
+      if ($a.Diagnose) { & $a.Diagnose }
+    } else {
+      Say ("  note     {0,-14} did not install. Setup continues without it." -f $a.Name)
+      if ($a.Manual) { Say ("           Install by hand: {0}" -f $a.Manual) }
+    }
   } catch {
     Say ("  note     {0,-14} install failed, continuing without it" -f $a.Name)
     Say ("           reason: {0}" -f $_.Exception.Message)

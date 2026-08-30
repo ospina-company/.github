@@ -148,6 +148,14 @@ jobs:
               $fail = 1
             }
           }
+          # An agent must be reported installed only when it is actually
+          # callable. Trusting the installer's exit code produced a false
+          # "installed" that made the next run ask again with no explanation.
+          if ($src -match '\$okAgent\s+-or\s+\(&\s*\$a\.Test\)') {
+            Write-Host "::error::agent success is inferred from the installer exit code; verify with the Test block instead"
+            $fail = 1
+          } else { Write-Host "agent success is verified, not assumed" }
+
           if ($fail) { exit 1 }
           Write-Host "all structural guards passed"
 
