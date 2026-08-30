@@ -114,6 +114,54 @@ if ! gh repo view ospina-company/handbook --json name >/dev/null 2>&1; then
 fi
 say "  ok       access to Ospina repositories confirmed"
 
+# ------------------------------------------------------------- coding agent
+step "Coding agent"
+say "  T3 Code is the editor this workflow uses. Claude Code and Codex are the"
+say "  agents that run inside it. You need T3 Code and at least one agent."
+say "  You bring your own Claude or Codex subscription; Ospina does not provide one."
+say ""
+
+ask_yes_no() {
+  # Default yes: this is how the workflow is set up, so the common answer
+  # should be the one you get by pressing Enter.
+  printf '%s [Y/n] ' "$1"
+  read -r _a </dev/tty || _a=""
+  case "$_a" in ''|[Yy]*) return 0 ;; *) return 1 ;; esac
+}
+
+have_t3()     { have t3 || ls -d /Applications/T3\ Code*.app >/dev/null 2>&1; }
+have_claude() { have claude; }
+have_codex()  { have codex; }
+
+install_t3() {
+  if [ "$PLATFORM" = mac ] && have brew; then brew install --cask t3-code >/dev/null 2>&1
+  else say "          open https://t3.codes/download"; return 1; fi
+}
+install_claude() {
+  if [ "$PLATFORM" = mac ] && have brew; then brew install --cask claude-code >/dev/null 2>&1
+  else curl -fsSL https://claude.ai/install.sh | bash >/dev/null 2>&1; fi
+}
+install_codex() {
+  if have brew; then brew install codex >/dev/null 2>&1
+  elif have npm; then npm install -g @openai/codex >/dev/null 2>&1
+  else say "          needs Homebrew or npm; see https://github.com/openai/codex"; return 1; fi
+}
+
+for _agent in "T3 Code|have_t3|install_t3" "Claude Code|have_claude|install_claude" "Codex|have_codex|install_codex"; do
+  _name=${_agent%%|*}; _rest=${_agent#*|}; _test=${_rest%%|*}; _inst=${_rest#*|}
+  if $_test; then printf '  ok       %-14s already installed\n' "$_name"; continue; fi
+  printf '  --       %-14s not found\n' "$_name"
+  if ask_yes_no "           Install $_name?"; then
+    say "          installing $_name, this can take a minute..."
+    if $_inst || $_test; then printf '  ok       %-14s installed\n' "$_name"
+    else printf '  note     %-14s not installed; a new terminal may be needed\n' "$_name"; fi
+  else
+    say "           skipped. Install later from https://t3.codes if you change your mind."
+  fi
+done
+say ""
+
+
 # ---------------------------------------------------------------- workspace
 step "Workspace location"
 

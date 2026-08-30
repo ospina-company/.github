@@ -237,6 +237,94 @@ if ((Invoke-Native gh @('repo','view','ospina-company/handbook','--json','name')
 }
 Say "  ok       access to Ospina repositories confirmed"
 
+# ------------------------------------------------------------ coding agent
+Step "Coding agent"
+Say "  T3 Code is the editor this workflow uses. Claude Code and Codex are the"
+Say "  agents that run inside it. You need T3 Code and at least one agent."
+Say "  You bring your own Claude or Codex subscription; Ospina does not provide one."
+Say ""
+
+function Ask-YesNo ($question) {
+  # Default yes: this is how the workflow is set up, so the common answer
+  # should be the one you get by pressing Enter.
+  $a = Read-Host "$question [Y/n]"
+  return ([string]::IsNullOrWhiteSpace($a) -or $a -match '^[Yy]')
+}
+
+function Test-T3Code {
+  if (Have t3) { return $true }
+  $paths = @(
+    (Join-Path $env:LOCALAPPDATA 'Programs\t3code'),
+    (Join-Path $env:LOCALAPPDATA 'Programs\T3 Code'),
+    (Join-Path $env:ProgramFiles 'T3 Code')
+  )
+  foreach ($p in $paths) { if (Test-Path $p) { return $true } }
+  # Anything registered as installed under a matching display name.
+  foreach ($k in @('HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*',
+                   'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*')) {
+    $hit = Get-ItemProperty $k -ErrorAction SilentlyContinue |
+           Where-Object { $_.DisplayName -like '*T3 Code*' }
+    if ($hit) { return $true }
+  }
+  return $false
+}
+
+function Install-T3Code {
+  # Not on winget, so take the signed installer from the project's own
+  # GitHub releases. Falls back to the download page if anything goes wrong.
+  try {
+    Say "          finding the latest T3 Code release..."
+    $rel = Invoke-RestMethod 'https://api.github.com/repos/pingdotgg/t3code/releases/latest' `
+                             -Headers @{ 'User-Agent' = 'ospina-installer' }
+    $asset = $rel.assets | Where-Object { $_.name -like '*x64.exe' } | Select-Object -First 1
+    if (-not $asset) { throw 'no Windows installer in the latest release' }
+    $out = Join-Path $env:TEMP $asset.name
+    Say "          downloading $($asset.name)..."
+    Invoke-WebRequest $asset.browser_download_url -OutFile $out -UseBasicParsing
+    Say "          running the installer..."
+    Start-Process -FilePath $out -ArgumentList '/S' -Wait
+    Remove-Item $out -ErrorAction SilentlyContinue
+    return $true
+  } catch {
+    Say "          could not install automatically: $($_.Exception.Message)"
+    Say "          opening the download page instead"
+    Start-Process 'https://t3.codes/download'
+    return $false
+  }
+}
+
+$agents = @(
+  @{ Name = 'T3 Code';     Test = { Test-T3Code };  Install = { Install-T3Code } },
+  @{ Name = 'Claude Code'; Test = { Have claude };
+     Install = { (Invoke-Native winget @('install','--id','Anthropic.ClaudeCode','--exact','--silent',
+                   '--accept-package-agreements','--accept-source-agreements')) -eq 0 } },
+  @{ Name = 'Codex';       Test = { Have codex };
+     Install = {
+       if (Have npm) { (Invoke-Native npm @('install','-g','@openai/codex')) -eq 0 }
+       else {
+         Say "          Codex installs through npm, and Node.js is not present."
+         Say "          Install Node.js first: winget install OpenJS.NodeJS"
+         Say "          then: npm install -g @openai/codex"
+         $false
+       }
+     } }
+)
+
+foreach ($a in $agents) {
+  if (& $a.Test) { Say ("  ok       {0,-14} already installed" -f $a.Name); continue }
+  Say ("  --       {0,-14} not found" -f $a.Name)
+  if (Ask-YesNo "           Install $($a.Name)?") {
+    $okAgent = & $a.Install
+    Refresh-Path
+    if ($okAgent -or (& $a.Test)) { Say ("  ok       {0,-14} installed" -f $a.Name) }
+    else { Say ("  note     {0,-14} not installed; a new terminal may be needed" -f $a.Name) }
+  } else {
+    Say ("           skipped. Install later from https://t3.codes if you change your mind.")
+  }
+}
+Say ""
+
+
 # ----------------------------------------------------------------- workspace
 Step "Workspace location"
 
