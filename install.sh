@@ -53,8 +53,17 @@ if [ "$PLATFORM" = mac ]; then
   else say "  note     vale did not install. Prose linting will not work; everything else will."
   fi
 else
-  have git || die "git is required. Install it with your package manager, then re-run."
-  have gh  || die "gh is required. See https://github.com/cli/cli#installation, then re-run."
+  if ! have git; then
+    die "git is required.
+  Debian/Ubuntu:  sudo apt install git
+  Fedora/RHEL:    sudo dnf install git
+  Then re-run this command."
+  fi
+  if ! have gh; then
+    die "gh (GitHub CLI) is required.
+  Install instructions: https://github.com/cli/cli/blob/trunk/docs/install_linux.md
+  Then re-run this command."
+  fi
   say "  ok       git, gh"
   have vale || say "  ${DIM}note: vale not found. Optional, but prose linting will not work.${RESET}"
 fi
@@ -181,7 +190,10 @@ if [ -n "${OSPINA_WORKSPACE:-}" ]; then
   WS="$OSPINA_WORKSPACE"
   say "  using OSPINA_WORKSPACE=$WS"
 else
-  CANDS=""
+  # Newline-delimited in a temp file, not a space-separated string: a
+  # candidate like "~/My Projects/Ospina" would otherwise word-split into two.
+  CANDFILE=$(mktemp 2>/dev/null || echo "${TMPDIR:-/tmp}/ospina-cands.$$")
+  : > "$CANDFILE"
   add_cand() {
     # Skip anything a sync client owns: git and sync both write .git.
     case "$1" in
@@ -191,11 +203,12 @@ else
     # one directory that pwd will happily report under either name. Compare the
     # inode, which is the only thing that actually settles it.
     _id=$(ls -di "$(dirname "$1")" 2>/dev/null | awk '{print $1}')
-    for existing in $CANDS; do
+    while IFS= read -r existing; do
+      [ -n "$existing" ] || continue
       _eid=$(ls -di "$(dirname "$existing")" 2>/dev/null | awk '{print $1}')
       [ -n "$_id" ] && [ "$_eid" = "$_id" ] && return 0
-    done
-    CANDS="$CANDS $1"
+    done < "$CANDFILE"
+    printf '%s\n' "$1" >> "$CANDFILE"
     N=$((N+1))
     printf '    %d) %-44s %s\n' "$N" "$1" "$2"
   }
@@ -216,7 +229,10 @@ else
 
   if [ "$pick" -eq "$pick" ] 2>/dev/null && [ "$pick" -ge 1 ] && [ "$pick" -le "$N" ]; then
     i=0
-    for c in $CANDS; do i=$((i+1)); [ "$i" -eq "$pick" ] && WS="$c"; done
+    while IFS= read -r c; do
+      [ -n "$c" ] || continue
+      i=$((i+1)); [ "$i" -eq "$pick" ] && WS="$c"
+    done < "$CANDFILE"
   elif [ "$pick" -eq "$((N+1))" ] 2>/dev/null; then
     printf '  Full path: '
     read -r WS </dev/tty || WS=""
@@ -225,6 +241,7 @@ else
     WS="$pick"
   fi
 fi
+rm -f "${CANDFILE:-}" 2>/dev/null || true
 WS="${WS/#\~/$HOME}"
 mkdir -p "$WS"
 WS=$(CDPATH= cd -- "$WS" && pwd)
@@ -233,7 +250,10 @@ say "  workspace: $WS"
 step "Handbook"
 if [ -d "$WS/handbook/.git" ]; then
   say "  ok       already cloned, updating"
-  git -C "$WS/handbook" pull -q --ff-only || say "  ${DIM}(local changes, left alone)${RESET}"
+  # A stale handbook still bootstraps, so this is deliberately not fatal. Do not
+  # guess the cause: diverged history, credentials and network all land here.
+  git -C "$WS/handbook" pull -q --ff-only \
+    || say "  ${DIM}could not update the handbook; continuing with the existing copy${RESET}"
 else
   gh repo clone ospina-company/handbook "$WS/handbook" -- -q
   say "  cloned   $WS/handbook"

@@ -68,8 +68,10 @@ if ($found.Count) { Line 'DIRTY' 'shell profiles' ("ospina block in: " + ($found
 else { Line 'CLEAN' 'shell profiles' 'no ospina block' }
 
 # 5. Git global config (per-user, so a fresh account should have none)
-$acrlf = (& git config --global --get core.autocrlf 2>$null)
-$lpath = (& git config --global --get core.longpaths 2>$null)
+if (Have git) {
+  $acrlf = (& git config --global --get core.autocrlf 2>$null)
+  $lpath = (& git config --global --get core.longpaths 2>$null)
+} else { $acrlf = $null; $lpath = $null }
 if ($acrlf -or $lpath) {
   Line 'DIRTY' 'git global config' "core.autocrlf=$acrlf core.longpaths=$lpath"; $dirty++
 } else { Line 'CLEAN' 'git global config' 'core.autocrlf and core.longpaths unset' }
@@ -81,15 +83,19 @@ if ($ws) { Line 'DIRTY' 'existing workspace' ($ws -join ', '); $dirty++ }
 else { Line 'CLEAN' 'existing workspace' 'none of the default paths exist' }
 
 Write-Host ""
-Write-Host "Inherited from the machine (installed for all users)" -ForegroundColor Cyan
-Write-Host "  These are already present, so your test will NOT exercise installing them." -ForegroundColor DarkGray
+Write-Host "Tools already present" -ForegroundColor Cyan
+Write-Host "  Your test will NOT exercise installing these. Scope is inferred from" -ForegroundColor DarkGray
+Write-Host "  the path: something under your profile is yours alone, not the machine's." -ForegroundColor DarkGray
 
 $inherited = 0
 foreach ($t in 'git','gh','vale','winget','tailscale') {
   if (Have $t) {
     $src = (Get-Command $t).Source
-    Line 'NOTE' $t $src
-    if ($t -ne 'winget') { $inherited++ }
+    # A binary under the user profile was installed for this account, so it is
+    # not evidence that the machine provides it to everyone.
+    $userScoped = $src -and $src.StartsWith($env:USERPROFILE, 'OrdinalIgnoreCase')
+    Line 'NOTE' $t ("{0}  [{1}]" -f $src, $(if ($userScoped) { 'this user' } else { 'machine-wide' }))
+    if ($t -ne 'winget' -and -not $userScoped) { $inherited++ }
   } else {
     Line 'CLEAN' $t 'not installed, so the install path WILL be tested'
   }

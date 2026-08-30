@@ -384,6 +384,10 @@ function Get-WorkspaceCandidates {
 if ($env:OSPINA_WORKSPACE) {
   $ws = $env:OSPINA_WORKSPACE
   Say "  using OSPINA_WORKSPACE=$ws"
+  # The env-var route must not skip the sync-folder check the menu applies.
+  if ($env:OneDrive -and $ws.StartsWith($env:OneDrive, 'OrdinalIgnoreCase')) {
+    Die "OSPINA_WORKSPACE points inside OneDrive. Sync clients and git both write to .git and will corrupt the repositories. Choose a path outside OneDrive."
+  }
 } else {
   $cands = @(Get-WorkspaceCandidates)
   $sysFree = (Get-PSDrive -Name ($env:SystemDrive.TrimEnd(':')) -ErrorAction SilentlyContinue).Free

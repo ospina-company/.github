@@ -9,11 +9,17 @@ on:
     paths: [ 'install.ps1', 'install.sh', 'preflight.ps1' ]
   workflow_dispatch:
 
+# Least privilege: this workflow only reads the repository.
+permissions:
+  contents: read
+
 jobs:
   windows:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - name: Parse install.ps1 with the real PowerShell parser
         shell: powershell
@@ -128,7 +134,7 @@ jobs:
           }
 
           # exit inside an iex-delivered script closes the user's window.
-          $bad = Select-String -Path install.ps1 -Pattern '^\s*exit\s' -AllMatches
+          $bad = Select-String -Path install.ps1 -Pattern '^\s*exit\b' -AllMatches
           if ($bad) {
             $bad | ForEach-Object { Write-Host "::error::bare exit at line $($_.LineNumber) closes the user's PowerShell window under iex" }
             $fail = 1
@@ -179,6 +185,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - name: Shellcheck + POSIX syntax
         run: |
           bash -n install.sh && echo "install.sh parses"
