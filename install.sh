@@ -38,9 +38,20 @@ if [ "$PLATFORM" = mac ]; then
     say "  /bin/bash -c \"\$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)\""
     die "Homebrew missing"
   fi
-  for pkg in git gh vale; do
-    if have "$pkg"; then say "  ok       $pkg"; else say "  install  $pkg"; brew install "$pkg" >/dev/null; fi
+  # git and gh are required. vale only powers the advisory prose linter, so a
+  # failure there must not end onboarding: set -e would otherwise abort the whole
+  # run before auth, clone and bootstrap ever happen.
+  for pkg in git gh; do
+    if have "$pkg"; then say "  ok       $pkg"
+    else
+      say "  install  $pkg"
+      brew install "$pkg" >/dev/null || die "Could not install $pkg. Install it manually, then re-run."
+    fi
   done
+  if have vale; then say "  ok       vale"
+  elif say "  install  vale" && brew install vale >/dev/null 2>&1; then say "  ok       vale"
+  else say "  note     vale did not install. Prose linting will not work; everything else will."
+  fi
 else
   have git || die "git is required. Install it with your package manager, then re-run."
   have gh  || die "gh is required. See https://github.com/cli/cli#installation, then re-run."

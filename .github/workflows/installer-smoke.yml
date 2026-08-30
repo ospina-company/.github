@@ -35,8 +35,13 @@ jobs:
         continue-on-error: true
         run: |
           Install-Module PSScriptAnalyzer -Force -Scope CurrentUser -ErrorAction SilentlyContinue
-          Invoke-ScriptAnalyzer -Path install.ps1,preflight.ps1 -Severity Error,Warning |
-            Format-Table -AutoSize | Out-String | Write-Host
+          # -Path binds a single string. Passing two silently analyses nothing,
+          # and continue-on-error would hide that.
+          foreach ($f in @('install.ps1','preflight.ps1')) {
+            Write-Host "--- $f"
+            Invoke-ScriptAnalyzer -Path $f -Severity Error,Warning |
+              Format-Table -AutoSize | Out-String | Write-Host
+          }
 
       - name: Helper functions behave on real Windows
         shell: powershell

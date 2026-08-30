@@ -472,6 +472,16 @@ try {
   Remove-Item Env:\GH_TOKEN -ErrorAction SilentlyContinue
 }
 
+# bootstrap.sh exits non-zero when it finished with warnings, which is not
+# necessarily a failure, but saying nothing leaves the reader guessing about
+# output that has already scrolled past.
+if ($rc -ne 0) {
+  Say ""
+  Say "  The bootstrap step finished with warnings or errors (exit $rc)." -ForegroundColor Yellow
+  Say "  Read section 7 above for which checks did not pass. Re-running this"
+  Say "  command is safe and fixes most of them."
+}
+
 } # end Invoke-OspinaInstall
 
 try {
