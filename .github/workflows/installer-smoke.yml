@@ -156,6 +156,14 @@ jobs:
             $fail = 1
           } else { Write-Host "agent success is verified, not assumed" }
 
+          # Presence is not usability. npm resolves to npm.ps1, which the default
+          # Restricted policy refuses to run, so Get-Command finding it proves
+          # nothing about whether it works.
+          if ($src -match 'if \(Have npm\)') {
+            Write-Host "::error::npm is gated on Have npm; use the functional Test-Npm check instead"
+            $fail = 1
+          } else { Write-Host "npm is checked functionally" }
+
           if ($fail) { exit 1 }
           Write-Host "all structural guards passed"
 

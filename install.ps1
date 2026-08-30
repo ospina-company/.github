@@ -263,6 +263,15 @@ function Ask-YesNo ($question) {
   return ([string]::IsNullOrWhiteSpace($a) -or $a -match '^[Yy]')
 }
 
+function Test-Npm {
+  # Get-Command finding npm proves a file exists, not that npm runs. On the
+  # default Restricted execution policy, npm resolves to npm.ps1 and PowerShell
+  # refuses to execute it, so npm is present and unusable at the same time.
+  # Ask cmd, which is the path we would actually install through.
+  if (-not (Have npm)) { return $false }
+  return (Invoke-Native cmd @('/c','npm','--version')) -eq 0
+}
+
 function Test-Codex {
   if (Have codex) { return $true }
   # npm global installs land in a prefix that is not always on PATH, and a tool
@@ -357,7 +366,7 @@ $agents = @(
        }
      };
      Install = {
-       if (Have npm) {
+       if (Test-Npm) {
          # Go through cmd. On Windows `npm` resolves to npm.ps1, and a machine
          # on the default Restricted execution policy refuses to run it, which
          # is not something a partner should have to diagnose.
@@ -367,6 +376,38 @@ $agents = @(
          # left no evidence to work from.
          Say "          running: npm install -g @openai/codex"
          (Invoke-Native cmd @('/c','npm','install','-g','@openai/codex') -Interactive) -eq 0
+       }
+       elseif (Have npm) {
+         # npm is on PATH but will not run. On Windows that is nearly always the
+         # execution policy blocking npm.ps1, which breaks npm for this account
+         # generally, not just for us.
+         Say ""
+         Say "          npm is installed but cannot run in PowerShell."
+         Say ("          Execution policy for this user: {0}" -f (Get-ExecutionPolicy -Scope CurrentUser))
+         Say  "          Windows blocks npm.ps1 under the default Restricted policy."
+         Say  "          This affects every npm command you run, not only this installer."
+         Say ""
+         Say  "          The standard developer fix, which applies to your account only"
+         Say  "          and still blocks unsigned scripts downloaded from the internet:"
+         Say  "            Set-ExecutionPolicy -Scope CurrentUser -ExecutionPolicy RemoteSigned"
+         Say ""
+         if (Ask-YesNo "           Apply that now?") {
+           try {
+             Set-ExecutionPolicy -Scope CurrentUser -ExecutionPolicy RemoteSigned -Force
+             Say ("          execution policy is now {0}" -f (Get-ExecutionPolicy -Scope CurrentUser))
+             if (Test-Npm) {
+               Say "          npm works now, installing Codex"
+               Say "          running: npm install -g @openai/codex"
+               return (Invoke-Native cmd @('/c','npm','install','-g','@openai/codex') -Interactive) -eq 0
+             }
+             Say "          npm still does not run. Open a new terminal and re-run."
+           } catch {
+             Say ("          could not change the policy: {0}" -f $_.Exception.Message)
+           }
+         } else {
+           Say "          skipped. Codex needs a working npm; the rest of setup continues."
+         }
+         $false
        }
        else {
          Say "          Codex installs through npm, and Node.js is not present."

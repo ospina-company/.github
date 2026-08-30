@@ -27,6 +27,12 @@ $admin = ([Security.Principal.WindowsPrincipal] `
          ).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 Write-Host ("  elevated   : {0}" -f $admin)
 Write-Host ("  policy     : {0}" -f (Get-ExecutionPolicy))
+if ((Get-ExecutionPolicy -Scope CurrentUser) -in @('Restricted','Undefined') -and
+    (Get-ExecutionPolicy) -eq 'Restricted') {
+  Write-Host "               Restricted blocks .ps1 files, which breaks npm (npm.ps1)." -ForegroundColor Yellow
+  Write-Host "               Fix for this account only:" -ForegroundColor Yellow
+  Write-Host "                 Set-ExecutionPolicy -Scope CurrentUser -ExecutionPolicy RemoteSigned" -ForegroundColor Yellow
+}
 Write-Host ""
 
 $dirty = 0
