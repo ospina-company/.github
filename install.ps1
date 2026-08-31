@@ -422,10 +422,9 @@ function Add-OspinaProfileBlock {
   $prefix = if ($bytes.Length -gt 0 -and $bytes[$bytes.Length - 1] -notin @(10,13)) { "`n" } else { '' }
   $appendBytes = $encoding.GetBytes($prefix + $Block.Trim() + "`n")
   $preamble = if ($bytes.Length -eq 0) { $encoding.GetPreamble() } else { [byte[]]@() }
-  $combined = New-Object byte[] ($bytes.Length + $preamble.Length + $appendBytes.Length)
-  [Array]::Copy($bytes, 0, $combined, 0, $bytes.Length)
-  [Array]::Copy($preamble, 0, $combined, $bytes.Length, $preamble.Length)
-  [Array]::Copy($appendBytes, 0, $combined, $bytes.Length + $preamble.Length, $appendBytes.Length)
+  # PowerShell 5.1 collapses an empty [byte[]] to $null; concatenation tolerates
+  # that representation while preserving every original byte in order.
+  $combined = [byte[]]@($bytes + $preamble + $appendBytes)
   [IO.File]::WriteAllBytes($Path, $combined)
 }
 function Install-OspinaPathProfiles {
