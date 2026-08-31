@@ -94,7 +94,7 @@ Write-Host "  Your test will NOT exercise installing these. Scope is inferred fr
 Write-Host "  the path: something under your profile is yours alone, not the machine's." -ForegroundColor DarkGray
 
 $inherited = 0
-foreach ($t in 'git','gh','vale','winget','tailscale') {
+foreach ($t in 'git','gh','vale','winget') {
   if (Have $t) {
     $src = (Get-Command $t).Source
     # A binary under the user profile was installed for this account, so it is
