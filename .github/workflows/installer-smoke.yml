@@ -771,7 +771,8 @@ jobs:
                           'brew install --cask libreoffice' 'pdftotext' \
                           'brew install --cask codex' 'brew install --cask t3-code' \
                           '/bin/bash "$_hb" </dev/tty' \
-                          'persist_path_front "$_brew_bin"'; do
+                          'persist_path_front "$_brew_bin"' \
+                          'persist_path_front "$HOME/.local/bin"'; do
             if ! grep -Fq "$required" install.sh; then
               echo "::error::macOS installer is missing required baseline: $required"
               exit 1
