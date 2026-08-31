@@ -176,6 +176,28 @@ jobs:
           }
           if (-not $fail) { Write-Host "all winget installs stream their output" }
 
+          # PowerShell executes function definitions in order, so a helper
+          # defined below the code that calls it does not exist yet. A partner
+          # hit exactly this: Ask-YesNo was called before its definition and the
+          # run died mid-way. Every function must be defined before the wrapper.
+          $ast2 = [System.Management.Automation.Language.Parser]::ParseFile(
+                    (Resolve-Path install.ps1), [ref]$null, [ref]$null)
+          $wrapper = $ast2.FindAll({
+            $args[0] -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+            $args[0].Name -eq 'Invoke-OspinaInstall' }, $true) | Select-Object -First 1
+          if ($wrapper) {
+            $late = $ast2.FindAll({
+              $args[0] -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true) |
+              Where-Object { $_.Name -ne 'Invoke-OspinaInstall' -and
+                             $_.Extent.StartOffset -gt $wrapper.Extent.StartOffset }
+            if ($late) {
+              $late | ForEach-Object {
+                Write-Host "::error::function $($_.Name) is defined after Invoke-OspinaInstall; hoist it above the wrapper"
+              }
+              $fail = 1
+            } else { Write-Host "all helpers are defined before the wrapper" }
+          }
+
           if ($fail) { exit 1 }
           Write-Host "all structural guards passed"
 
