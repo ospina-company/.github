@@ -375,22 +375,58 @@ function Add-UserPathEntry {
   })
   $env:Path = ((@($Dir) + $processParts) -join ';')
 }
-function Set-OspinaProfileBlock {
+function Add-OspinaProfileBlock {
   param(
     [Parameter(Mandatory)][string]$Path,
     [Parameter(Mandatory)][string]$Start,
-    [Parameter(Mandatory)][string]$End,
-    [Parameter(Mandatory)][string]$Block
+    [Parameter(Mandatory)][string]$Block,
+    [switch]$PowerShellProfile
   )
   $parent = Split-Path $Path -Parent
   if ($parent) { New-Item -ItemType Directory -Force -Path $parent | Out-Null }
-  $content = if (Test-Path $Path) { Get-Content $Path -Raw } else { '' }
-  $pattern = '(?ms)^' + [regex]::Escape($Start) + '.*?^' +
-             [regex]::Escape($End) + '[\r\n]*'
-  $content = ([regex]::Replace($content, $pattern, '')).TrimEnd()
-  if ($content) { $content += "`n`n" }
-  $content += $Block.Trim() + "`n"
-  [IO.File]::WriteAllText($Path, $content, (New-Object Text.UTF8Encoding($false)))
+
+  # Never decode and rewrite an employee's profile: doing so can change its
+  # encoding, line endings, BOM, or non-ASCII text. Detect the existing encoding
+  # only so the ASCII block is appended in the same representation.
+  $bytes = if (Test-Path $Path) { [IO.File]::ReadAllBytes($Path) } else { [byte[]]@() }
+  $encoding = $null
+  $preambleLength = 0
+  if ($bytes.Length -ge 3 -and $bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF) {
+    $encoding = New-Object Text.UTF8Encoding($true); $preambleLength = 3
+  } elseif ($bytes.Length -ge 2 -and $bytes[0] -eq 0xFF -and $bytes[1] -eq 0xFE) {
+    $encoding = [Text.Encoding]::Unicode; $preambleLength = 2
+  } elseif ($bytes.Length -ge 2 -and $bytes[0] -eq 0xFE -and $bytes[1] -eq 0xFF) {
+    $encoding = [Text.Encoding]::BigEndianUnicode; $preambleLength = 2
+  } elseif ($PowerShellProfile -and $bytes.Length -eq 0) {
+    # Windows PowerShell 5.1 needs a BOM to identify UTF-8 reliably.
+    $encoding = New-Object Text.UTF8Encoding($true)
+  } elseif ($PowerShellProfile) {
+    # A BOM-less Windows PowerShell 5.1 profile uses the active ANSI code page.
+    $encoding = [Text.Encoding]::Default
+  } else {
+    $encoding = New-Object Text.UTF8Encoding($false)
+  }
+
+  $existingText = if ($bytes.Length -gt $preambleLength) {
+    $encoding.GetString($bytes, $preambleLength, $bytes.Length - $preambleLength)
+  } else { '' }
+  if ($existingText.Contains($Start)) { return }
+
+  if ($PowerShellProfile -and (Test-Path $Path)) {
+    $signature = Get-AuthenticodeSignature -FilePath $Path -ErrorAction SilentlyContinue
+    if ($signature -and $signature.Status -eq 'Valid') {
+      Die "The signed PowerShell profile '$Path' cannot be changed safely. Ask your device administrator to add OSPINA_PREFERRED_PATH at the start of PATH, then re-run."
+    }
+  }
+
+  $prefix = if ($bytes.Length -gt 0 -and $bytes[$bytes.Length - 1] -notin @(10,13)) { "`n" } else { '' }
+  $appendBytes = $encoding.GetBytes($prefix + $Block.Trim() + "`n")
+  $preamble = if ($bytes.Length -eq 0) { $encoding.GetPreamble() } else { [byte[]]@() }
+  $combined = New-Object byte[] ($bytes.Length + $preamble.Length + $appendBytes.Length)
+  [Array]::Copy($bytes, 0, $combined, 0, $bytes.Length)
+  [Array]::Copy($preamble, 0, $combined, $bytes.Length, $preamble.Length)
+  [Array]::Copy($appendBytes, 0, $combined, $bytes.Length + $preamble.Length, $appendBytes.Length)
+  [IO.File]::WriteAllBytes($Path, $combined)
 }
 function Install-OspinaPathProfiles {
   # PowerShell 5.1 and PowerShell 7 use different profile directories. Write
@@ -415,24 +451,32 @@ if ($ospinaPreferredPath) {
     (Join-Path $documents 'WindowsPowerShell\Microsoft.PowerShell_profile.ps1'),
     (Join-Path $documents 'PowerShell\Microsoft.PowerShell_profile.ps1')
   )) {
-    Set-OspinaProfileBlock -Path $profilePath -Start $start -End $end `
-                           -Block $powerShellBlock
+    Add-OspinaProfileBlock -Path $profilePath -Start $start `
+                           -Block $powerShellBlock -PowerShellProfile
   }
 
   $bashBlock = @'
 # >>> ospina workstation PATH >>>
-if [ -n "${OSPINA_PREFERRED_PATH:-}" ]; then
-  _ospina_preferred_path=$(cygpath -p "$OSPINA_PREFERRED_PATH" 2>/dev/null || true)
+_ospina_preferred_windows_path=$(reg.exe query 'HKCU\Environment' /v OSPINA_PREFERRED_PATH 2>/dev/null |
+  tr -d '\r' | sed -n 's/^[[:space:]]*OSPINA_PREFERRED_PATH[[:space:]]*REG_[A-Z0-9_]*[[:space:]]*//p')
+if [ -z "$_ospina_preferred_windows_path" ]; then
+  _ospina_preferred_windows_path=${OSPINA_PREFERRED_PATH:-}
+fi
+if [ -n "$_ospina_preferred_windows_path" ]; then
+  _ospina_preferred_path=$(cygpath -p "$_ospina_preferred_windows_path" 2>/dev/null || true)
   if [ -n "$_ospina_preferred_path" ]; then
     PATH="$_ospina_preferred_path:$PATH"
     export PATH
   fi
-  unset _ospina_preferred_path
 fi
+unset _ospina_preferred_path _ospina_preferred_windows_path
 # <<< ospina workstation PATH <<<
 '@
-  Set-OspinaProfileBlock -Path (Join-Path $env:USERPROFILE '.bash_profile') `
-                         -Start $start -End $end -Block $bashBlock
+  $bashProfiles = @('.bash_profile','.bash_login','.profile') |
+                  ForEach-Object { Join-Path $env:USERPROFILE $_ }
+  $bashProfile = $bashProfiles | Where-Object { Test-Path $_ } | Select-Object -First 1
+  if (-not $bashProfile) { $bashProfile = $bashProfiles[0] }
+  Add-OspinaProfileBlock -Path $bashProfile -Start $start -Block $bashBlock
 }
 function Test-Codex {
   if (Have codex) { return $true }
@@ -573,6 +617,15 @@ if (-not $admin) {
   Say "  Windows may request administrator approval for LibreOffice."
 }
 
+if ((Get-ExecutionPolicy) -eq 'AllSigned') {
+  Die @"
+This account enforces PowerShell's AllSigned policy. Ospina setup needs a small
+per-user profile block so Node 24 and Python 3.12 outrank older machine tools.
+Ask your device administrator to approve that profile change or set a compatible
+policy, then re-run this command.
+"@
+}
+
 # ------------------------------------------------------------------ packages
 Step "Checking tools"
 if (-not (Have winget)) {
@@ -608,6 +661,8 @@ foreach ($p in $pkgs) {
   if ($p.Version) { $wingetArgs += @('--version',$p.Version) }
   $code = Invoke-Native winget $wingetArgs -Interactive
   Refresh-Path
+  if ($p.Cmd -eq 'node') { $null = Resolve-NodeToolchainPath }
+  if ($p.Cmd -eq 'uv') { $null = Resolve-UvOnPath }
   # A managed laptop often blocks machine-wide installs. User scope needs no admin.
   if (-not (Have $p.Cmd)) {
     Say "  retry    $($p.Cmd) with user-scope install (no admin required)"
@@ -617,6 +672,8 @@ foreach ($p in $pkgs) {
     if ($p.Version) { $wingetArgs += @('--version',$p.Version) }
     $code = Invoke-Native winget $wingetArgs -Interactive
     Refresh-Path
+    if ($p.Cmd -eq 'node') { $null = Resolve-NodeToolchainPath }
+    if ($p.Cmd -eq 'uv') { $null = Resolve-UvOnPath }
   }
   if (Have $p.Cmd) {
     Say "  ok       $($p.Cmd) installed"

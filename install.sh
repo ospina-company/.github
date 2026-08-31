@@ -46,10 +46,16 @@ persist_path_front() {
   # The installer runs under bash, while macOS opens zsh login shells by
   # default. Persist the verified ordering for both common login shells so a
   # competing older tool does not return after this process exits.
-  local _dir=$1 _profile _quoted _line
+  local _dir=$1 _profile _candidate _bash_profile _quoted _line
   printf -v _quoted '%q' "$_dir"
   _line="export PATH=${_quoted}:\$PATH"
-  for _profile in "$HOME/.zprofile" "$HOME/.bash_profile"; do
+  # Bash reads only the first existing login profile. Do not create
+  # .bash_profile over an employee's existing .bash_login or .profile.
+  _bash_profile="$HOME/.bash_profile"
+  for _candidate in "$HOME/.bash_profile" "$HOME/.bash_login" "$HOME/.profile"; do
+    if [ -f "$_candidate" ]; then _bash_profile=$_candidate; break; fi
+  done
+  for _profile in "$HOME/.zprofile" "$_bash_profile"; do
     if ! grep -Fqx "$_line" "$_profile" 2>/dev/null; then
       printf '\n# Ospina workstation PATH\n%s\n' "$_line" >> "$_profile"
     fi

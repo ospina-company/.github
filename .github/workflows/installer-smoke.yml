@@ -136,8 +136,29 @@ jobs:
             if ($nodePackage -notin (Get-NodeToolDirectories)) {
               Write-Host "::error::nested WinGet portable Node directory was not discovered"; exit 1
             }
-          } finally { $env:LOCALAPPDATA = $savedLocalAppDataForNode }
-          Write-Host "nested WinGet portable Node layout is discovered"
+            $savedCaptureFunction = (Get-Item Function:\Invoke-Native-Capture).ScriptBlock
+            $savedAddPathFunction = (Get-Item Function:\Add-UserPathEntry).ScriptBlock
+            $script:promotedNodeDirectory = $null
+            function Invoke-Native-Capture {
+              param($Exe,$Arguments)
+              if ($Exe -eq (Join-Path $nodePackage 'node.exe')) { return 'v24.19.0' }
+              if ((Split-Path $Exe -Leaf) -eq 'node.exe') { return 'v23.0.0' }
+              return $null
+            }
+            function Add-UserPathEntry { param($Dir) $script:promotedNodeDirectory = $Dir }
+            if (-not (Resolve-NodeToolchainPath) -or $script:promotedNodeDirectory -ne $nodePackage) {
+              Write-Host "::error::nested WinGet portable Node was not resolved and promoted"; exit 1
+            }
+          } finally {
+            if ($savedCaptureFunction) {
+              Set-Item Function:\Invoke-Native-Capture -Value $savedCaptureFunction
+            }
+            if ($savedAddPathFunction) {
+              Set-Item Function:\Add-UserPathEntry -Value $savedAddPathFunction
+            }
+            $env:LOCALAPPDATA = $savedLocalAppDataForNode
+          }
+          Write-Host "nested WinGet portable Node layout is resolved and promoted"
 
           # npm's per-user global prefix is not necessarily beside node.exe.
           # Prove Corepack resolution follows the trusted npm command to that
@@ -165,14 +186,30 @@ jobs:
           $profilePaths = @(
             (Join-Path $documents 'WindowsPowerShell\Microsoft.PowerShell_profile.ps1'),
             (Join-Path $documents 'PowerShell\Microsoft.PowerShell_profile.ps1'),
-            (Join-Path $env:USERPROFILE '.bash_profile')
+            (Join-Path $env:USERPROFILE '.bash_profile'),
+            (Join-Path $env:USERPROFILE '.bash_login'),
+            (Join-Path $env:USERPROFILE '.profile')
           )
           $profileBackups = @{}
           foreach ($profilePath in $profilePaths) {
             $profileBackups[$profilePath] = [pscustomobject]@{
               Existed = Test-Path $profilePath
-              Content = if (Test-Path $profilePath) { Get-Content $profilePath -Raw } else { $null }
+              Bytes = if (Test-Path $profilePath) { [IO.File]::ReadAllBytes($profilePath) } else { $null }
             }
+          }
+          # Seed three different encodings. The installer must append its block
+          # without changing a single pre-existing byte.
+          $profileFixtures = @{}
+          $profileFixtures[$profilePaths[0]] = [byte[]]([Text.Encoding]::Unicode.GetPreamble() +
+            [Text.Encoding]::Unicode.GetBytes("# café`r`n"))
+          $profileFixtures[$profilePaths[1]] = [byte[]]((New-Object Text.UTF8Encoding($true)).GetPreamble() +
+            (New-Object Text.UTF8Encoding($true)).GetBytes("# привет`n"))
+          # Seed only .profile so creating .bash_profile would suppress it.
+          $profileFixtures[$profilePaths[4]] = (New-Object Text.UTF8Encoding($false)).GetBytes("# café`n")
+          Remove-Item $profilePaths[2],$profilePaths[3] -Force -ErrorAction SilentlyContinue
+          foreach ($profilePath in $profileFixtures.Keys) {
+            New-Item -ItemType Directory -Force -Path (Split-Path $profilePath -Parent) | Out-Null
+            [IO.File]::WriteAllBytes($profilePath, $profileFixtures[$profilePath])
           }
           $uvRoot = Join-Path $env:RUNNER_TEMP 'uv-path-fixture'
           $oldUvDir = Join-Path $uvRoot 'old'
@@ -208,6 +245,30 @@ jobs:
             if ($freshUv -ne (Join-Path $newUvDir 'uv.exe')) {
               Write-Host "::error::new PowerShell resolved '$freshUv' instead of the promoted uv"; exit 1
             }
+            if ((Test-Path $profilePaths[2]) -or (Test-Path $profilePaths[3])) {
+              Write-Host "::error::installer hid an existing .profile behind a new Bash profile"; exit 1
+            }
+            foreach ($profilePath in $profileFixtures.Keys) {
+              $after = [IO.File]::ReadAllBytes($profilePath)
+              $before = [byte[]]$profileFixtures[$profilePath]
+              if ($after.Length -le $before.Length) {
+                Write-Host "::error::profile block was not appended: $profilePath"; exit 1
+              }
+              $prefixAfter = [byte[]]$after[0..($before.Length - 1)]
+              if ([Convert]::ToBase64String($before) -ne
+                  [Convert]::ToBase64String($prefixAfter)) {
+                Write-Host "::error::existing profile bytes changed: $profilePath"; exit 1
+              }
+            }
+            # Remove the inherited process value. Git Bash must read the current
+            # HKCU value and still promote uv in a new login shell.
+            $env:OSPINA_PREFERRED_PATH = $null
+            $freshUvBash = (& $bash -lc 'command -v uv.exe || command -v uv' |
+              Select-Object -Last 1).Trim()
+            $expectedUvBash = (& $bash -c "cygpath -u '$newUvDir\uv.exe'").Trim()
+            if ($freshUvBash -ne $expectedUvBash) {
+              Write-Host "::error::new Git Bash resolved '$freshUvBash' instead of '$expectedUvBash'"; exit 1
+            }
           } finally {
             $env:Path = $savedPath
             $env:LOCALAPPDATA = $savedLocalAppData
@@ -218,8 +279,7 @@ jobs:
               $backup = $profileBackups[$profilePath]
               if ($backup.Existed) {
                 New-Item -ItemType Directory -Force -Path (Split-Path $profilePath -Parent) | Out-Null
-                [IO.File]::WriteAllText($profilePath, $backup.Content,
-                  (New-Object Text.UTF8Encoding($false)))
+                [IO.File]::WriteAllBytes($profilePath, $backup.Bytes)
               } elseif (Test-Path $profilePath) { Remove-Item $profilePath -Force }
             }
           }
@@ -418,6 +478,12 @@ jobs:
             Write-Host "::error::Windows Node must stay pinned to the reviewed 24.x Winget version"
             $fail = 1
           }
+          $nodeResolverCalls = [regex]::Matches(
+            $src, 'if \(\$p\.Cmd -eq ''node''\) \{ \$null = Resolve-NodeToolchainPath \}')
+          if ($nodeResolverCalls.Count -lt 2) {
+            Write-Host "::error::both WinGet attempts must resolve portable Node before the generic required-tool failure"
+            $fail = 1
+          }
           if ($src -notmatch 'Test-UvDefaultInstall') {
             Write-Host "::error::the installer must reject or upgrade uv versions without --default support"
             $fail = 1
@@ -608,7 +674,8 @@ jobs:
           for required in 'node@24' 'corepack enable' 'uv python install 3.12' \
                           'brew install --cask libreoffice' 'pdftotext' \
                           'brew install --cask codex' 'brew install --cask t3-code' \
-                          '/bin/bash "$_hb" </dev/tty'; do
+                          '/bin/bash "$_hb" </dev/tty' \
+                          'persist_path_front "$_brew_bin"'; do
             if ! grep -Fq "$required" install.sh; then
               echo "::error::macOS installer is missing required baseline: $required"
               exit 1
@@ -653,6 +720,7 @@ jobs:
           HOME="$RUNNER_TEMP/ospina-home"
           export HOME
           mkdir -p "$HOME"
+          printf 'profile sentinel\n' > "$HOME/.profile"
           persist_path_front "$new_bin"
           brew_bin=$(dirname "$(command -v brew)")
           persist_path_front "$brew_bin"
@@ -662,4 +730,6 @@ jobs:
           [ "$resolved" = "$new_bin/uv" ]
           resolved_brew=$(PATH=/usr/bin:/bin zsh -l -c 'command -v brew')
           [ "$resolved_brew" = "$brew_bin/brew" ]
+          [ ! -e "$HOME/.bash_profile" ]
+          grep -Fq 'profile sentinel' "$HOME/.profile"
           echo "Homebrew and competing-old-uv recovery persist in a new login shell"
