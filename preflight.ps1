@@ -25,6 +25,8 @@ function Have-UsablePython ($c) {
 }
 function Test-IsUserScopedTool ($Tool, $Source) {
   if (-not $Source) { return $false }
+  if ($Source.StartsWith('HKCU:', 'OrdinalIgnoreCase')) { return $true }
+  if ($Source.StartsWith('HKLM:', 'OrdinalIgnoreCase')) { return $false }
   $isAlias = $Source -match '(?i)\\Microsoft\\WindowsApps\\'
   if ($Tool -in @('python','python3') -and $isAlias) {
     return (Test-StorePythonPackage)
@@ -60,7 +62,7 @@ function Get-T3CodePath {
                      'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*')) {
     $hit = Get-ItemProperty $key -ErrorAction SilentlyContinue |
            Where-Object { $_.DisplayName -like '*T3 Code*' } | Select-Object -First 1
-    if ($hit) { return '[registered application]' }
+    if ($hit) { return $key.TrimEnd('*') }
   }
   return $null
 }

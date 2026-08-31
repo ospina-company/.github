@@ -217,6 +217,21 @@ function Invoke-NodeToolCapture ($Name, [string[]] $Arguments = @()) {
   if (-not $tool) { return $null }
   return (Invoke-Native-Capture $tool $Arguments)
 }
+function Get-CorepackPath {
+  $tool = Get-NodeToolPath 'corepack'
+  if ($tool) { return $tool }
+
+  # A per-user `npm install -g corepack` writes its command shim to npm's
+  # global prefix, which need not be beside node.exe or inside WinGet's package
+  # directory. Resolve npm itself by trusted absolute path, then inspect only
+  # the prefix npm reports.
+  $prefix = Invoke-NodeToolCapture 'npm' @('prefix','-g')
+  if ($prefix) {
+    $candidate = Join-Path $prefix 'corepack.cmd'
+    if (Test-Path $candidate) { return $candidate }
+  }
+  return $null
+}
 function Test-UvDefaultInstall ([string] $UvExe = 'uv') {
   if ($UvExe -eq 'uv' -and -not (Have uv)) { return $false }
   if ($UvExe -ne 'uv' -and -not (Test-Path $UvExe)) { return $false }
@@ -593,15 +608,18 @@ if (-not (Have corepack)) {
   if ($npm) { $rc = Invoke-Native $npm @('install','-g','corepack') -Interactive }
   else { $rc = 127 }
   Refresh-Path
-  if ($rc -ne 0 -or -not (Have corepack)) {
+  $installedCorepack = Get-CorepackPath
+  if ($rc -ne 0 -or -not $installedCorepack) {
     Say "  note     Corepack did not install. pnpm repositories will not run yet."
     $corepackReady = $false
+  } else {
+    Add-UserPathEntry (Split-Path $installedCorepack -Parent)
   }
 }
 if ($corepackReady) {
   $corepackDir = Join-Path $env:USERPROFILE '.local\bin'
   New-Item -ItemType Directory -Force -Path $corepackDir | Out-Null
-  $corepack = Get-NodeToolPath 'corepack'
+  $corepack = Get-CorepackPath
   if (-not $corepack -or
       (Invoke-Native $corepack @('enable','--install-directory',$corepackDir)) -ne 0) {
     Say "  note     Corepack could not enable pnpm. Setup will continue."
