@@ -379,10 +379,27 @@ function Add-UserPathEntry {
   })
   $env:Path = ((@($Dir) + $processParts) -join ';')
 }
+function Find-ByteSequence {
+  param(
+    [byte[]]$Bytes,
+    [byte[]]$Needle,
+    [int]$StartAt = 0
+  )
+  if (-not $Bytes -or -not $Needle -or $Needle.Length -gt $Bytes.Length) { return -1 }
+  for ($i = [Math]::Max(0, $StartAt); $i -le $Bytes.Length - $Needle.Length; $i++) {
+    $matched = $true
+    for ($j = 0; $j -lt $Needle.Length; $j++) {
+      if ($Bytes[$i + $j] -ne $Needle[$j]) { $matched = $false; break }
+    }
+    if ($matched) { return $i }
+  }
+  return -1
+}
 function Add-OspinaProfileBlock {
   param(
     [Parameter(Mandatory)][string]$Path,
     [Parameter(Mandatory)][string]$Start,
+    [Parameter(Mandatory)][string]$End,
     [Parameter(Mandatory)][string]$Block,
     [switch]$PowerShellProfile
   )
@@ -414,22 +431,66 @@ function Add-OspinaProfileBlock {
   $existingText = if ($bytes.Length -gt $preambleLength) {
     $encoding.GetString($bytes, $preambleLength, $bytes.Length - $preambleLength)
   } else { '' }
-  if ($existingText.Contains($Start)) { return }
+  $blockBytes = $encoding.GetBytes($Block.Trim())
+  if ((Find-ByteSequence -Bytes $bytes -Needle $blockBytes -StartAt $preambleLength) -ge 0) {
+    return
+  }
 
   if ($PowerShellProfile -and (Test-Path $Path)) {
-    $signature = Get-AuthenticodeSignature -FilePath $Path -ErrorAction SilentlyContinue
-    if ($signature -and $signature.Status -eq 'Valid') {
+    try {
+      $signature = Get-AuthenticodeSignature -FilePath $Path -ErrorAction Stop
+    } catch {
+      Die "The PowerShell signature on '$Path' could not be checked safely. Ask your device administrator to add OSPINA_PREFERRED_PATH at the start of PATH, then re-run."
+    }
+    if (-not $signature -or [string]$signature.Status -ne 'NotSigned') {
       Die "The signed PowerShell profile '$Path' cannot be changed safely. Ask your device administrator to add OSPINA_PREFERRED_PATH at the start of PATH, then re-run."
     }
   }
 
-  $prefix = if ($bytes.Length -gt 0 -and $bytes[$bytes.Length - 1] -notin @(10,13)) { "`n" } else { '' }
+  $startBytes = $encoding.GetBytes($Start)
+  $endBytes = $encoding.GetBytes($End)
+  $startIndex = Find-ByteSequence -Bytes $bytes -Needle $startBytes -StartAt $preambleLength
+  $endIndex = if ($startIndex -ge 0) {
+    Find-ByteSequence -Bytes $bytes -Needle $endBytes -StartAt ($startIndex + $startBytes.Length)
+  } else { -1 }
+  if ($startIndex -ge 0 -and $endIndex -lt 0) {
+    Die "The managed Ospina block in '$Path' is incomplete. Restore its closing marker, then re-run."
+  }
+
+  $managedBytes = $encoding.GetBytes($Block.Trim() + "`n")
+  if ($startIndex -ge 0) {
+    # Replace only the bytes between Ospina's markers. Every user-owned byte
+    # before and after the managed block remains byte-for-byte identical.
+    $afterIndex = $endIndex + $endBytes.Length
+    $before = if ($startIndex -gt 0) { [byte[]]$bytes[0..($startIndex - 1)] } else { [byte[]]@() }
+    $after = if ($afterIndex -lt $bytes.Length) {
+      [byte[]]$bytes[$afterIndex..($bytes.Length - 1)]
+    } else { [byte[]]@() }
+    $combined = [byte[]]@($before + $managedBytes + $after)
+    [IO.File]::WriteAllBytes($Path, $combined)
+    return
+  }
+
+  $prefix = if ($existingText -and -not $existingText.EndsWith("`n") -and
+                -not $existingText.EndsWith("`r")) { "`n" } else { '' }
   $appendBytes = $encoding.GetBytes($prefix + $Block.Trim() + "`n")
   $preamble = if ($bytes.Length -eq 0) { $encoding.GetPreamble() } else { [byte[]]@() }
   # PowerShell 5.1 collapses an empty [byte[]] to $null; concatenation tolerates
   # that representation while preserving every original byte in order.
   $combined = [byte[]]@($bytes + $preamble + $appendBytes)
   [IO.File]::WriteAllBytes($Path, $combined)
+}
+function Test-OspinaOnlyProfile {
+  param(
+    [Parameter(Mandatory)][string]$Path,
+    [Parameter(Mandatory)][string]$Start,
+    [Parameter(Mandatory)][string]$End
+  )
+  if (-not (Test-Path $Path)) { return $false }
+  try { $text = [IO.File]::ReadAllText($Path) } catch { return $false }
+  $pattern = '^\s*' + [regex]::Escape($Start) + '.*?' +
+             [regex]::Escape($End) + '\s*$'
+  return [regex]::IsMatch($text, $pattern, [Text.RegularExpressions.RegexOptions]::Singleline)
 }
 function Install-OspinaPathProfiles {
   # PowerShell 5.1 and PowerShell 7 use different profile directories. Write
@@ -454,7 +515,7 @@ if ($ospinaPreferredPath) {
     (Join-Path $documents 'WindowsPowerShell\Microsoft.PowerShell_profile.ps1'),
     (Join-Path $documents 'PowerShell\Microsoft.PowerShell_profile.ps1')
   )) {
-    Add-OspinaProfileBlock -Path $profilePath -Start $start `
+    Add-OspinaProfileBlock -Path $profilePath -Start $start -End $end `
                            -Block $powerShellBlock -PowerShellProfile
   }
 
@@ -479,9 +540,16 @@ unset _ospina_preferred_path _ospina_preferred_windows_path
 '@
   $bashProfiles = @('.bash_profile','.bash_login','.profile') |
                   ForEach-Object { Join-Path $env:USERPROFILE $_ }
+  # The pre-2026-08-31 installer always created .bash_profile. If that file
+  # contains only our managed block and hides an employee's older login file,
+  # remove our obsolete file so Bash can read the employee's original one.
+  if ((Test-OspinaOnlyProfile -Path $bashProfiles[0] -Start $start -End $end) -and
+      ((Test-Path $bashProfiles[1]) -or (Test-Path $bashProfiles[2]))) {
+    Remove-Item $bashProfiles[0] -Force
+  }
   $bashProfile = $bashProfiles | Where-Object { Test-Path $_ } | Select-Object -First 1
   if (-not $bashProfile) { $bashProfile = $bashProfiles[0] }
-  Add-OspinaProfileBlock -Path $bashProfile -Start $start -Block $bashBlock
+  Add-OspinaProfileBlock -Path $bashProfile -Start $start -End $end -Block $bashBlock
 }
 function Test-Codex {
   if (Have codex) { return $true }

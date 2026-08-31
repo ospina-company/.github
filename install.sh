@@ -52,6 +52,29 @@ persist_path_front() {
   # Bash reads only the first existing login profile. Do not create
   # .bash_profile over an employee's existing .bash_login or .profile.
   _bash_profile="$HOME/.bash_profile"
+  if [ -f "$_bash_profile" ] \
+    && { [ -f "$HOME/.bash_login" ] || [ -f "$HOME/.profile" ]; } \
+    && awk '
+      BEGIN { owned = 0; clean = 1; expect_path = 0 }
+      /^[[:space:]]*$/ { next }
+      /^# Ospina workstation PATH$/ {
+        if (expect_path) clean = 0
+        owned = 1
+        expect_path = 1
+        next
+      }
+      /^export PATH=.*:\$PATH$/ {
+        if (!expect_path) clean = 0
+        expect_path = 0
+        next
+      }
+      { clean = 0 }
+      END { exit !(owned && clean && !expect_path) }
+    ' "$_bash_profile"; then
+    # Older versions created this installer-only file even when it suppressed
+    # an employee's existing .bash_login or .profile. Remove only our file.
+    rm -f "$_bash_profile"
+  fi
   for _candidate in "$HOME/.bash_profile" "$HOME/.bash_login" "$HOME/.profile"; do
     if [ -f "$_candidate" ]; then _bash_profile=$_candidate; break; fi
   done

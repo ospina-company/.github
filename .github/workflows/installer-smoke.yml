@@ -202,26 +202,28 @@ jobs:
               Bytes = if (Test-Path $profilePath) { [IO.File]::ReadAllBytes($profilePath) } else { $null }
             }
           }
-          # Seed three different encodings. The installer must append its block
-          # without changing a single pre-existing byte.
-          $profileFixtures = @{}
-          $profileFixtures[$profilePaths[0]] = [byte[]]([Text.Encoding]::Unicode.GetPreamble() +
-            [Text.Encoding]::Unicode.GetBytes("# café`r`n"))
-          $profileFixtures[$profilePaths[1]] = [byte[]]((New-Object Text.UTF8Encoding($true)).GetPreamble() +
-            (New-Object Text.UTF8Encoding($true)).GetBytes("# привет`n"))
-          # Seed only .profile so creating .bash_profile would suppress it.
-          $profileFixtures[$profilePaths[4]] = (New-Object Text.UTF8Encoding($false)).GetBytes("# café`n")
-          Remove-Item $profilePaths[2],$profilePaths[3] -Force -ErrorAction SilentlyContinue
-          foreach ($profilePath in $profileFixtures.Keys) {
-            New-Item -ItemType Directory -Force -Path (Split-Path $profilePath -Parent) | Out-Null
-            [IO.File]::WriteAllBytes($profilePath, $profileFixtures[$profilePath])
-          }
-          $uvRoot = Join-Path $env:RUNNER_TEMP 'uv-path-fixture'
-          $oldUvDir = Join-Path $uvRoot 'old'
-          $newUvDir = Join-Path $uvRoot 'localapp\Microsoft\WinGet\Packages\astral-sh.uv_fixture'
-          New-Item -ItemType Directory -Force -Path $oldUvDir,$newUvDir | Out-Null
-          Set-Content -Path (Join-Path $oldUvDir 'uv.cmd') -Value '@echo old-uv-help' -Encoding ASCII
-          $uvSource = @'
+          try {
+            # Seed three different encodings. The installer must append its block
+            # without changing a single pre-existing byte. All mutations stay
+            # inside this restoration guard so a fixture/setup failure is safe.
+            $profileFixtures = @{}
+            $profileFixtures[$profilePaths[0]] = [byte[]]([Text.Encoding]::Unicode.GetPreamble() +
+              [Text.Encoding]::Unicode.GetBytes("# café`r`n"))
+            $profileFixtures[$profilePaths[1]] = [byte[]]((New-Object Text.UTF8Encoding($true)).GetPreamble() +
+              (New-Object Text.UTF8Encoding($true)).GetBytes("# привет`n"))
+            # Seed only .profile so creating .bash_profile would suppress it.
+            $profileFixtures[$profilePaths[4]] = (New-Object Text.UTF8Encoding($false)).GetBytes("# café`n")
+            Remove-Item $profilePaths[2],$profilePaths[3] -Force -ErrorAction SilentlyContinue
+            foreach ($profilePath in $profileFixtures.Keys) {
+              New-Item -ItemType Directory -Force -Path (Split-Path $profilePath -Parent) | Out-Null
+              [IO.File]::WriteAllBytes($profilePath, $profileFixtures[$profilePath])
+            }
+            $uvRoot = Join-Path $env:RUNNER_TEMP 'uv-path-fixture'
+            $oldUvDir = Join-Path $uvRoot 'old'
+            $newUvDir = Join-Path $uvRoot 'localapp\Microsoft\WinGet\Packages\astral-sh.uv_fixture'
+            New-Item -ItemType Directory -Force -Path $oldUvDir,$newUvDir | Out-Null
+            Set-Content -Path (Join-Path $oldUvDir 'uv.cmd') -Value '@echo old-uv-help' -Encoding ASCII
+            $uvSource = @'
           using System;
           public class UvFixture {
             public static int Main(string[] args) {
@@ -230,9 +232,8 @@ jobs:
             }
           }
           '@
-          Add-Type -TypeDefinition $uvSource -Language CSharp `
-                   -OutputAssembly (Join-Path $newUvDir 'uv.exe') -OutputType ConsoleApplication
-          try {
+            Add-Type -TypeDefinition $uvSource -Language CSharp `
+                     -OutputAssembly (Join-Path $newUvDir 'uv.exe') -OutputType ConsoleApplication
             $env:LOCALAPPDATA = Join-Path $uvRoot 'localapp'
             $env:Path = "$oldUvDir;$savedPath"
             if (Test-UvDefaultInstall) {
@@ -265,6 +266,57 @@ jobs:
                 Write-Host "::error::existing profile bytes changed: $profilePath"; exit 1
               }
             }
+            $start = '# >>> ospina workstation PATH >>>'
+            $end = '# <<< ospina workstation PATH <<<'
+            $legacyEnvBlock = @'
+          # >>> ospina workstation PATH >>>
+          if [ -n "${OSPINA_PREFERRED_PATH:-}" ]; then
+            _ospina_preferred_path=$(cygpath -p "$OSPINA_PREFERRED_PATH" 2>/dev/null || true)
+            if [ -n "$_ospina_preferred_path" ]; then
+              PATH="$_ospina_preferred_path:$PATH"
+              export PATH
+            fi
+            unset _ospina_preferred_path
+          fi
+          # <<< ospina workstation PATH <<<
+          '@
+            # The oldest installer created an Ospina-only .bash_profile even
+            # when it hid an employee's .profile. A rerun must remove our file.
+            [IO.File]::WriteAllText($profilePaths[2], $legacyEnvBlock.Trim() + "`n",
+                                    (New-Object Text.UTF8Encoding($false)))
+            Install-OspinaPathProfiles
+            if (Test-Path $profilePaths[2]) {
+              Write-Host "::error::legacy installer-only .bash_profile still hides .profile"; exit 1
+            }
+
+            $legacyRegistryBlock = @'
+          # user-owned sentinel
+          # >>> ospina workstation PATH >>>
+          _ospina_preferred_windows_path=$(reg.exe query 'HKCU\Environment' /v OSPINA_PREFERRED_PATH 2>/dev/null |
+            tr -d '\r' | sed -n 's/^[[:space:]]*OSPINA_PREFERRED_PATH[[:space:]]*REG_[A-Z0-9_]*[[:space:]]*//p')
+          if [ -n "$_ospina_preferred_windows_path" ]; then
+            _ospina_preferred_path=$(cygpath -p "$_ospina_preferred_windows_path" 2>/dev/null || true)
+            PATH="$_ospina_preferred_path:$PATH"
+            export PATH
+          fi
+          # <<< ospina workstation PATH <<<
+          '@
+            # The immediately previous block used reg.exe. Preserve the user's
+            # byte prefix while replacing only the marked installer-owned bytes.
+            [IO.File]::WriteAllText($profilePaths[3], $legacyRegistryBlock.Trim() + "`n",
+                                    (New-Object Text.UTF8Encoding($false)))
+            Install-OspinaPathProfiles
+            $migratedBashLogin = [IO.File]::ReadAllText($profilePaths[3])
+            if (-not $migratedBashLogin.Contains('# user-owned sentinel') -or
+                -not $migratedBashLogin.Contains('$HOME/.ospina/preferred-path') -or
+                $migratedBashLogin.Contains('reg.exe query')) {
+              Write-Host "::error::previous Git Bash block was not migrated safely"; exit 1
+            }
+            Install-OspinaPathProfiles
+            if (([regex]::Matches([IO.File]::ReadAllText($profilePaths[3]),
+                                  [regex]::Escape($start))).Count -ne 1) {
+              Write-Host "::error::migrated Git Bash block is not idempotent"; exit 1
+            }
             # Remove the inherited process value. Git Bash must read the current
             # installer-owned state file and still promote uv in a login shell.
             $env:OSPINA_PREFERRED_PATH = $null
@@ -273,6 +325,39 @@ jobs:
             $expectedUvBash = (& $bash -c "cygpath -u '$newUvDir\uv.exe'").Trim()
             if ($freshUvBash -ne $expectedUvBash) {
               Write-Host "::error::new Git Bash resolved '$freshUvBash' instead of '$expectedUvBash'"; exit 1
+            }
+
+            # Any Authenticode state other than NotSigned is immutable here,
+            # even when trust validation failed rather than returning Valid.
+            $signedFixture = Join-Path $env:RUNNER_TEMP 'signed-profile-fixture.ps1'
+            [IO.File]::WriteAllText($signedFixture, '# signed sentinel',
+                                    (New-Object Text.UTF8Encoding($false)))
+            $signedBefore = [IO.File]::ReadAllBytes($signedFixture)
+            $savedDieFunction = (Get-Item Function:\Die).ScriptBlock
+            $savedSignatureFunction = Get-Item Function:\Get-AuthenticodeSignature -ErrorAction SilentlyContinue
+            $signatureBlocked = $false
+            try {
+              function Get-AuthenticodeSignature {
+                param($FilePath,$ErrorAction)
+                return [pscustomobject]@{ Status = 'NotTrusted'; SignerCertificate = [pscustomobject]@{} }
+              }
+              function Die { param($m) throw $m }
+              try {
+                Add-OspinaProfileBlock -Path $signedFixture -Start $start -End $end `
+                                       -Block "$start`n# current`n$end" -PowerShellProfile
+              } catch { $signatureBlocked = $true }
+            } finally {
+              if ($savedSignatureFunction) {
+                Set-Item Function:\Get-AuthenticodeSignature -Value $savedSignatureFunction.ScriptBlock
+              } else {
+                Remove-Item Function:\Get-AuthenticodeSignature -ErrorAction SilentlyContinue
+              }
+              Set-Item Function:\Die -Value $savedDieFunction
+            }
+            if (-not $signatureBlocked -or
+                [Convert]::ToBase64String($signedBefore) -ne
+                [Convert]::ToBase64String([IO.File]::ReadAllBytes($signedFixture))) {
+              Write-Host "::error::untrusted signed profile was modified"; exit 1
             }
           } finally {
             $env:Path = $savedPath
@@ -732,6 +817,9 @@ jobs:
           export HOME
           mkdir -p "$HOME"
           printf 'profile sentinel\n' > "$HOME/.profile"
+          # Simulate the legacy installer suppressing .profile with a file that
+          # contains only Ospina's own PATH lines. A rerun must remove our file.
+          printf '\n# Ospina workstation PATH\nexport PATH=/legacy/bin:$PATH\n' > "$HOME/.bash_profile"
           persist_path_front "$new_bin"
           brew_bin=$(dirname "$(command -v brew)")
           persist_path_front "$brew_bin"
