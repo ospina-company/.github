@@ -182,6 +182,11 @@ jobs:
           $savedUserPath = [Environment]::GetEnvironmentVariable('Path','User')
           $savedPreferredUser = [Environment]::GetEnvironmentVariable('OSPINA_PREFERRED_PATH','User')
           $savedPreferredProcess = $env:OSPINA_PREFERRED_PATH
+          $preferredStateFile = Join-Path $env:USERPROFILE '.ospina\preferred-path'
+          $preferredStateExisted = Test-Path $preferredStateFile
+          $preferredStateBytes = if ($preferredStateExisted) {
+            [IO.File]::ReadAllBytes($preferredStateFile)
+          } else { $null }
           $documents = [Environment]::GetFolderPath('MyDocuments')
           $profilePaths = @(
             (Join-Path $documents 'WindowsPowerShell\Microsoft.PowerShell_profile.ps1'),
@@ -261,7 +266,7 @@ jobs:
               }
             }
             # Remove the inherited process value. Git Bash must read the current
-            # HKCU value and still promote uv in a new login shell.
+            # installer-owned state file and still promote uv in a login shell.
             $env:OSPINA_PREFERRED_PATH = $null
             $freshUvBash = (& $bash -lc 'command -v uv.exe || command -v uv' |
               Select-Object -Last 1).Trim()
@@ -275,6 +280,12 @@ jobs:
             [Environment]::SetEnvironmentVariable('Path', $savedUserPath, 'User')
             [Environment]::SetEnvironmentVariable('OSPINA_PREFERRED_PATH', $savedPreferredUser, 'User')
             $env:OSPINA_PREFERRED_PATH = $savedPreferredProcess
+            if ($preferredStateExisted) {
+              New-Item -ItemType Directory -Force -Path (Split-Path $preferredStateFile -Parent) | Out-Null
+              [IO.File]::WriteAllBytes($preferredStateFile, $preferredStateBytes)
+            } elseif (Test-Path $preferredStateFile) {
+              Remove-Item $preferredStateFile -Force
+            }
             foreach ($profilePath in $profilePaths) {
               $backup = $profileBackups[$profilePath]
               if ($backup.Existed) {

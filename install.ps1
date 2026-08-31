@@ -368,6 +368,10 @@ function Add-UserPathEntry {
   $preferredPath = ((@($Dir) + $preferredParts) -join ';')
   [Environment]::SetEnvironmentVariable('OSPINA_PREFERRED_PATH', $preferredPath, 'User')
   $env:OSPINA_PREFERRED_PATH = $preferredPath
+  $stateDir = Join-Path $env:USERPROFILE '.ospina'
+  New-Item -ItemType Directory -Force -Path $stateDir | Out-Null
+  [IO.File]::WriteAllText((Join-Path $stateDir 'preferred-path'), $preferredPath,
+                          (New-Object Text.UTF8Encoding($false)))
   Install-OspinaPathProfiles
 
   $processParts = @($env:Path -split ';' | Where-Object {
@@ -456,8 +460,10 @@ if ($ospinaPreferredPath) {
 
   $bashBlock = @'
 # >>> ospina workstation PATH >>>
-_ospina_preferred_windows_path=$(reg.exe query 'HKCU\Environment' /v OSPINA_PREFERRED_PATH 2>/dev/null |
-  tr -d '\r' | sed -n 's/^[[:space:]]*OSPINA_PREFERRED_PATH[[:space:]]*REG_[A-Z0-9_]*[[:space:]]*//p')
+_ospina_preferred_windows_path=
+if [ -r "$HOME/.ospina/preferred-path" ]; then
+  IFS= read -r _ospina_preferred_windows_path < "$HOME/.ospina/preferred-path" || true
+fi
 if [ -z "$_ospina_preferred_windows_path" ]; then
   _ospina_preferred_windows_path=${OSPINA_PREFERRED_PATH:-}
 fi
