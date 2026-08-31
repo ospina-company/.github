@@ -11,14 +11,26 @@
 $ErrorActionPreference = 'Continue'
 
 function Have ($c) { $null -ne (Get-Command $c -ErrorAction SilentlyContinue) }
+function Test-StorePythonPackage {
+  return $null -ne (Get-AppxPackage -Name 'PythonSoftwareFoundation.Python*' `
+                     -ErrorAction SilentlyContinue | Select-Object -First 1)
+}
 function Have-UsablePython ($c) {
   $cmd = Get-Command $c -ErrorAction SilentlyContinue
   if (-not $cmd) { return $false }
   if ($cmd.Source -notmatch '(?i)\\Microsoft\\WindowsApps\\') { return $true }
   # Windows creates zero-function Store aliases even when Python is absent.
   # Count one only when this user actually has a Store Python package.
-  return $null -ne (Get-AppxPackage -Name 'PythonSoftwareFoundation.Python*' `
-                     -ErrorAction SilentlyContinue | Select-Object -First 1)
+  return (Test-StorePythonPackage)
+}
+function Test-IsUserScopedTool ($Tool, $Source) {
+  if (-not $Source) { return $false }
+  $isAlias = $Source -match '(?i)\\Microsoft\\WindowsApps\\'
+  if ($Tool -in @('python','python3') -and $isAlias) {
+    return (Test-StorePythonPackage)
+  }
+  return (-not $isAlias -and
+          $Source.StartsWith($env:USERPROFILE, 'OrdinalIgnoreCase'))
 }
 function Get-LibreOfficePath {
   $cmd = Get-Command soffice -ErrorAction SilentlyContinue
@@ -151,9 +163,7 @@ foreach ($t in 'git','gh','node','npm','corepack','uv','python','python3',
     # not evidence that the machine provides it to everyone.
     # WindowsApps holds app execution aliases, which Windows provides. A binary
     # there sits under the profile but was not installed by this account.
-    $isAlias    = $src -and $src -match '(?i)\\Microsoft\\WindowsApps\\'
-    $userScoped = $src -and -not $isAlias -and
-                  $src.StartsWith($env:USERPROFILE, 'OrdinalIgnoreCase')
+    $userScoped = Test-IsUserScopedTool $t $src
     Line 'NOTE' $t ("{0}  [{1}]" -f $src, $(if ($userScoped) { 'this user' } else { 'machine-wide' }))
     if ($t -ne 'winget' -and -not $userScoped) { $inherited++ }
   } else {
