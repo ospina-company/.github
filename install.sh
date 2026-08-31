@@ -45,11 +45,14 @@ if [ "$PLATFORM" = mac ]; then
     if have "$pkg"; then say "  ok       $pkg"
     else
       say "  install  $pkg"
-      brew install "$pkg" >/dev/null || die "Could not install $pkg. Install it manually, then re-run."
+      # Do not hide this. A first brew install takes minutes, and with the
+      # output suppressed a working install is indistinguishable from a hang.
+      say "           this can take a few minutes; brew output follows"
+      brew install "$pkg" || die "Could not install $pkg. Install it manually, then re-run."
     fi
   done
   if have vale; then say "  ok       vale"
-  elif say "  install  vale" && brew install vale >/dev/null 2>&1; then say "  ok       vale"
+  elif say "  install  vale" && brew install vale; then say "  ok       vale"
   else say "  note     vale did not install. Prose linting will not work; everything else will."
   fi
 else
@@ -159,17 +162,17 @@ have_claude() { have claude; }
 have_codex()  { have codex; }
 
 install_t3() {
-  if [ "$PLATFORM" = mac ] && have brew; then brew install --cask t3-code >/dev/null 2>&1
+  if [ "$PLATFORM" = mac ] && have brew; then brew install --cask t3-code
   else say "          open https://t3.codes/download"; return 1; fi
 }
 install_claude() {
-  if [ "$PLATFORM" = mac ] && have brew; then brew install --cask claude-code >/dev/null 2>&1
+  if [ "$PLATFORM" = mac ] && have brew; then brew install --cask claude-code
   else
     # Download first, then run, so the script that executes is a file that can
     # be inspected afterwards rather than a stream piped straight into a shell.
     _ci="${TMPDIR:-/tmp}/claude-install.$$.sh"
     if curl -fsSL https://claude.ai/install.sh -o "$_ci"; then
-      bash "$_ci" >/dev/null 2>&1; _rc=$?
+      bash "$_ci"; _rc=$?
       rm -f "$_ci"; return $_rc
     else
       return 1
@@ -177,8 +180,8 @@ install_claude() {
   fi
 }
 install_codex() {
-  if have brew; then brew install codex >/dev/null 2>&1
-  elif have npm; then npm install -g @openai/codex >/dev/null 2>&1
+  if have brew; then brew install codex
+  elif have npm; then npm install -g @openai/codex
   else say "          needs Homebrew or npm; see https://github.com/openai/codex"; return 1; fi
 }
 
