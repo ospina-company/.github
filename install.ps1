@@ -2,9 +2,9 @@
 #
 #   irm https://raw.githubusercontent.com/ospina-company/.github/main/install.ps1 | iex
 #
-# Installs Git, GitHub CLI and Vale via winget, signs you in to GitHub, clones
-# the handbook, and hands off to handbook/bootstrap.sh running under the Git
-# Bash that Git for Windows installs.
+# Installs the workstation baseline via winget (Git, Node 24, Python 3.12 and
+# document tools), signs you in to GitHub, clones the handbook, and hands off
+# to handbook/bootstrap.sh under the Git Bash that Git for Windows installs.
 #
 # Read before running. Safe to re-run: every step checks before it acts.
 
@@ -147,35 +147,22 @@ function Test-Npm {
   if (-not (Have npm)) { return $false }
   return (Invoke-Native cmd @('/c','npm','--version')) -eq 0
 }
-function Install-CodexBinary {
-  # Codex publishes a standalone executable per architecture, which removes the
-  # Node and execution-policy dependency entirely.
+function Install-CodexOfficial {
+  # Keep vendor installation logic with OpenAI. Their supported PowerShell
+  # installer selects the right Windows architecture and install location.
   try {
-    $arch = if ($env:PROCESSOR_ARCHITECTURE -eq 'ARM64') { 'aarch64' } else { 'x86_64' }
-    $want = "codex-$arch-pc-windows-msvc.exe"
-    Say "          finding the latest Codex release..."
-    $rel = Invoke-RestMethod 'https://api.github.com/repos/openai/codex/releases/latest' `
-                             -Headers @{ 'User-Agent' = 'ospina-installer' }
-    $asset = $rel.assets | Where-Object { $_.name -eq $want } | Select-Object -First 1
-    if (-not $asset) { throw "no $want in the latest release" }
-
-    $dir = Join-Path $env:LOCALAPPDATA 'Programs\codex'
-    New-Item -ItemType Directory -Force -Path $dir | Out-Null
-    $dest = Join-Path $dir 'codex.exe'
-    Get-RemoteFile -Uri $asset.browser_download_url -OutFile $dest `
-                   -Label $want -SizeMB ([int]($asset.size/1MB))
-
-    # Put it on PATH for this account and for this session.
-    $userPath = [Environment]::GetEnvironmentVariable('Path','User')
-    if (($userPath -split ';') -notcontains $dir) {
-      [Environment]::SetEnvironmentVariable('Path', (($userPath.TrimEnd(';') + ';' + $dir).TrimStart(';')), 'User')
-      Say "          added $dir to your PATH"
-    }
-    $env:Path = "$env:Path;$dir"
+    Say "          running OpenAI's official Codex installer..."
+    $installer = Invoke-RestMethod 'https://chatgpt.com/codex/install.ps1'
+    & ([scriptblock]::Create($installer))
+    Refresh-Path
+    $null = Resolve-OnPath -Command 'codex' -Directories @(
+      (Join-Path $env:USERPROFILE '.local\bin'),
+      (Join-Path $env:USERPROFILE '.codex\bin')
+    )
     return $true
   } catch {
-    Say ("          standalone install failed: {0}" -f $_.Exception.Message)
-    Say  "          Install manually: https://github.com/openai/codex/releases/latest"
+    Say ("          official install failed: {0}" -f $_.Exception.Message)
+    Say  "          Install manually: https://learn.chatgpt.com/docs/codex/cli"
     return $false
   }
 }
@@ -216,9 +203,9 @@ function Add-UserPathEntry {
   param([Parameter(Mandatory)][string]$Dir)
   $userPath = [Environment]::GetEnvironmentVariable('Path','User')
   if (($userPath -split ';') -notcontains $Dir) {
-    [Environment]::SetEnvironmentVariable('Path', (($userPath.TrimEnd(';') + ';' + $Dir).TrimStart(';')), 'User')
+    [Environment]::SetEnvironmentVariable('Path', (($Dir.TrimEnd(';') + ';' + $userPath).TrimEnd(';')), 'User')
   }
-  if (($env:Path -split ';') -notcontains $Dir) { $env:Path = "$env:Path;$Dir" }
+  if (($env:Path -split ';') -notcontains $Dir) { $env:Path = "$Dir;$env:Path" }
 }
 function Test-Codex {
   if (Have codex) { return $true }
@@ -230,8 +217,10 @@ function Test-Codex {
       if (Test-Path (Join-Path $prefix $n)) { return $true }
     }
   }
-  # The standalone build lands here.
-  if ($env:LOCALAPPDATA -and (Test-Path (Join-Path $env:LOCALAPPDATA 'Programs\codex\codex.exe'))) { return $true }
+  foreach ($p in @((Join-Path $env:USERPROFILE '.local\bin\codex.exe'),
+                   (Join-Path $env:USERPROFILE '.codex\bin\codex.exe'))) {
+    if (Test-Path $p) { return $true }
+  }
   return $false
 }
 function Test-T3Code {
@@ -252,38 +241,13 @@ function Test-T3Code {
   return $false
 }
 function Install-T3Code {
-  # Not on winget, so take the signed installer from the project's own
-  # GitHub releases. Falls back to the download page if anything goes wrong.
+  # T3 Code now publishes an official winget package. Use its package manifest,
+  # pinned digest and upgrade path instead of scraping the latest release.
   try {
-    Say "          finding the latest T3 Code release..."
-    $rel = Invoke-RestMethod 'https://api.github.com/repos/pingdotgg/t3code/releases/latest' `
-                             -Headers @{ 'User-Agent' = 'ospina-installer' }
-    $asset = $rel.assets | Where-Object { $_.name -like '*x64.exe' } | Select-Object -First 1
-    if (-not $asset) { throw 'no Windows installer in the latest release' }
-    $out = Join-Path $env:TEMP $asset.name
-    Get-RemoteFile -Uri $asset.browser_download_url -OutFile $out `
-                   -Label $asset.name -SizeMB ([int]($asset.size/1MB))
-    # This is a downloaded executable, so check what signed it before running.
-    # The publisher name is not asserted here because it is not documented
-    # anywhere authoritative; an unsigned or broken signature asks first.
-    $sig = Get-AuthenticodeSignature -FilePath $out
-    if ($sig.Status -eq 'Valid') {
-      Say ("          signature: valid, signed by {0}" -f $sig.SignerCertificate.Subject)
-    } else {
-      Say ""
-      Say ("          WARNING: the downloaded installer's signature is '{0}'." -f $sig.Status)
-      Say  "          It came from the official pingdotgg/t3code releases, but it is"
-      Say  "          not carrying a signature Windows trusts."
-      if (-not (Ask-YesNo "           Run it anyway?")) {
-        Remove-Item $out -ErrorAction SilentlyContinue
-        Say "          skipped. Install manually from https://t3.codes/download"
-        return $false
-      }
-    }
-    Say "          running the installer..."
-    Start-Process -FilePath $out -ArgumentList '/S' -Wait
-    Remove-Item $out -ErrorAction SilentlyContinue
-    return $true
+    $rc = Invoke-Native winget @('install','--id','T3Tools.T3Code','--exact','--silent',
+            '--disable-interactivity','--accept-package-agreements','--accept-source-agreements') -Interactive
+    Refresh-Path
+    return ($rc -eq 0 -or (Test-T3Code))
   } catch {
     Say "          could not install automatically: $($_.Exception.Message)"
     Say "          opening the download page instead"
@@ -369,9 +333,12 @@ Then open a new PowerShell and run this command again.
 }
 
 $pkgs = @(
-  @{ Cmd = 'git';   Id = 'Git.Git';         Required = $true  },
-  @{ Cmd = 'gh';    Id = 'GitHub.cli';      Required = $true  },
-  @{ Cmd = 'vale';  Id = 'errata-ai.Vale';  Required = $false }
+  @{ Cmd = 'git';       Id = 'Git.Git';                 Required = $true  },
+  @{ Cmd = 'gh';        Id = 'GitHub.cli';              Required = $true  },
+  @{ Cmd = 'node';      Id = 'OpenJS.NodeJS.LTS';       Required = $true  },
+  @{ Cmd = 'uv';        Id = 'astral-sh.uv';            Required = $true  },
+  @{ Cmd = 'pdftotext'; Id = 'oschwartz10612.Poppler'; Required = $true  },
+  @{ Cmd = 'vale';      Id = 'errata-ai.Vale';          Required = $false }
 )
 foreach ($p in $pkgs) {
   if (Have $p.Cmd) { Say "  ok       $($p.Cmd)"; continue }
@@ -406,6 +373,79 @@ already installed.
     Say "  note     $($p.Cmd) not callable yet; a new terminal will pick it up"
   }
 }
+
+# Node 24 is the common version supported by T3 Code and all current Ospina
+# Node repositories. A random newer system Node is not equivalent: some repos
+# deliberately cap support below Node 25.
+$nodeMajor = Invoke-Native-Capture node @('-p','process.versions.node.split(".")[0]')
+if ($nodeMajor -ne '24') {
+  Say "  install  Node 24 LTS (current Node major: $nodeMajor)"
+  $null = Invoke-Native winget @('upgrade','--id','OpenJS.NodeJS.LTS','--exact','--silent',
+            '--disable-interactivity','--accept-package-agreements','--accept-source-agreements') -Interactive
+  Refresh-Path
+  $nodeMajor = Invoke-Native-Capture node @('-p','process.versions.node.split(".")[0]')
+  if ($nodeMajor -ne '24') {
+    $null = Invoke-Native winget @('install','--id','OpenJS.NodeJS.LTS','--exact','--silent','--force',
+              '--disable-interactivity','--accept-package-agreements','--accept-source-agreements') -Interactive
+    Refresh-Path
+    $nodeMajor = Invoke-Native-Capture node @('-p','process.versions.node.split(".")[0]')
+  }
+}
+if ($nodeMajor -ne '24') {
+  Die "Node 24 LTS is required, but Node major '$nodeMajor' is active. Remove the conflicting Node installation, then re-run."
+}
+Say "  ok       node 24 LTS"
+
+if (-not (Have corepack)) {
+  Say "  install  corepack"
+  $rc = Invoke-Native cmd @('/c','npm','install','-g','corepack') -Interactive
+  Refresh-Path
+  if ($rc -ne 0) { Die "Could not install Corepack." }
+}
+$corepackDir = Join-Path $env:USERPROFILE '.local\bin'
+New-Item -ItemType Directory -Force -Path $corepackDir | Out-Null
+if ((Invoke-Native cmd @('/c','corepack','enable','--install-directory',$corepackDir)) -ne 0) {
+  Die "Corepack could not enable the pnpm shims."
+}
+Add-UserPathEntry $corepackDir
+Say "  ok       corepack enabled (each repo selects its pinned pnpm)"
+
+Say "  install  Python 3.12 (managed by uv)"
+if ((Invoke-Native uv @('python','install','3.12','--default') -Interactive) -ne 0) {
+  Die "uv could not install Python 3.12."
+}
+$uvBin = Invoke-Native-Capture uv @('python','dir','--bin')
+if ($uvBin) { Add-UserPathEntry $uvBin }
+if ((Invoke-Native uv @('python','find','3.12')) -ne 0) {
+  Die "Python 3.12 was requested but uv cannot find it."
+}
+$pythonMinor = Invoke-Native-Capture python @('-c','import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')
+if ($pythonMinor -ne '3.12') {
+  Die "Python 3.12 is installed, but the 'python' command resolves to '$pythonMinor'. Open a new PowerShell and re-run."
+}
+Say "  ok       python command is Python 3.12"
+
+if (-not (Have soffice)) {
+  $loDirs = @(
+    (Join-Path $env:ProgramFiles 'LibreOffice\program'),
+    $(if (${env:ProgramFiles(x86)}) { Join-Path ${env:ProgramFiles(x86)} 'LibreOffice\program' }),
+    (Join-Path $env:LOCALAPPDATA 'Programs\LibreOffice\program')
+  ) | Where-Object { $_ }
+  $null = Resolve-OnPath -Command 'soffice' -Directories $loDirs
+}
+if (-not (Have soffice)) {
+  Say "  install  LibreOffice (document and workbook rendering)"
+  $null = Invoke-Native winget @('install','--id','TheDocumentFoundation.LibreOffice','--exact','--silent',
+            '--disable-interactivity','--accept-package-agreements','--accept-source-agreements') -Interactive
+  Refresh-Path
+  $null = Resolve-OnPath -Command 'soffice' -Directories @(
+    (Join-Path $env:ProgramFiles 'LibreOffice\program'),
+    $(if (${env:ProgramFiles(x86)}) { Join-Path ${env:ProgramFiles(x86)} 'LibreOffice\program' }),
+    (Join-Path $env:LOCALAPPDATA 'Programs\LibreOffice\program')
+  )
+}
+if (-not (Have soffice)) { Die "LibreOffice installed but soffice is not callable in this session." }
+Say "  ok       soffice"
 
 # Several of the repositories a partner clones are pnpm / Next.js projects, and
 # npm resolves to npm.ps1. Under the default Restricted policy none of them can
@@ -568,7 +608,7 @@ $agents = @(
          return $false
        }
      } },
-  @{ Name = 'Codex'; Command = 'codex';       Test = { Test-Codex }; Manual = 'npm install -g @openai/codex';
+  @{ Name = 'Codex'; Command = 'codex';       Test = { Test-Codex }; Manual = 'irm https://chatgpt.com/codex/install.ps1 | iex';
      Diagnose = {
        # npm can install into a prefix that is not on PATH. Show where it went.
        $prefix = Invoke-Native-Capture cmd @('/c','npm','prefix','-g')
@@ -583,38 +623,7 @@ $agents = @(
          }
        }
      };
-     Install = {
-       if (Test-Npm) {
-         # Go through cmd. On Windows `npm` resolves to npm.ps1, and a machine
-         # on the default Restricted execution policy refuses to run it, which
-         # is not something a partner should have to diagnose.
-         #
-         # -Interactive so npm's own output is visible. Swallowing it produced a
-         # run that printed "installed" while npm had done nothing useful, and
-         # left no evidence to work from.
-         Say "          running: npm install -g @openai/codex"
-         $rc = Invoke-Native cmd @('/c','npm','install','-g','@openai/codex') -Interactive
-         if ($rc -ne 0) { return $false }
-         # npm's global prefix is frequently absent from PATH on Windows.
-         Resolve-OnPath -Command 'codex' -Directories @(
-           (Invoke-Native-Capture cmd @('/c','npm','prefix','-g')),
-           (Join-Path $env:LOCALAPPDATA 'Programs\codex')
-         )
-       }
-       else {
-         # npm is unusable or absent. Codex publishes standalone Windows
-         # binaries, so there is no need to send the reader off to install Node
-         # and come back.
-         Say ""
-         Say "          npm is not usable here, so the standalone build is the only"
-         Say "          option. Note the trade: T3 Code can only update Codex in one"
-         Say "          click when it was installed through a package manager, so a"
-         Say "          standalone build has to be updated by hand."
-         Say "          Fixing the execution policy and using npm avoids that."
-         Say ""
-         Install-CodexBinary
-       }
-     } }
+     Install = { Install-CodexOfficial } }
 )
 
 foreach ($a in $agents) {
@@ -656,6 +665,38 @@ foreach ($a in $agents) {
     Say ("           reason: {0}" -f $_.Exception.Message)
     Say  "           Setup continues. Install it later and re-run this command."
   }
+}
+Say ""
+
+$null = Resolve-OnPath -Command 'claude' -Directories @(
+  (Join-Path $env:USERPROFILE '.local\bin')
+)
+$null = Resolve-OnPath -Command 'codex' -Directories @(
+  (Join-Path $env:USERPROFILE '.local\bin'),
+  (Join-Path $env:USERPROFILE '.codex\bin'),
+  (Invoke-Native-Capture cmd @('/c','npm','prefix','-g'))
+)
+$providerAuthed = $false
+if (Have claude) {
+  if ((Invoke-Native claude @('auth','status')) -eq 0) {
+    Say "  ok       Claude Code signed in"
+    $providerAuthed = $true
+  } elseif (Ask-YesNo "           Sign in to Claude Code now?") {
+    $null = Invoke-Native claude @('auth','login') -Interactive
+    $providerAuthed = (Invoke-Native claude @('auth','status')) -eq 0
+  }
+}
+if (Have codex) {
+  if ((Invoke-Native codex @('login','status')) -eq 0) {
+    Say "  ok       Codex signed in"
+    $providerAuthed = $true
+  } elseif (Ask-YesNo "           Sign in to Codex now?") {
+    $null = Invoke-Native codex @('login') -Interactive
+    if ((Invoke-Native codex @('login','status')) -eq 0) { $providerAuthed = $true }
+  }
+}
+if (-not $providerAuthed) {
+  Say "  note     Sign in to at least one agent before starting work in T3 Code."
 }
 Say ""
 

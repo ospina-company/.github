@@ -6,7 +6,7 @@ on:
   push:
     paths: [ 'install.ps1', 'install.sh', 'preflight.ps1', '.github/workflows/installer-smoke.yml' ]
   pull_request:
-    paths: [ 'install.ps1', 'install.sh', 'preflight.ps1' ]
+    paths: [ 'install.ps1', 'install.sh', 'preflight.ps1', '.github/workflows/installer-smoke.yml' ]
   workflow_dispatch:
 
 # Least privilege: this workflow only reads the repository.
@@ -166,6 +166,26 @@ jobs:
             $fail = 1
           } else { Write-Host "npm is checked functionally" }
 
+          # The machine baseline is contractual. These package IDs are the
+          # cross-platform capabilities that make T3 and artifact work usable.
+          foreach ($required in @('OpenJS.NodeJS.LTS','astral-sh.uv',
+                                   'oschwartz10612.Poppler',
+                                   'TheDocumentFoundation.LibreOffice',
+                                   'T3Tools.T3Code')) {
+            if ($src -notmatch [regex]::Escape($required)) {
+              Write-Host "::error::missing required package $required"
+              $fail = 1
+            }
+          }
+          if ($src -match 'api.github.com/repos/pingdotgg/t3code/releases/latest') {
+            Write-Host "::error::T3 Code must use its official winget package, not scrape latest release assets"
+            $fail = 1
+          }
+          if ($src -notmatch 'https://chatgpt.com/codex/install.ps1') {
+            Write-Host "::error::Codex must use OpenAI's official Windows installer"
+            $fail = 1
+          }
+
           # Every installer invocation must be visible. Hiding subprocess output
           # is what made a working install look like a hang on a bare machine.
           foreach ($m in [regex]::Matches($src, 'Invoke-Native winget @\([^)]*\)(?<tail>[^\r\n]*)')) {
@@ -297,3 +317,26 @@ jobs:
           echo "all installers in install.sh stream their output"
           sudo apt-get update -qq && sudo apt-get install -y shellcheck -qq
           shellcheck -S warning install.sh || true
+
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Parse and guard the actual macOS path
+        shell: bash
+        run: |
+          bash -n install.sh
+          for required in 'node@24' 'corepack enable' 'uv python install 3.12' \
+                          'brew install --cask libreoffice' 'pdftotext' \
+                          'brew install --cask codex' 'brew install --cask t3-code'; do
+            if ! grep -Fq "$required" install.sh; then
+              echo "::error::macOS installer is missing required baseline: $required"
+              exit 1
+            fi
+          done
+          if grep -nE '(brew install|npm install -g)[^|]*>/dev/null' install.sh; then
+            echo "::error::an installer above hides its output; let it stream"
+            exit 1
+          fi

@@ -48,13 +48,15 @@ if (Have gh) {
   } else { Line 'CLEAN' 'gh credentials' 'not signed in' }
 } else { Line 'CLEAN' 'gh credentials' 'gh not installed for this user' }
 
-# 2. Agent skills
-$skills = Join-Path $env:USERPROFILE '.claude\skills'
-if (Test-Path $skills) {
-  $n = (Get-ChildItem $skills -ErrorAction SilentlyContinue).Count
-  if ($n -gt 0) { Line 'DIRTY' 'agent skills' "$skills has $n item(s)"; $dirty++ }
-  else { Line 'CLEAN' 'agent skills' 'directory exists but is empty' }
-} else { Line 'CLEAN' 'agent skills' 'no ~/.claude/skills' }
+# 2. Agent skills. Claude and Codex use different user-level discovery roots.
+foreach ($skillRoot in @('.claude\skills','.agents\skills')) {
+  $skills = Join-Path $env:USERPROFILE $skillRoot
+  if (Test-Path $skills) {
+    $n = (Get-ChildItem $skills -ErrorAction SilentlyContinue).Count
+    if ($n -gt 0) { Line 'DIRTY' "agent skills ($skillRoot)" "$skills has $n item(s)"; $dirty++ }
+    else { Line 'CLEAN' "agent skills ($skillRoot)" 'directory exists but is empty' }
+  } else { Line 'CLEAN' "agent skills ($skillRoot)" "no ~/$($skillRoot -replace '\\','/')" }
+}
 
 # 3. Environment variables
 if ($env:OSPINA_HANDBOOK) { Line 'DIRTY' 'OSPINA_HANDBOOK' $env:OSPINA_HANDBOOK; $dirty++ }
@@ -94,7 +96,9 @@ Write-Host "  Your test will NOT exercise installing these. Scope is inferred fr
 Write-Host "  the path: something under your profile is yours alone, not the machine's." -ForegroundColor DarkGray
 
 $inherited = 0
-foreach ($t in 'git','gh','vale','winget') {
+foreach ($t in 'git','gh','node','npm','corepack','uv','python','python3',
+                    'pdftotext','pdftoppm','pdfinfo','soffice','vale',
+                    'claude','codex','winget') {
   if (Have $t) {
     $src = (Get-Command $t).Source
     # A binary under the user profile was installed for this account, so it is
