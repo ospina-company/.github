@@ -219,6 +219,7 @@ Ask your device administrator to install Homebrew from https://brew.sh, then re-
     mkdir -p "$HOME/.local/bin"
     ln -sf /Applications/LibreOffice.app/Contents/MacOS/soffice "$HOME/.local/bin/soffice"
     add_path "$HOME/.local/bin"
+    persist_path_front "$HOME/.local/bin"
   fi
   have soffice || die "LibreOffice installed but soffice is not callable. Open a new terminal and re-run."
   say "  ok       soffice"
