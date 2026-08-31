@@ -155,6 +155,10 @@ jobs:
             if ((Get-Command uv.exe).Source -ne (Join-Path $newUvDir 'uv.exe')) {
               Write-Host "::error::verified uv directory was not moved to the front of PATH"; exit 1
             }
+            Refresh-Path -MachinePath $oldUvDir -UserPath $newUvDir
+            if ((Get-Command uv.exe).Source -ne (Join-Path $newUvDir 'uv.exe')) {
+              Write-Host "::error::PATH refresh restored the obsolete machine-scoped uv"; exit 1
+            }
           } finally {
             $env:Path = $savedPath
             $env:LOCALAPPDATA = $savedLocalAppData
@@ -547,6 +551,7 @@ jobs:
         run: |
           set -euo pipefail
           eval "$(sed -n '/^add_path()/,/^}/p' install.sh)"
+          eval "$(sed -n '/^persist_path_front()/,/^}/p' install.sh)"
           eval "$(sed -n '/^can_install_homebrew()/,/^}/p' install.sh)"
           eval "$(sed -n '/^uv_supports_default()/,/^}/p' install.sh)"
           have() { command -v "$1" >/dev/null 2>&1; }
@@ -568,6 +573,12 @@ jobs:
             exit 1
           fi
           add_path "$new_bin"
+          HOME="$RUNNER_TEMP/ospina-home"
+          export HOME
+          mkdir -p "$HOME"
+          persist_path_front "$new_bin"
           uv_supports_default
           [ "$(command -v uv)" = "$new_bin/uv" ]
-          echo "non-admin Homebrew guard and competing-old-uv recovery behave correctly"
+          resolved=$(PATH="$old_bin:$PATH" zsh -l -c 'command -v uv')
+          [ "$resolved" = "$new_bin/uv" ]
+          echo "non-admin guard and competing-old-uv recovery persist in a new login shell"

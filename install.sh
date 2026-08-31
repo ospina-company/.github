@@ -41,6 +41,21 @@ add_path() {
   export PATH
 }
 
+persist_path_front() {
+  [ -d "$1" ] || return 0
+  # The installer runs under bash, while macOS opens zsh login shells by
+  # default. Persist the verified ordering for both common login shells so a
+  # competing older tool does not return after this process exits.
+  local _dir=$1 _profile _quoted _line
+  printf -v _quoted '%q' "$_dir"
+  _line="export PATH=${_quoted}:\$PATH"
+  for _profile in "$HOME/.zprofile" "$HOME/.bash_profile"; do
+    if ! grep -Fqx "$_line" "$_profile" 2>/dev/null; then
+      printf '\n# Ospina workstation PATH\n%s\n' "$_line" >> "$_profile"
+    fi
+  done
+}
+
 load_brew() {
   have brew && return 0
   for _brew in /opt/homebrew/bin/brew /usr/local/bin/brew; do
@@ -133,6 +148,7 @@ Ask your device administrator to install Homebrew from https://brew.sh, then re-
     say "  upgrade  uv (the installed version lacks 'python install --default')"
     brew upgrade uv || brew install uv || die "Could not install a current uv."
     add_path "$(brew --prefix)/bin"
+    persist_path_front "$(brew --prefix)/bin"
     hash -r
     uv_supports_default || die "A conflicting old uv is still first on PATH. Remove it, then re-run."
   fi
@@ -146,6 +162,7 @@ Ask your device administrator to install Homebrew from https://brew.sh, then re-
     # 25+ breaks repositories that cap their supported range below 25.
     brew link --overwrite --force node@24 || true
     add_path "$(brew --prefix node@24)/bin"
+    persist_path_front "$(brew --prefix node@24)/bin"
   fi
   _node_major=$(node -p 'process.versions.node.split(".")[0]' 2>/dev/null || true)
   [ "$_node_major" = 24 ] || die "Node 24 installed but is not active. Open a new terminal and re-run."
@@ -202,6 +219,7 @@ if have node; then
     mkdir -p "$HOME/.local/bin"
     if corepack enable --install-directory "$HOME/.local/bin"; then
       add_path "$HOME/.local/bin"
+      [ "$PLATFORM" = mac ] && persist_path_front "$HOME/.local/bin"
       say "  ok       corepack $(corepack --version 2>/dev/null || echo present)"
     else
       say "  note     Corepack could not enable pnpm. Setup will continue."
@@ -216,7 +234,10 @@ if have uv; then
   say "  install  Python 3.12 (managed by uv)"
   uv python install 3.12 --default || die "uv could not install Python 3.12."
   _uv_bin=$(uv python dir --bin 2>/dev/null || true)
-  [ -n "$_uv_bin" ] && add_path "$_uv_bin"
+  if [ -n "$_uv_bin" ]; then
+    add_path "$_uv_bin"
+    [ "$PLATFORM" = mac ] && persist_path_front "$_uv_bin"
+  fi
   if uv python find 3.12 >/dev/null 2>&1; then
     _python_minor=$(python -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")' 2>/dev/null || true)
     [ "$_python_minor" = 3.12 ] \
