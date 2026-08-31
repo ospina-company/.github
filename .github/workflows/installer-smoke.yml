@@ -771,13 +771,22 @@ jobs:
                           'brew install --cask libreoffice' 'pdftotext' \
                           'brew install --cask codex' 'brew install --cask t3-code' \
                           '/bin/bash "$_hb" </dev/tty' \
-                          'persist_path_front "$_brew_bin"' \
-                          'persist_path_front "$HOME/.local/bin"'; do
+                          'persist_path_front "$_brew_bin"'; do
             if ! grep -Fq "$required" install.sh; then
               echo "::error::macOS installer is missing required baseline: $required"
               exit 1
             fi
           done
+          libreoffice_block=$(awk '
+            /^  if \[ -x \/Applications\/LibreOffice\.app\/Contents\/MacOS\/soffice \]; then$/ { inside=1 }
+            inside { print }
+            inside && /^  fi$/ { exit }
+          ' install.sh)
+          if ! printf '%s\n' "$libreoffice_block" |
+               grep -Fq 'persist_path_front "$HOME/.local/bin"'; then
+            echo "::error::the LibreOffice block does not persist soffice for new shells"
+            exit 1
+          fi
           if grep -nE '(brew install|npm install -g)[^|]*>/dev/null' install.sh; then
             echo "::error::an installer above hides its output; let it stream"
             exit 1
