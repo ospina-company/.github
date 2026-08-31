@@ -20,6 +20,38 @@ function Have-UsablePython ($c) {
   return $null -ne (Get-AppxPackage -Name 'PythonSoftwareFoundation.Python*' `
                      -ErrorAction SilentlyContinue | Select-Object -First 1)
 }
+function Get-LibreOfficePath {
+  $cmd = Get-Command soffice -ErrorAction SilentlyContinue
+  if ($cmd) { return $cmd.Source }
+  foreach ($root in @($env:ProgramFiles, ${env:ProgramFiles(x86)})) {
+    if (-not $root) { continue }
+    $candidate = Join-Path $root 'LibreOffice\program\soffice.exe'
+    if (Test-Path $candidate) { return $candidate }
+  }
+  if ($env:LOCALAPPDATA) {
+    $candidate = Join-Path $env:LOCALAPPDATA 'Programs\LibreOffice\program\soffice.exe'
+    if (Test-Path $candidate) { return $candidate }
+  }
+  return $null
+}
+function Get-T3CodePath {
+  $cmd = Get-Command t3 -ErrorAction SilentlyContinue
+  if ($cmd) { return $cmd.Source }
+  foreach ($root in @($env:LOCALAPPDATA, $env:ProgramFiles)) {
+    if (-not $root) { continue }
+    foreach ($relative in @('Programs\t3code','Programs\T3 Code','T3 Code')) {
+      $candidate = Join-Path $root $relative
+      if (Test-Path $candidate) { return $candidate }
+    }
+  }
+  foreach ($key in @('HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*',
+                     'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*')) {
+    $hit = Get-ItemProperty $key -ErrorAction SilentlyContinue |
+           Where-Object { $_.DisplayName -like '*T3 Code*' } | Select-Object -First 1
+    if ($hit) { return '[registered application]' }
+  }
+  return $null
+}
 function Line ($state, $label, $detail) {
   $color = switch ($state) { 'CLEAN' {'Green'} 'DIRTY' {'Red'} default {'Yellow'} }
   Write-Host ("  {0,-6} {1,-38} {2}" -f $state, $label, $detail) -ForegroundColor $color
@@ -107,10 +139,14 @@ Write-Host "  the path: something under your profile is yours alone, not the mac
 $inherited = 0
 foreach ($t in 'git','gh','node','npm','corepack','uv','python','python3',
                     'pdftotext','pdftoppm','pdfinfo','soffice','vale',
-                    'claude','codex','winget') {
-  $present = if ($t -in @('python','python3')) { Have-UsablePython $t } else { Have $t }
+                    't3','claude','codex','winget') {
+  $specialPath = $null
+  if ($t -in @('python','python3')) { $present = Have-UsablePython $t }
+  elseif ($t -eq 'soffice') { $specialPath = Get-LibreOfficePath; $present = $null -ne $specialPath }
+  elseif ($t -eq 't3') { $specialPath = Get-T3CodePath; $present = $null -ne $specialPath }
+  else { $present = Have $t }
   if ($present) {
-    $src = (Get-Command $t).Source
+    $src = if ($specialPath) { $specialPath } else { (Get-Command $t).Source }
     # A binary under the user profile was installed for this account, so it is
     # not evidence that the machine provides it to everyone.
     # WindowsApps holds app execution aliases, which Windows provides. A binary
