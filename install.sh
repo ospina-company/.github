@@ -29,7 +29,16 @@ ask_yes_no() {
 
 add_path() {
   [ -d "$1" ] || return 0
-  case ":$PATH:" in *":$1:"*) : ;; *) PATH="$1:$PATH"; export PATH ;; esac
+  # Put the verified tool first even when this directory already appears later
+  # in PATH. Merely avoiding duplicates leaves an older binary active.
+  local _dir=$1 _part _new_path=$1
+  local -a _path_parts
+  IFS=: read -r -a _path_parts <<< "$PATH"
+  for _part in "${_path_parts[@]}"; do
+    [ -z "$_part" ] || [ "$_part" = "$_dir" ] || _new_path="$_new_path:$_part"
+  done
+  PATH=$_new_path
+  export PATH
 }
 
 load_brew() {
@@ -77,9 +86,18 @@ Ask your device administrator to install Homebrew from https://brew.sh, then re-
     if ! ask_yes_no "           Install Homebrew?"; then
       die "Homebrew is required. Re-run this command when you are ready to install it."
     fi
+    # Reviewed on 2026-08-31. Pin both the source revision and content digest;
+    # a changed privileged installer must fail closed until Platform reviews it.
+    HOMEBREW_INSTALL_COMMIT=2c31714faddf35de11f9daff6c131f30bcd54588
+    HOMEBREW_INSTALL_SHA256=12479a24be3f5307eecac7cde670fad7118640f031229e964f544b1367b52a41
     _hb=$(mktemp 2>/dev/null || echo "${TMPDIR:-/tmp}/homebrew-install.$$")
-    curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh -o "$_hb" \
+    curl -fsSL "https://raw.githubusercontent.com/Homebrew/install/$HOMEBREW_INSTALL_COMMIT/install.sh" -o "$_hb" \
       || die "Could not download the Homebrew installer."
+    _hb_actual=$(shasum -a 256 "$_hb" | awk '{print $1}')
+    if [ "$_hb_actual" != "$HOMEBREW_INSTALL_SHA256" ]; then
+      rm -f "$_hb"
+      die "Homebrew installer digest changed. Stop and ask Platform to review the new installer."
+    fi
     /bin/bash "$_hb" </dev/tty || die "Homebrew did not install successfully."
     rm -f "$_hb"
     load_brew || die "Homebrew installed but is not callable in this terminal. Open a new terminal and re-run."

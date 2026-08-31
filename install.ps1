@@ -213,22 +213,62 @@ function Invoke-NodeToolCapture ($Name, [string[]] $Arguments = @()) {
   if (-not $tool) { return $null }
   return (Invoke-Native-Capture $tool $Arguments)
 }
-function Test-UvDefaultInstall {
-  if (-not (Have uv)) { return $false }
+function Test-UvDefaultInstall ([string] $UvExe = 'uv') {
+  if ($UvExe -eq 'uv' -and -not (Have uv)) { return $false }
+  if ($UvExe -ne 'uv' -and -not (Test-Path $UvExe)) { return $false }
   # Invoke-Native-Capture intentionally returns one line, so use a direct
   # capture here because --default may appear anywhere in multi-line help.
   $prev = $ErrorActionPreference
   $ErrorActionPreference = 'Continue'
-  try { $help = (& uv python install --help 2>$null | Out-String) }
+  try { $help = (& $UvExe python install --help 2>$null | Out-String) }
   finally { $ErrorActionPreference = $prev }
   return ($help -match '(?m)--default\b')
+}
+function Get-UvCandidatePaths {
+  $paths = @()
+  $active = Get-Command uv.exe -CommandType Application -ErrorAction SilentlyContinue |
+            Select-Object -First 1
+  if ($active -and $active.Source) { $paths += $active.Source }
+  if ($env:USERPROFILE) { $paths += (Join-Path $env:USERPROFILE '.local\bin\uv.exe') }
+  if ($env:LOCALAPPDATA) {
+    $packages = Join-Path $env:LOCALAPPDATA 'Microsoft\WinGet\Packages'
+    if (Test-Path $packages) {
+      Get-ChildItem $packages -Directory -Filter 'astral-sh.uv_*' -ErrorAction SilentlyContinue |
+        Sort-Object LastWriteTime -Descending | ForEach-Object {
+          $candidate = Get-ChildItem $_.FullName -File -Filter 'uv.exe' -Recurse `
+                         -ErrorAction SilentlyContinue | Select-Object -First 1
+          if ($candidate) { $paths += $candidate.FullName }
+        }
+    }
+  }
+  return @($paths | Where-Object { $_ -and (Test-Path $_) } | Select-Object -Unique)
+}
+function Resolve-UvOnPath {
+  foreach ($candidate in (Get-UvCandidatePaths)) {
+    if (Test-UvDefaultInstall $candidate) {
+      Add-UserPathEntry (Split-Path $candidate -Parent)
+      return $true
+    }
+  }
+  return $false
 }
 function Install-CodexOfficial {
   # Keep vendor installation logic with OpenAI. Their supported PowerShell
   # installer selects the right Windows architecture and install location.
+  $tempInstaller = $null
   try {
     Say "          running OpenAI's official Codex installer..."
-    $installer = Invoke-RestMethod 'https://chatgpt.com/codex/install.ps1'
+    # Reviewed on 2026-08-31. The official endpoint is mutable, so authenticate
+    # the content before executing it and fail closed on an upstream change.
+    $expected = '391f247de2c70c7e99041979ec02dae7e76be27ac9cfc1dfe7c1eb21d48d8b97'
+    $tempInstaller = Join-Path ([IO.Path]::GetTempPath()) ("ospina-codex-install-{0}.ps1" -f $PID)
+    Get-RemoteFile -Uri 'https://chatgpt.com/codex/install.ps1' -OutFile $tempInstaller `
+                   -Label 'OpenAI Codex installer'
+    $actual = (Get-FileHash -Algorithm SHA256 $tempInstaller).Hash.ToLowerInvariant()
+    if ($actual -ne $expected) {
+      throw "OpenAI Codex installer digest changed; Platform must review the new installer"
+    }
+    $installer = Get-Content $tempInstaller -Raw
     & ([scriptblock]::Create($installer))
     Refresh-Path
     $null = Resolve-OnPath -Command 'codex' -Directories @(
@@ -240,6 +280,10 @@ function Install-CodexOfficial {
     Say ("          official install failed: {0}" -f $_.Exception.Message)
     Say  "          Install manually: https://learn.chatgpt.com/docs/codex/cli"
     return $false
+  } finally {
+    if ($tempInstaller -and (Test-Path $tempInstaller)) {
+      Remove-Item $tempInstaller -Force -ErrorAction SilentlyContinue
+    }
   }
 }
 function Resolve-OnPath {
@@ -278,10 +322,14 @@ function Test-Claude {
 function Add-UserPathEntry {
   param([Parameter(Mandatory)][string]$Dir)
   $userPath = [Environment]::GetEnvironmentVariable('Path','User')
-  if (($userPath -split ';') -notcontains $Dir) {
-    [Environment]::SetEnvironmentVariable('Path', (($Dir.TrimEnd(';') + ';' + $userPath).TrimEnd(';')), 'User')
-  }
-  if (($env:Path -split ';') -notcontains $Dir) { $env:Path = "$Dir;$env:Path" }
+  $userParts = @($userPath -split ';' | Where-Object {
+    $_ -and -not [string]::Equals($_, $Dir, [StringComparison]::OrdinalIgnoreCase)
+  })
+  [Environment]::SetEnvironmentVariable('Path', ((@($Dir) + $userParts) -join ';'), 'User')
+  $processParts = @($env:Path -split ';' | Where-Object {
+    $_ -and -not [string]::Equals($_, $Dir, [StringComparison]::OrdinalIgnoreCase)
+  })
+  $env:Path = ((@($Dir) + $processParts) -join ';')
 }
 function Test-Codex {
   if (Have codex) { return $true }
@@ -330,6 +378,32 @@ function Install-T3Code {
     Start-Process 'https://t3.codes/download'
     return $false
   }
+}
+function Get-LibreOfficeDirectories {
+  $dirs = @()
+  if ($env:ProgramFiles) { $dirs += (Join-Path $env:ProgramFiles 'LibreOffice\program') }
+  if (${env:ProgramFiles(x86)}) {
+    $dirs += (Join-Path ${env:ProgramFiles(x86)} 'LibreOffice\program')
+  }
+  if ($env:LOCALAPPDATA) {
+    $dirs += (Join-Path $env:LOCALAPPDATA 'Programs\LibreOffice\program')
+  }
+  return $dirs
+}
+function Ensure-LibreOffice {
+  if (-not (Have soffice)) {
+    $null = Resolve-OnPath -Command 'soffice' -Directories (Get-LibreOfficeDirectories)
+  }
+  if (Have soffice) { return $true }
+
+  Say "  install  LibreOffice (document and workbook rendering)"
+  $script:OspinaLibreOfficeExitCode = Invoke-Native winget @(
+    'install','--id','TheDocumentFoundation.LibreOffice','--exact','--source','winget','--silent',
+    '--disable-interactivity','--accept-package-agreements','--accept-source-agreements'
+  ) -Interactive
+  Refresh-Path
+  $null = Resolve-OnPath -Command 'soffice' -Directories (Get-LibreOfficeDirectories)
+  return (Have soffice)
 }
 function Test-SyncedPath {
   # One definition, used by the menu, the OSPINA_WORKSPACE route and the typed
@@ -460,17 +534,22 @@ already installed.
 # uv binary is not enough; update it through the reviewed WinGet source and
 # verify the capability before depending on it.
 if (-not (Test-UvDefaultInstall)) {
+  $null = Resolve-UvOnPath
+}
+if (-not (Test-UvDefaultInstall)) {
   Say "  upgrade  uv (the installed version lacks 'python install --default')"
   $uvArgs = @('upgrade','--id','astral-sh.uv','--exact','--source','winget','--silent',
               '--disable-interactivity','--accept-package-agreements','--accept-source-agreements')
   $null = Invoke-Native winget $uvArgs -Interactive
   Refresh-Path
+  $null = Resolve-UvOnPath
   if (-not (Test-UvDefaultInstall)) {
     $uvArgs = @('install','--id','astral-sh.uv','--exact','--source','winget','--silent',
                 '--scope','user','--force','--disable-interactivity',
                 '--accept-package-agreements','--accept-source-agreements')
     $null = Invoke-Native winget $uvArgs -Interactive
     Refresh-Path
+    $null = Resolve-UvOnPath
   }
 }
 if (-not (Test-UvDefaultInstall)) {
@@ -544,27 +623,8 @@ if ($pythonMinor -ne '3.12') {
 }
 Say "  ok       python command is Python 3.12"
 
-if (-not (Have soffice)) {
-  $loDirs = @(
-    (Join-Path $env:ProgramFiles 'LibreOffice\program'),
-    $(if (${env:ProgramFiles(x86)}) { Join-Path ${env:ProgramFiles(x86)} 'LibreOffice\program' }),
-    (Join-Path $env:LOCALAPPDATA 'Programs\LibreOffice\program')
-  ) | Where-Object { $_ }
-  $null = Resolve-OnPath -Command 'soffice' -Directories $loDirs
-}
-if (-not (Have soffice)) {
-  Say "  install  LibreOffice (document and workbook rendering)"
-  $loCode = Invoke-Native winget @('install','--id','TheDocumentFoundation.LibreOffice','--exact','--source','winget','--silent',
-            '--disable-interactivity','--accept-package-agreements','--accept-source-agreements') -Interactive
-  Refresh-Path
-  $null = Resolve-OnPath -Command 'soffice' -Directories @(
-    (Join-Path $env:ProgramFiles 'LibreOffice\program'),
-    $(if (${env:ProgramFiles(x86)}) { Join-Path ${env:ProgramFiles(x86)} 'LibreOffice\program' }),
-    (Join-Path $env:LOCALAPPDATA 'Programs\LibreOffice\program')
-  )
-}
-if (-not (Have soffice)) {
-  Say "  note     LibreOffice is not installed (winget exit $loCode)."
+if (-not (Ensure-LibreOffice)) {
+  Say "  note     LibreOffice is not installed (winget exit $OspinaLibreOfficeExitCode)."
   Say "           Its official WinGet package is machine-scoped and needs administrator approval."
   Say "           Setup will continue, but document and workbook visual QA will be unavailable."
 } else { Say "  ok       soffice" }
