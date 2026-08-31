@@ -198,6 +198,15 @@ jobs:
             } else { Write-Host "all helpers are defined before the wrapper" }
           }
 
+          # Windows PowerShell 5.x renders a progress bar per chunk, costing
+          # roughly 10x on a large download. Every fetch must go through
+          # Get-RemoteFile, which suppresses it and reports progress itself.
+          $iwr = [regex]::Matches($src, 'Invoke-WebRequest')
+          if ($iwr.Count -ne 1) {
+            Write-Host "::error::found $($iwr.Count) Invoke-WebRequest calls; downloads must go through Get-RemoteFile"
+            $fail = 1
+          } else { Write-Host "all downloads go through Get-RemoteFile" }
+
           if ($fail) { exit 1 }
           Write-Host "all structural guards passed"
 
