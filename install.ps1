@@ -147,6 +147,16 @@ function Test-Npm {
   if (-not (Have npm)) { return $false }
   return (Invoke-Native cmd @('/c','npm','--version')) -eq 0
 }
+function Get-NodeMajor {
+  $version = Invoke-Native-Capture node @('--version')
+  if ($version -match '^v?([0-9]+)\.') { return $Matches[1] }
+  return $null
+}
+function Get-PythonMinor {
+  $version = Invoke-Native-Capture python @('--version')
+  if ($version -match '^Python\s+([0-9]+\.[0-9]+)\.') { return $Matches[1] }
+  return $null
+}
 function Install-CodexOfficial {
   # Keep vendor installation logic with OpenAI. Their supported PowerShell
   # installer selects the right Windows architecture and install location.
@@ -332,10 +342,11 @@ Then open a new PowerShell and run this command again.
 "@
 }
 
+$NodeVersion = '24.19.0'
 $pkgs = @(
   @{ Cmd = 'git';       Id = 'Git.Git';                 Required = $true  },
   @{ Cmd = 'gh';        Id = 'GitHub.cli';              Required = $true  },
-  @{ Cmd = 'node';      Id = 'OpenJS.NodeJS.LTS';       Required = $true  },
+  @{ Cmd = 'node';      Id = 'OpenJS.NodeJS.LTS';       Required = $true; Version = $NodeVersion },
   @{ Cmd = 'uv';        Id = 'astral-sh.uv';            Required = $true  },
   @{ Cmd = 'pdftotext'; Id = 'oschwartz10612.Poppler'; Required = $true  },
   @{ Cmd = 'vale';      Id = 'errata-ai.Vale';          Required = $false }
@@ -347,16 +358,20 @@ foreach ($p in $pkgs) {
   # output made a slow first-run source update indistinguishable from a hang,
   # and would hide a prompt the reader cannot then answer.
   Say "          this can take a minute; winget output follows"
-  $code = Invoke-Native winget @('install','--id',$p.Id,'--exact','--silent',
-            '--disable-interactivity',
-            '--accept-package-agreements','--accept-source-agreements') -Interactive
+  $wingetArgs = @('install','--id',$p.Id,'--exact','--silent',
+                  '--disable-interactivity',
+                  '--accept-package-agreements','--accept-source-agreements')
+  if ($p.Version) { $wingetArgs += @('--version',$p.Version) }
+  $code = Invoke-Native winget $wingetArgs -Interactive
   Refresh-Path
   # A managed laptop often blocks machine-wide installs. User scope needs no admin.
   if (-not (Have $p.Cmd)) {
     Say "  retry    $($p.Cmd) with user-scope install (no admin required)"
-    $code = Invoke-Native winget @('install','--id',$p.Id,'--exact','--silent',
-              '--scope','user','--disable-interactivity',
-              '--accept-package-agreements','--accept-source-agreements') -Interactive
+    $wingetArgs = @('install','--id',$p.Id,'--exact','--silent','--scope','user',
+                    '--disable-interactivity','--accept-package-agreements',
+                    '--accept-source-agreements')
+    if ($p.Version) { $wingetArgs += @('--version',$p.Version) }
+    $code = Invoke-Native winget $wingetArgs -Interactive
     Refresh-Path
   }
   if (Have $p.Cmd) {
@@ -377,38 +392,41 @@ already installed.
 # Node 24 is the common version supported by T3 Code and all current Ospina
 # Node repositories. A random newer system Node is not equivalent: some repos
 # deliberately cap support below Node 25.
-$nodeMajor = Invoke-Native-Capture node @('-p','process.versions.node.split(".")[0]')
+$nodeMajor = Get-NodeMajor
 if ($nodeMajor -ne '24') {
   Say "  install  Node 24 LTS (current Node major: $nodeMajor)"
-  $null = Invoke-Native winget @('upgrade','--id','OpenJS.NodeJS.LTS','--exact','--silent',
-            '--disable-interactivity','--accept-package-agreements','--accept-source-agreements') -Interactive
+  $null = Invoke-Native winget @('install','--id','OpenJS.NodeJS.LTS','--exact','--silent',
+            '--version',$NodeVersion,'--force','--disable-interactivity',
+            '--accept-package-agreements','--accept-source-agreements') -Interactive
   Refresh-Path
-  $nodeMajor = Invoke-Native-Capture node @('-p','process.versions.node.split(".")[0]')
-  if ($nodeMajor -ne '24') {
-    $null = Invoke-Native winget @('install','--id','OpenJS.NodeJS.LTS','--exact','--silent','--force',
-              '--disable-interactivity','--accept-package-agreements','--accept-source-agreements') -Interactive
-    Refresh-Path
-    $nodeMajor = Invoke-Native-Capture node @('-p','process.versions.node.split(".")[0]')
-  }
+  $nodeMajor = Get-NodeMajor
 }
 if ($nodeMajor -ne '24') {
   Die "Node 24 LTS is required, but Node major '$nodeMajor' is active. Remove the conflicting Node installation, then re-run."
 }
 Say "  ok       node 24 LTS"
 
+$corepackReady = $true
 if (-not (Have corepack)) {
   Say "  install  corepack"
   $rc = Invoke-Native cmd @('/c','npm','install','-g','corepack') -Interactive
   Refresh-Path
-  if ($rc -ne 0) { Die "Could not install Corepack." }
+  if ($rc -ne 0 -or -not (Have corepack)) {
+    Say "  note     Corepack did not install. pnpm repositories will not run yet."
+    $corepackReady = $false
+  }
 }
-$corepackDir = Join-Path $env:USERPROFILE '.local\bin'
-New-Item -ItemType Directory -Force -Path $corepackDir | Out-Null
-if ((Invoke-Native cmd @('/c','corepack','enable','--install-directory',$corepackDir)) -ne 0) {
-  Die "Corepack could not enable the pnpm shims."
+if ($corepackReady) {
+  $corepackDir = Join-Path $env:USERPROFILE '.local\bin'
+  New-Item -ItemType Directory -Force -Path $corepackDir | Out-Null
+  if ((Invoke-Native cmd @('/c','corepack','enable','--install-directory',$corepackDir)) -ne 0) {
+    Say "  note     Corepack could not enable pnpm. Setup will continue."
+    $corepackReady = $false
+  } else {
+    Add-UserPathEntry $corepackDir
+    Say "  ok       corepack enabled (each repo selects its pinned pnpm)"
+  }
 }
-Add-UserPathEntry $corepackDir
-Say "  ok       corepack enabled (each repo selects its pinned pnpm)"
 
 Say "  install  Python 3.12 (managed by uv)"
 if ((Invoke-Native uv @('python','install','3.12','--default') -Interactive) -ne 0) {
@@ -419,7 +437,7 @@ if ($uvBin) { Add-UserPathEntry $uvBin }
 if ((Invoke-Native uv @('python','find','3.12')) -ne 0) {
   Die "Python 3.12 was requested but uv cannot find it."
 }
-$pythonMinor = Invoke-Native-Capture python @('-c','import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')
+$pythonMinor = Get-PythonMinor
 if ($pythonMinor -ne '3.12') {
   Die "Python 3.12 is installed, but the 'python' command resolves to '$pythonMinor'. Open a new PowerShell and re-run."
 }

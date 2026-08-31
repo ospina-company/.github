@@ -11,6 +11,15 @@
 $ErrorActionPreference = 'Continue'
 
 function Have ($c) { $null -ne (Get-Command $c -ErrorAction SilentlyContinue) }
+function Have-UsablePython ($c) {
+  $cmd = Get-Command $c -ErrorAction SilentlyContinue
+  if (-not $cmd) { return $false }
+  if ($cmd.Source -notmatch '(?i)\\Microsoft\\WindowsApps\\') { return $true }
+  # Windows creates zero-function Store aliases even when Python is absent.
+  # Count one only when this user actually has a Store Python package.
+  return $null -ne (Get-AppxPackage -Name 'PythonSoftwareFoundation.Python*' `
+                     -ErrorAction SilentlyContinue | Select-Object -First 1)
+}
 function Line ($state, $label, $detail) {
   $color = switch ($state) { 'CLEAN' {'Green'} 'DIRTY' {'Red'} default {'Yellow'} }
   Write-Host ("  {0,-6} {1,-38} {2}" -f $state, $label, $detail) -ForegroundColor $color
@@ -99,7 +108,8 @@ $inherited = 0
 foreach ($t in 'git','gh','node','npm','corepack','uv','python','python3',
                     'pdftotext','pdftoppm','pdfinfo','soffice','vale',
                     'claude','codex','winget') {
-  if (Have $t) {
+  $present = if ($t -in @('python','python3')) { Have-UsablePython $t } else { Have $t }
+  if ($present) {
     $src = (Get-Command $t).Source
     # A binary under the user profile was installed for this account, so it is
     # not evidence that the machine provides it to everyone.

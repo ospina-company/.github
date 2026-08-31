@@ -72,6 +72,16 @@ jobs:
           Write-Host "Find-GitBash -> $bash"
           & $bash -c "echo bash works: \$(uname -s)"
 
+          $nodeMajor = Get-NodeMajor
+          if ($nodeMajor -notmatch '^[0-9]+$') {
+            Write-Host "::error::Get-NodeMajor returned '$nodeMajor'"; exit 1
+          }
+          $pythonMinor = Get-PythonMinor
+          if ($pythonMinor -notmatch '^[0-9]+\.[0-9]+$') {
+            Write-Host "::error::Get-PythonMinor returned '$pythonMinor'"; exit 1
+          }
+          Write-Host "native version probes work: Node $nodeMajor, Python $pythonMinor"
+
       - name: Native stderr does not kill the script (regression)
         shell: powershell
         run: |
@@ -183,6 +193,21 @@ jobs:
           }
           if ($src -notmatch 'https://chatgpt.com/codex/install.ps1') {
             Write-Host "::error::Codex must use OpenAI's official Windows installer"
+            $fail = 1
+          }
+          if ($src -notmatch '\$NodeVersion = ''24\.19\.0''') {
+            Write-Host "::error::Windows Node must stay pinned to the reviewed 24.x Winget version"
+            $fail = 1
+          }
+          if ($src -match "Invoke-Native-Capture node @\('-p'" -or
+              $src -match "Invoke-Native-Capture python @\('-c'") {
+            Write-Host "::error::PowerShell 5.1 strips embedded quotes from native expression arguments; parse --version output instead"
+            $fail = 1
+          }
+
+          $preflight = Get-Content preflight.ps1 -Raw
+          if ($preflight -notmatch 'Have-UsablePython') {
+            Write-Host "::error::preflight must distinguish Microsoft Store aliases from usable Python"
             $fail = 1
           }
 
@@ -330,7 +355,8 @@ jobs:
           bash -n install.sh
           for required in 'node@24' 'corepack enable' 'uv python install 3.12' \
                           'brew install --cask libreoffice' 'pdftotext' \
-                          'brew install --cask codex' 'brew install --cask t3-code'; do
+                          'brew install --cask codex' 'brew install --cask t3-code' \
+                          '/bin/bash "$_hb" </dev/tty'; do
             if ! grep -Fq "$required" install.sh; then
               echo "::error::macOS installer is missing required baseline: $required"
               exit 1
