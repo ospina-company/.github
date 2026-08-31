@@ -141,14 +141,20 @@ $pkgs = @(
 foreach ($p in $pkgs) {
   if (Have $p.Cmd) { Say "  ok       $($p.Cmd)"; continue }
   Say "  install  $($p.Cmd)  ($($p.Id))"
+  # -Interactive so winget's progress and any prompt are visible. Hiding this
+  # output made a slow first-run source update indistinguishable from a hang,
+  # and would hide a prompt the reader cannot then answer.
+  Say "          this can take a minute; winget output follows"
   $code = Invoke-Native winget @('install','--id',$p.Id,'--exact','--silent',
-            '--accept-package-agreements','--accept-source-agreements')
+            '--disable-interactivity',
+            '--accept-package-agreements','--accept-source-agreements') -Interactive
   Refresh-Path
   # A managed laptop often blocks machine-wide installs. User scope needs no admin.
   if (-not (Have $p.Cmd)) {
     Say "  retry    $($p.Cmd) with user-scope install (no admin required)"
     $code = Invoke-Native winget @('install','--id',$p.Id,'--exact','--silent',
-              '--scope','user','--accept-package-agreements','--accept-source-agreements')
+              '--scope','user','--disable-interactivity',
+              '--accept-package-agreements','--accept-source-agreements') -Interactive
     Refresh-Path
   }
   if (Have $p.Cmd) {
