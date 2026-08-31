@@ -65,7 +65,7 @@ if [ "$PLATFORM" = mac ]; then
     _hb=$(mktemp 2>/dev/null || echo "${TMPDIR:-/tmp}/homebrew-install.$$")
     curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh -o "$_hb" \
       || die "Could not download the Homebrew installer."
-    /bin/bash "$_hb" || die "Homebrew did not install successfully."
+    /bin/bash "$_hb" </dev/tty || die "Homebrew did not install successfully."
     rm -f "$_hb"
     load_brew || die "Homebrew installed but is not callable in this terminal. Open a new terminal and re-run."
     say "  ok       Homebrew installed"
@@ -134,7 +134,13 @@ else
   fi
   say "  ok       git, gh"
   have vale || say "  ${DIM}note: vale not found. Optional, but prose linting will not work.${RESET}"
-  have node || say "  ${DIM}note: Node 24 is required. Install it from https://nodejs.org, then re-run.${RESET}"
+  if have node; then
+    _linux_node_major=$(node --version 2>/dev/null | sed 's/^v//;s/\..*//' || true)
+    [ "$_linux_node_major" = 24 ] \
+      || say "  ${DIM}note: Node 24 is required, but Node ${_linux_node_major:-unknown} is active.${RESET}"
+  else
+    say "  ${DIM}note: Node 24 is required. Install it from https://nodejs.org, then re-run.${RESET}"
+  fi
   have uv || say "  ${DIM}note: uv is required. Install it from https://docs.astral.sh/uv/, then re-run.${RESET}"
   have soffice || say "  ${DIM}note: LibreOffice is required for document verification.${RESET}"
   have pdftotext || say "  ${DIM}note: Poppler is required for PDF verification.${RESET}"
@@ -146,14 +152,20 @@ fi
 if have node; then
   if ! have corepack && have npm; then
     say "  install  corepack"
-    npm install -g corepack || die "Could not install Corepack."
+    npm install -g corepack \
+      || say "  note     Corepack did not install. pnpm repositories will not run yet."
   fi
-  have corepack || die "Node is present but Corepack is missing."
-  mkdir -p "$HOME/.local/bin"
-  corepack enable --install-directory "$HOME/.local/bin" \
-    || die "Corepack could not enable the pnpm shims."
-  add_path "$HOME/.local/bin"
-  say "  ok       corepack $(corepack --version 2>/dev/null || echo present)"
+  if have corepack; then
+    mkdir -p "$HOME/.local/bin"
+    if corepack enable --install-directory "$HOME/.local/bin"; then
+      add_path "$HOME/.local/bin"
+      say "  ok       corepack $(corepack --version 2>/dev/null || echo present)"
+    else
+      say "  note     Corepack could not enable pnpm. Setup will continue."
+    fi
+  else
+    say "  note     Corepack is missing. Setup will continue; pnpm repos need it."
+  fi
 fi
 
 if have uv; then
