@@ -140,12 +140,12 @@ function Ask-YesNo ($question) {
   return ([string]::IsNullOrWhiteSpace($a) -or $a -match '^[Yy]')
 }
 function Test-Npm {
-  # Get-Command finding npm proves a file exists, not that npm runs. On the
-  # default Restricted execution policy, npm resolves to npm.ps1 and PowerShell
-  # refuses to execute it, so npm is present and unusable at the same time.
-  # Ask cmd, which is the path we would actually install through.
-  if (-not (Have npm)) { return $false }
-  return (Invoke-Native cmd @('/c','npm','--version')) -eq 0
+  # Get-Command finding npm proves a file exists, not that npm runs. Resolve the
+  # .cmd next to the active Node installation so the default Restricted policy
+  # cannot select npm.ps1 and cmd.exe cannot select a file in the current repo.
+  $npm = Get-NodeToolPath 'npm'
+  if (-not $npm) { return $false }
+  return (Invoke-Native $npm @('--version')) -eq 0
 }
 function Get-NodeMajor {
   $version = Invoke-Native-Capture node @('--version')
@@ -156,6 +156,72 @@ function Get-PythonMinor {
   $version = Invoke-Native-Capture python @('--version')
   if ($version -match '^Python\s+([0-9]+\.[0-9]+)\.') { return $Matches[1] }
   return $null
+}
+function Get-NodeToolDirectories {
+  # Do not ask cmd.exe to find npm/corepack: cmd searches the current working
+  # directory before PATH, so running setup from a checkout containing npm.cmd
+  # would execute repository code. Derive tools from the active node.exe and
+  # WinGet's per-user portable-package directory instead.
+  $dirs = @()
+  $node = Get-Command node.exe -CommandType Application -ErrorAction SilentlyContinue |
+          Select-Object -First 1
+  if ($node -and $node.Source) {
+    $dirs += (Split-Path $node.Source -Parent)
+    try {
+      $item = Get-Item $node.Source -Force -ErrorAction Stop
+      foreach ($target in @($item.Target)) {
+        if (-not $target) { continue }
+        $resolvedTarget = $target
+        if (-not [IO.Path]::IsPathRooted($resolvedTarget)) {
+          $resolvedTarget = Join-Path (Split-Path $node.Source -Parent) $resolvedTarget
+        }
+        $resolvedTarget = [IO.Path]::GetFullPath($resolvedTarget)
+        $dirs += (Split-Path $resolvedTarget -Parent)
+      }
+    } catch { }
+  }
+  $wingetPackages = Join-Path $env:LOCALAPPDATA 'Microsoft\WinGet\Packages'
+  if (Test-Path $wingetPackages) {
+    Get-ChildItem $wingetPackages -Directory -Filter 'OpenJS.NodeJS.LTS_*' `
+      -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending |
+      ForEach-Object { $dirs += $_.FullName }
+  }
+  return @($dirs | Where-Object { $_ } | Select-Object -Unique)
+}
+function Get-NodeToolPath ($Name) {
+  foreach ($dir in (Get-NodeToolDirectories)) {
+    $candidate = Join-Path $dir ($Name + '.cmd')
+    if (Test-Path $candidate) { return $candidate }
+  }
+  return $null
+}
+function Resolve-NodeToolchainPath {
+  foreach ($dir in (Get-NodeToolDirectories)) {
+    $nodeExe = Join-Path $dir 'node.exe'
+    $npmCmd = Join-Path $dir 'npm.cmd'
+    if ((Test-Path $nodeExe) -and (Test-Path $npmCmd)) {
+      $version = Invoke-Native-Capture $nodeExe @('--version')
+      if ($version -notmatch '^v?24\.') { continue }
+      Add-UserPathEntry $dir
+      return $true
+    }
+  }
+  return $false
+}
+function Invoke-NodeToolCapture ($Name, [string[]] $Arguments = @()) {
+  $tool = Get-NodeToolPath $Name
+  if (-not $tool) { return $null }
+  return (Invoke-Native-Capture $tool $Arguments)
+}
+function Test-UvDefaultInstall {
+  if (-not (Have uv)) { return $false }
+  # Invoke-Native-Capture intentionally returns one line, so use a direct
+  # capture here because --default may appear anywhere in multi-line help.
+  $prev = $ErrorActionPreference
+  $ErrorActionPreference = 'Continue'
+  try { $help = (& uv python install --help 2>$null | Out-String) }
+  finally { $ErrorActionPreference = $prev }
+  return ($help -match '(?m)--default\b')
 }
 function Install-CodexOfficial {
   # Keep vendor installation logic with OpenAI. Their supported PowerShell
@@ -221,7 +287,7 @@ function Test-Codex {
   if (Have codex) { return $true }
   # npm global installs land in a prefix that is not always on PATH, and a tool
   # that exists but cannot be found would otherwise be reinstalled every run.
-  $prefix = Invoke-Native-Capture cmd @('/c','npm','prefix','-g')
+  $prefix = Invoke-NodeToolCapture 'npm' @('prefix','-g')
   if ($prefix) {
     foreach ($n in @('codex.cmd','codex.ps1','codex')) {
       if (Test-Path (Join-Path $prefix $n)) { return $true }
@@ -254,7 +320,7 @@ function Install-T3Code {
   # T3 Code now publishes an official winget package. Use its package manifest,
   # pinned digest and upgrade path instead of scraping the latest release.
   try {
-    $rc = Invoke-Native winget @('install','--id','T3Tools.T3Code','--exact','--silent',
+    $rc = Invoke-Native winget @('install','--id','T3Tools.T3Code','--exact','--source','winget','--silent',
             '--disable-interactivity','--accept-package-agreements','--accept-source-agreements') -Interactive
     Refresh-Path
     return ($rc -eq 0 -or (Test-T3Code))
@@ -326,7 +392,8 @@ $admin = ([Security.Principal.WindowsPrincipal] `
           [Security.Principal.WindowsIdentity]::GetCurrent()
          ).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 if (-not $admin) {
-  Say "  Running without administrator rights. Tools will install per-user, which is fine."
+  Say "  Running without elevation. Most tools install per-user."
+  Say "  Windows may request administrator approval for LibreOffice."
 }
 
 # ------------------------------------------------------------------ packages
@@ -358,7 +425,7 @@ foreach ($p in $pkgs) {
   # output made a slow first-run source update indistinguishable from a hang,
   # and would hide a prompt the reader cannot then answer.
   Say "          this can take a minute; winget output follows"
-  $wingetArgs = @('install','--id',$p.Id,'--exact','--silent',
+  $wingetArgs = @('install','--id',$p.Id,'--exact','--source','winget','--silent',
                   '--disable-interactivity',
                   '--accept-package-agreements','--accept-source-agreements')
   if ($p.Version) { $wingetArgs += @('--version',$p.Version) }
@@ -367,7 +434,7 @@ foreach ($p in $pkgs) {
   # A managed laptop often blocks machine-wide installs. User scope needs no admin.
   if (-not (Have $p.Cmd)) {
     Say "  retry    $($p.Cmd) with user-scope install (no admin required)"
-    $wingetArgs = @('install','--id',$p.Id,'--exact','--silent','--scope','user',
+    $wingetArgs = @('install','--id',$p.Id,'--exact','--source','winget','--silent','--scope','user',
                     '--disable-interactivity','--accept-package-agreements',
                     '--accept-source-agreements')
     if ($p.Version) { $wingetArgs += @('--version',$p.Version) }
@@ -389,27 +456,59 @@ already installed.
   }
 }
 
+# uv 0.5 introduced the --default behavior used below. Merely finding an old
+# uv binary is not enough; update it through the reviewed WinGet source and
+# verify the capability before depending on it.
+if (-not (Test-UvDefaultInstall)) {
+  Say "  upgrade  uv (the installed version lacks 'python install --default')"
+  $uvArgs = @('upgrade','--id','astral-sh.uv','--exact','--source','winget','--silent',
+              '--disable-interactivity','--accept-package-agreements','--accept-source-agreements')
+  $null = Invoke-Native winget $uvArgs -Interactive
+  Refresh-Path
+  if (-not (Test-UvDefaultInstall)) {
+    $uvArgs = @('install','--id','astral-sh.uv','--exact','--source','winget','--silent',
+                '--scope','user','--force','--disable-interactivity',
+                '--accept-package-agreements','--accept-source-agreements')
+    $null = Invoke-Native winget $uvArgs -Interactive
+    Refresh-Path
+  }
+}
+if (-not (Test-UvDefaultInstall)) {
+  Die "uv is installed, but it is too old to manage the default Python. Remove the conflicting uv installation, then re-run."
+}
+
 # Node 24 is the common version supported by T3 Code and all current Ospina
 # Node repositories. A random newer system Node is not equivalent: some repos
 # deliberately cap support below Node 25.
 $nodeMajor = Get-NodeMajor
 if ($nodeMajor -ne '24') {
   Say "  install  Node 24 LTS (current Node major: $nodeMajor)"
-  $null = Invoke-Native winget @('install','--id','OpenJS.NodeJS.LTS','--exact','--silent',
+  $null = Invoke-Native winget @('install','--id','OpenJS.NodeJS.LTS','--exact','--source','winget','--silent',
             '--version',$NodeVersion,'--force','--disable-interactivity',
             '--accept-package-agreements','--accept-source-agreements') -Interactive
   Refresh-Path
+  $nodeMajor = Get-NodeMajor
+  if ($nodeMajor -ne '24') {
+    $null = Invoke-Native winget @('install','--id','OpenJS.NodeJS.LTS','--exact','--source','winget','--silent',
+              '--version',$NodeVersion,'--scope','user','--force','--disable-interactivity',
+              '--accept-package-agreements','--accept-source-agreements') -Interactive
+    Refresh-Path
+    $null = Resolve-NodeToolchainPath
+  }
   $nodeMajor = Get-NodeMajor
 }
 if ($nodeMajor -ne '24') {
   Die "Node 24 LTS is required, but Node major '$nodeMajor' is active. Remove the conflicting Node installation, then re-run."
 }
 Say "  ok       node 24 LTS"
+$null = Resolve-NodeToolchainPath
 
 $corepackReady = $true
 if (-not (Have corepack)) {
   Say "  install  corepack"
-  $rc = Invoke-Native cmd @('/c','npm','install','-g','corepack') -Interactive
+  $npm = Get-NodeToolPath 'npm'
+  if ($npm) { $rc = Invoke-Native $npm @('install','-g','corepack') -Interactive }
+  else { $rc = 127 }
   Refresh-Path
   if ($rc -ne 0 -or -not (Have corepack)) {
     Say "  note     Corepack did not install. pnpm repositories will not run yet."
@@ -419,7 +518,9 @@ if (-not (Have corepack)) {
 if ($corepackReady) {
   $corepackDir = Join-Path $env:USERPROFILE '.local\bin'
   New-Item -ItemType Directory -Force -Path $corepackDir | Out-Null
-  if ((Invoke-Native cmd @('/c','corepack','enable','--install-directory',$corepackDir)) -ne 0) {
+  $corepack = Get-NodeToolPath 'corepack'
+  if (-not $corepack -or
+      (Invoke-Native $corepack @('enable','--install-directory',$corepackDir)) -ne 0) {
     Say "  note     Corepack could not enable pnpm. Setup will continue."
     $corepackReady = $false
   } else {
@@ -453,7 +554,7 @@ if (-not (Have soffice)) {
 }
 if (-not (Have soffice)) {
   Say "  install  LibreOffice (document and workbook rendering)"
-  $null = Invoke-Native winget @('install','--id','TheDocumentFoundation.LibreOffice','--exact','--silent',
+  $loCode = Invoke-Native winget @('install','--id','TheDocumentFoundation.LibreOffice','--exact','--source','winget','--silent',
             '--disable-interactivity','--accept-package-agreements','--accept-source-agreements') -Interactive
   Refresh-Path
   $null = Resolve-OnPath -Command 'soffice' -Directories @(
@@ -462,8 +563,11 @@ if (-not (Have soffice)) {
     (Join-Path $env:LOCALAPPDATA 'Programs\LibreOffice\program')
   )
 }
-if (-not (Have soffice)) { Die "LibreOffice installed but soffice is not callable in this session." }
-Say "  ok       soffice"
+if (-not (Have soffice)) {
+  Say "  note     LibreOffice is not installed (winget exit $loCode)."
+  Say "           Its official WinGet package is machine-scoped and needs administrator approval."
+  Say "           Setup will continue, but document and workbook visual QA will be unavailable."
+} else { Say "  ok       soffice" }
 
 # Several of the repositories a partner clones are pnpm / Next.js projects, and
 # npm resolves to npm.ps1. Under the default Restricted policy none of them can
@@ -629,7 +733,7 @@ $agents = @(
   @{ Name = 'Codex'; Command = 'codex';       Test = { Test-Codex }; Manual = 'irm https://chatgpt.com/codex/install.ps1 | iex';
      Diagnose = {
        # npm can install into a prefix that is not on PATH. Show where it went.
-       $prefix = Invoke-Native-Capture cmd @('/c','npm','prefix','-g')
+       $prefix = Invoke-NodeToolCapture 'npm' @('prefix','-g')
        if ($prefix) {
          Say ("           npm global prefix: {0}" -f $prefix)
          $cand = Join-Path $prefix 'codex.cmd'
@@ -692,7 +796,7 @@ $null = Resolve-OnPath -Command 'claude' -Directories @(
 $null = Resolve-OnPath -Command 'codex' -Directories @(
   (Join-Path $env:USERPROFILE '.local\bin'),
   (Join-Path $env:USERPROFILE '.codex\bin'),
-  (Invoke-Native-Capture cmd @('/c','npm','prefix','-g'))
+  (Invoke-NodeToolCapture 'npm' @('prefix','-g'))
 )
 $providerAuthed = $false
 if (Have claude) {

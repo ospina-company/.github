@@ -43,6 +43,17 @@ load_brew() {
   return 1
 }
 
+can_install_homebrew() {
+  # Homebrew's supported macOS installer requires sudo access. Starting its
+  # prompts on a managed standard account can never succeed, so detect that
+  # condition before downloading anything and give the reader the IT handoff.
+  groups "$(id -un)" 2>/dev/null | tr ' ' '\n' | grep -qx admin
+}
+
+uv_supports_default() {
+  have uv && uv python install --help 2>/dev/null | grep -q -- '--default'
+}
+
 case "$(uname -s)" in
   Darwin) PLATFORM=mac ;;
   Linux)  PLATFORM=linux ;;
@@ -59,6 +70,10 @@ step "Checking tools"
 if [ "$PLATFORM" = mac ]; then
   if ! load_brew; then
     say "  --       Homebrew not found"
+    if ! can_install_homebrew; then
+      die "Homebrew is required, but this macOS account does not have administrator access.
+Ask your device administrator to install Homebrew from https://brew.sh, then re-run."
+    fi
     if ! ask_yes_no "           Install Homebrew?"; then
       die "Homebrew is required. Re-run this command when you are ready to install it."
     fi
@@ -93,6 +108,16 @@ if [ "$PLATFORM" = mac ]; then
   brew_formula vale vale optional
   brew_formula uv uv required
   brew_formula pdftotext poppler required
+
+  # uv 0.5 introduced the --default behavior used below. Presence alone does
+  # not make an old uv compatible, so upgrade/replace it before proceeding.
+  if ! uv_supports_default; then
+    say "  upgrade  uv (the installed version lacks 'python install --default')"
+    brew upgrade uv || brew install uv || die "Could not install a current uv."
+    add_path "$(brew --prefix)/bin"
+    hash -r
+    uv_supports_default || die "A conflicting old uv is still first on PATH. Remove it, then re-run."
+  fi
 
   _node_major=$(node -p 'process.versions.node.split(".")[0]' 2>/dev/null || true)
   if [ "$_node_major" != 24 ]; then
@@ -169,6 +194,7 @@ if have node; then
 fi
 
 if have uv; then
+  uv_supports_default || die "uv is too old; version 0.5 or newer is required."
   say "  install  Python 3.12 (managed by uv)"
   uv python install 3.12 --default || die "uv could not install Python 3.12."
   _uv_bin=$(uv python dir --bin 2>/dev/null || true)

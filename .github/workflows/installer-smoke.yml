@@ -82,6 +82,45 @@ jobs:
           }
           Write-Host "native version probes work: Node $nodeMajor, Python $pythonMinor"
 
+          # The runner's inherited Node version is not the installer's contract.
+          # Feed the parsers the exact required outputs as a controlled test.
+          function Invoke-Native-Capture {
+            param([string]$Exe, [string[]]$Arguments = @())
+            if ($Exe -eq 'node') { return 'v24.19.0' }
+            if ($Exe -eq 'python') { return 'Python 3.12.10' }
+            return $null
+          }
+          if ((Get-NodeMajor) -ne '24') {
+            Write-Host "::error::Get-NodeMajor did not recognize the required Node 24 output"; exit 1
+          }
+          if ((Get-PythonMinor) -ne '3.12') {
+            Write-Host "::error::Get-PythonMinor did not recognize the required Python 3.12 output"; exit 1
+          }
+          Write-Host "exact Node 24 / Python 3.12 parsing works"
+
+          # cmd.exe searches the current directory before PATH. Prove the helper
+          # selects npm.cmd beside the active node.exe and ignores a malicious
+          # same-name file in the checkout.
+          $trustedDir = Join-Path $env:RUNNER_TEMP 'trusted-node'
+          $untrustedDir = Join-Path $env:RUNNER_TEMP 'untrusted-checkout'
+          New-Item -ItemType Directory -Force -Path $trustedDir,$untrustedDir | Out-Null
+          Copy-Item (Join-Path $env:SystemRoot 'System32\cmd.exe') (Join-Path $trustedDir 'node.exe')
+          Set-Content -Path (Join-Path $trustedDir 'npm.cmd') -Value '@echo trusted-npm' -Encoding ASCII
+          Set-Content -Path (Join-Path $untrustedDir 'npm.cmd') -Value '@echo MALICIOUS-NPM' -Encoding ASCII
+          $env:Path = "$trustedDir;$env:Path"
+          Push-Location $untrustedDir
+          try {
+            $npm = Get-NodeToolPath 'npm'
+            if ($npm -ne (Join-Path $trustedDir 'npm.cmd')) {
+              Write-Host "::error::trusted npm resolver returned '$npm'"; exit 1
+            }
+            $npmOut = (& $npm --version | Out-String).Trim()
+            if ($npmOut -ne 'trusted-npm') {
+              Write-Host "::error::absolute npm invocation returned '$npmOut'"; exit 1
+            }
+          } finally { Pop-Location }
+          Write-Host "Node tooling ignores current-directory command hijacks"
+
       - name: Native stderr does not kill the script (regression)
         shell: powershell
         run: |
@@ -125,10 +164,12 @@ jobs:
           $src = Get-Content install.ps1 -Raw
           $fail = 0
 
-          # npm on Windows resolves to npm.ps1, which the default Restricted
-          # execution policy refuses to run. It must be invoked through cmd.
-          if ($src -match "Invoke-Native npm ") {
-            Write-Host "::error::install.ps1 calls npm directly; use cmd /c npm so the execution policy does not block npm.ps1"
+          # npm.ps1 is blocked by the default execution policy, while cmd /c
+          # searches the current checkout first. Resolve the trusted .cmd by
+          # absolute path beside node.exe instead.
+          if ($src -match "cmd @\('/c','(npm|corepack)'" -or
+              $src -notmatch 'Get-NodeToolPath') {
+            Write-Host "::error::npm/corepack must use an absolute .cmd resolved from the active Node installation"
             $fail = 1
           }
 
@@ -199,6 +240,19 @@ jobs:
             Write-Host "::error::Windows Node must stay pinned to the reviewed 24.x Winget version"
             $fail = 1
           }
+          if ($src -notmatch 'Test-UvDefaultInstall') {
+            Write-Host "::error::the installer must reject or upgrade uv versions without --default support"
+            $fail = 1
+          }
+          $wingetBuilders = [regex]::Matches(
+            $src, "(?s)(?:@\(|= @\()'(?:install|upgrade)'.{0,450}?\)")
+          foreach ($builder in $wingetBuilders) {
+            if ($builder.Value -match "--id" -and
+                $builder.Value -notmatch "'--source','winget'") {
+              Write-Host "::error::WinGet package arguments are not pinned to the reviewed winget source: $($builder.Value)"
+              $fail = 1
+            }
+          }
           if ($src -match "Invoke-Native-Capture node @\('-p'" -or
               $src -match "Invoke-Native-Capture python @\('-c'") {
             Write-Host "::error::PowerShell 5.1 strips embedded quotes from native expression arguments; parse --version output instead"
@@ -209,6 +263,12 @@ jobs:
           if ($preflight -notmatch 'Have-UsablePython') {
             Write-Host "::error::preflight must distinguish Microsoft Store aliases from usable Python"
             $fail = 1
+          }
+          foreach ($detector in @('Get-LibreOfficePath','Get-T3CodePath')) {
+            if ($preflight -notmatch $detector) {
+              Write-Host "::error::preflight does not mirror installer detection through $detector"
+              $fail = 1
+            }
           }
 
           # Every installer invocation must be visible. Hiding subprocess output
@@ -366,3 +426,29 @@ jobs:
             echo "::error::an installer above hides its output; let it stream"
             exit 1
           fi
+
+      - name: macOS prerequisite and uv capability behavior
+        shell: bash
+        run: |
+          set -euo pipefail
+          eval "$(sed -n '/^can_install_homebrew()/,/^}/p' install.sh)"
+          eval "$(sed -n '/^uv_supports_default()/,/^}/p' install.sh)"
+          have() { command -v "$1" >/dev/null 2>&1; }
+          mock_bin="$RUNNER_TEMP/ospina-mocks"
+          mkdir -p "$mock_bin"
+          printf '#!/bin/sh\nprintf "staff\\n"\n' > "$mock_bin/groups"
+          printf '#!/bin/sh\ncase "${MOCK_UV_DEFAULT:-0}" in 1) printf "  --default\\n";; *) printf "help\\n";; esac\n' > "$mock_bin/uv"
+          chmod +x "$mock_bin/groups" "$mock_bin/uv"
+          PATH="$mock_bin:$PATH"
+
+          if can_install_homebrew; then
+            echo "::error::a simulated non-admin account was allowed into Homebrew installation"
+            exit 1
+          fi
+          if uv_supports_default; then
+            echo "::error::old uv simulation was accepted"
+            exit 1
+          fi
+          MOCK_UV_DEFAULT=1; export MOCK_UV_DEFAULT
+          uv_supports_default
+          echo "non-admin Homebrew guard and uv capability probe behave correctly"
