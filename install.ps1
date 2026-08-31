@@ -32,6 +32,31 @@ function Have ($c) { $null -ne (Get-Command $c -ErrorAction SilentlyContinue) }
 # even when the command only printed a diagnostic. `gh auth status` on a machine
 # that is not logged in does exactly that, and it is not a failure: it is the
 # answer. Judge native tools by exit code, never by whether they wrote to stderr.
+function Get-RemoteFile {
+  # Invoke-WebRequest renders a progress bar per chunk, and in Windows
+  # PowerShell 5.x that costs roughly a factor of ten on a large file
+  # (PowerShell/PowerShell#2138, fixed only in 6.0). Suppress it and report
+  # progress ourselves, so the download is fast and the reader still knows
+  # what is happening.
+  param(
+    [Parameter(Mandatory)][string]$Uri,
+    [Parameter(Mandatory)][string]$OutFile,
+    [string]$Label = 'file',
+    [int]$SizeMB = 0
+  )
+  $prev = $ProgressPreference
+  $ProgressPreference = 'SilentlyContinue'
+  try {
+    if ($SizeMB -gt 0) { Say ("          downloading {0} ({1} MB)..." -f $Label, $SizeMB) }
+    else               { Say ("          downloading {0}..." -f $Label) }
+    $t0 = Get-Date
+    Invoke-WebRequest $Uri -OutFile $OutFile -UseBasicParsing
+    $secs = [int]((Get-Date) - $t0).TotalSeconds
+    $mb = [int]((Get-Item $OutFile).Length / 1MB)
+    Say ("          downloaded {0} MB in {1}s" -f $mb, $secs)
+  } finally { $ProgressPreference = $prev }
+}
+
 function Invoke-Native-Capture {
   # Same stderr problem, but we want stdout back as a string.
   param([Parameter(Mandatory)][string] $Exe, [string[]] $Arguments = @())
@@ -137,8 +162,8 @@ function Install-CodexBinary {
     $dir = Join-Path $env:LOCALAPPDATA 'Programs\codex'
     New-Item -ItemType Directory -Force -Path $dir | Out-Null
     $dest = Join-Path $dir 'codex.exe'
-    Say ("          downloading {0} ({1} MB)..." -f $want, [int]($asset.size/1MB))
-    Invoke-WebRequest $asset.browser_download_url -OutFile $dest -UseBasicParsing
+    Get-RemoteFile -Uri $asset.browser_download_url -OutFile $dest `
+                   -Label $want -SizeMB ([int]($asset.size/1MB))
 
     # Put it on PATH for this account and for this session.
     $userPath = [Environment]::GetEnvironmentVariable('Path','User')
@@ -236,8 +261,8 @@ function Install-T3Code {
     $asset = $rel.assets | Where-Object { $_.name -like '*x64.exe' } | Select-Object -First 1
     if (-not $asset) { throw 'no Windows installer in the latest release' }
     $out = Join-Path $env:TEMP $asset.name
-    Say "          downloading $($asset.name)..."
-    Invoke-WebRequest $asset.browser_download_url -OutFile $out -UseBasicParsing
+    Get-RemoteFile -Uri $asset.browser_download_url -OutFile $out `
+                   -Label $asset.name -SizeMB ([int]($asset.size/1MB))
     # This is a downloaded executable, so check what signed it before running.
     # The publisher name is not asserted here because it is not documented
     # anywhere authoritative; an unsigned or broken signature asks first.
