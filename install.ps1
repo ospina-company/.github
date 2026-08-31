@@ -86,14 +86,18 @@ function Invoke-Native {
 }
 
 function Refresh-Path {
+  param(
+    [string]$MachinePath = [Environment]::GetEnvironmentVariable('Path','Machine'),
+    [string]$UserPath = [Environment]::GetEnvironmentVariable('Path','User')
+  )
   # Merge, do not replace. A tool that added itself to this process's PATH only
   # would otherwise disappear the moment we rebuild from the registry.
   # winget writes the new PATH to the registry; this session still holds the old
   # one. Rebuild from Machine + User so freshly installed tools are callable now
-  # instead of only after a restart.
-  $machine = [Environment]::GetEnvironmentVariable('Path','Machine')
-  $user    = [Environment]::GetEnvironmentVariable('Path','User')
-  $merged = @($machine, $user, $env:Path) | Where-Object { $_ } |
+  # instead of only after a restart. Keep the current process first: helpers may
+  # already have promoted a capability-verified user tool over an obsolete
+  # machine-scoped copy, and a later refresh must not undo that repair.
+  $merged = @($env:Path, $UserPath, $MachinePath) | Where-Object { $_ } |
             ForEach-Object { $_ -split ';' } | Where-Object { $_ } |
             Select-Object -Unique
   $env:Path = ($merged -join ';')
