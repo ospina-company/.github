@@ -166,8 +166,53 @@ jobs:
             $fail = 1
           } else { Write-Host "npm is checked functionally" }
 
+          # Every installer invocation must be visible. Hiding subprocess output
+          # is what made a working install look like a hang on a bare machine.
+          foreach ($m in [regex]::Matches($src, 'Invoke-Native winget @\([^)]*\)(?<tail>[^\r\n]*)')) {
+            if ($m.Groups['tail'].Value -notmatch '-Interactive') {
+              Write-Host "::error::a winget install does not stream its output; add -Interactive"
+              $fail = 1
+            }
+          }
+          if (-not $fail) { Write-Host "all winget installs stream their output" }
+
           if ($fail) { exit 1 }
           Write-Host "all structural guards passed"
+
+      - name: Installer output reaches the console (regression)
+        shell: powershell
+        run: |
+          # A partner on a bare machine stalled at "install gh" because winget's
+          # output was piped to Out-Null: a working install and a hang looked
+          # identical. Prove -Interactive actually streams.
+          $ast = [System.Management.Automation.Language.Parser]::ParseFile(
+                   (Resolve-Path install.ps1), [ref]$null, [ref]$null)
+          $OSPINA_HALT = '[ospina-halt] '
+          foreach ($f in $ast.FindAll({
+            $args[0] -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true)) {
+            Invoke-Expression $f.Extent.Text
+          }
+
+          $marker = 'OSPINA_STREAM_PROOF'
+          $shown  = (Invoke-Native cmd @('/c', "echo $marker") -Interactive) 6>&1 |
+                      Out-String
+          # Capture what the console actually received.
+          $tmp = Join-Path $env:RUNNER_TEMP 'stream.txt'
+          Start-Transcript -Path $tmp | Out-Null
+          $null = Invoke-Native cmd @('/c', "echo $marker") -Interactive
+          $null = Invoke-Native cmd @('/c', "echo HIDDEN_$marker")
+          Stop-Transcript | Out-Null
+          $log = Get-Content $tmp -Raw
+
+          if ($log -notmatch [regex]::Escape($marker)) {
+            Write-Host "::error::-Interactive did not reach the console; installer output would be invisible"
+            exit 1
+          }
+          if ($log -match ('HIDDEN_' + $marker)) {
+            Write-Host "::error::non-interactive mode leaked output; the two modes are not distinct"
+            exit 1
+          }
+          Write-Host "proved: -Interactive streams to the console, non-interactive does not"
 
       - name: Windows path conversion is correct
         shell: powershell
@@ -208,5 +253,12 @@ jobs:
       - name: Shellcheck + POSIX syntax
         run: |
           bash -n install.sh && echo "install.sh parses"
+          # No installer may hide its output: on a bare machine that turns a
+          # slow install into an apparent hang.
+          if grep -nE '(brew install|npm install -g)[^|]*>/dev/null' install.sh; then
+            echo "::error::an installer above hides its output; let it stream"
+            exit 1
+          fi
+          echo "all installers in install.sh stream their output"
           sudo apt-get update -qq && sudo apt-get install -y shellcheck -qq
           shellcheck -S warning install.sh || true
