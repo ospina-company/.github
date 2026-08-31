@@ -188,7 +188,18 @@ function Get-NodeToolDirectories {
   if (Test-Path $wingetPackages) {
     Get-ChildItem $wingetPackages -Directory -Filter 'OpenJS.NodeJS.LTS_*' `
       -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending |
-      ForEach-Object { $dirs += $_.FullName }
+      ForEach-Object {
+        # The non-admin WinGet fallback is a portable archive. Its package root
+        # contains node-v24.x-win-<arch>\node.exe rather than node.exe directly.
+        # Find only directories that carry both Node and its matching npm shim.
+        Get-ChildItem $_.FullName -File -Filter 'node.exe' -Recurse `
+          -ErrorAction SilentlyContinue | ForEach-Object {
+            $candidateDir = Split-Path $_.FullName -Parent
+            if (Test-Path (Join-Path $candidateDir 'npm.cmd')) {
+              $dirs += $candidateDir
+            }
+          }
+      }
   }
   return @($dirs | Where-Object { $_ } | Select-Object -Unique)
 }
@@ -345,10 +356,83 @@ function Add-UserPathEntry {
     $_ -and -not [string]::Equals($_, $Dir, [StringComparison]::OrdinalIgnoreCase)
   })
   [Environment]::SetEnvironmentVariable('Path', ((@($Dir) + $userParts) -join ';'), 'User')
+
+  # Windows creates a new process PATH as machine entries followed by user
+  # entries. A per-user Node/Python/uv install therefore cannot outrank an old
+  # machine-scoped copy through HKCU\Environment\Path alone. Keep a separate
+  # reviewed list and have the two shells used by T3 Code promote it at startup.
+  $preferredPath = [Environment]::GetEnvironmentVariable('OSPINA_PREFERRED_PATH','User')
+  $preferredParts = @($preferredPath -split ';' | Where-Object {
+    $_ -and -not [string]::Equals($_, $Dir, [StringComparison]::OrdinalIgnoreCase)
+  })
+  $preferredPath = ((@($Dir) + $preferredParts) -join ';')
+  [Environment]::SetEnvironmentVariable('OSPINA_PREFERRED_PATH', $preferredPath, 'User')
+  $env:OSPINA_PREFERRED_PATH = $preferredPath
+  Install-OspinaPathProfiles
+
   $processParts = @($env:Path -split ';' | Where-Object {
     $_ -and -not [string]::Equals($_, $Dir, [StringComparison]::OrdinalIgnoreCase)
   })
   $env:Path = ((@($Dir) + $processParts) -join ';')
+}
+function Set-OspinaProfileBlock {
+  param(
+    [Parameter(Mandatory)][string]$Path,
+    [Parameter(Mandatory)][string]$Start,
+    [Parameter(Mandatory)][string]$End,
+    [Parameter(Mandatory)][string]$Block
+  )
+  $parent = Split-Path $Path -Parent
+  if ($parent) { New-Item -ItemType Directory -Force -Path $parent | Out-Null }
+  $content = if (Test-Path $Path) { Get-Content $Path -Raw } else { '' }
+  $pattern = '(?ms)^' + [regex]::Escape($Start) + '.*?^' +
+             [regex]::Escape($End) + '[\r\n]*'
+  $content = ([regex]::Replace($content, $pattern, '')).TrimEnd()
+  if ($content) { $content += "`n`n" }
+  $content += $Block.Trim() + "`n"
+  [IO.File]::WriteAllText($Path, $content, (New-Object Text.UTF8Encoding($false)))
+}
+function Install-OspinaPathProfiles {
+  # PowerShell 5.1 and PowerShell 7 use different profile directories. Write
+  # the same small marked block to both, plus Git Bash's login profile.
+  $start = '# >>> ospina workstation PATH >>>'
+  $end = '# <<< ospina workstation PATH <<<'
+  $powerShellBlock = @'
+# >>> ospina workstation PATH >>>
+$ospinaPreferredPath = [Environment]::GetEnvironmentVariable('OSPINA_PREFERRED_PATH','User')
+if ($ospinaPreferredPath) {
+  $ospinaPreferredParts = @($ospinaPreferredPath -split ';' | Where-Object { $_ })
+  $ospinaCurrentParts = @($env:Path -split ';' | Where-Object {
+    $_ -and $_ -notin $ospinaPreferredParts
+  })
+  $env:Path = (($ospinaPreferredParts + $ospinaCurrentParts) -join ';')
+}
+# <<< ospina workstation PATH <<<
+'@
+  $documents = [Environment]::GetFolderPath('MyDocuments')
+  if (-not $documents) { $documents = Join-Path $env:USERPROFILE 'Documents' }
+  foreach ($profilePath in @(
+    (Join-Path $documents 'WindowsPowerShell\Microsoft.PowerShell_profile.ps1'),
+    (Join-Path $documents 'PowerShell\Microsoft.PowerShell_profile.ps1')
+  )) {
+    Set-OspinaProfileBlock -Path $profilePath -Start $start -End $end `
+                           -Block $powerShellBlock
+  }
+
+  $bashBlock = @'
+# >>> ospina workstation PATH >>>
+if [ -n "${OSPINA_PREFERRED_PATH:-}" ]; then
+  _ospina_preferred_path=$(cygpath -p "$OSPINA_PREFERRED_PATH" 2>/dev/null || true)
+  if [ -n "$_ospina_preferred_path" ]; then
+    PATH="$_ospina_preferred_path:$PATH"
+    export PATH
+  fi
+  unset _ospina_preferred_path
+fi
+# <<< ospina workstation PATH <<<
+'@
+  Set-OspinaProfileBlock -Path (Join-Path $env:USERPROFILE '.bash_profile') `
+                         -Start $start -End $end -Block $bashBlock
 }
 function Test-Codex {
   if (Have codex) { return $true }

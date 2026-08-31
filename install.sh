@@ -124,6 +124,14 @@ Ask your device administrator to install Homebrew from https://brew.sh, then re-
     say "  ok       Homebrew installed"
   fi
 
+  # Homebrew's installer prints its profile instructions but does not apply
+  # them. Persist the prefix even on a clean first run, before any formula is
+  # installed, so brew and every unversioned formula remain available when the
+  # employee opens T3 Code or a new terminal.
+  _brew_bin="$(brew --prefix)/bin"
+  add_path "$_brew_bin"
+  persist_path_front "$_brew_bin"
+
   brew_formula() {
     _cmd=$1; _pkg=$2; _required=$3
     if have "$_cmd"; then say "  ok       $_cmd"
