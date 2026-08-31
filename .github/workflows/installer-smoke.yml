@@ -771,7 +771,8 @@ jobs:
                           'brew install --cask libreoffice' 'pdftotext' \
                           'brew install --cask codex' 'brew install --cask t3-code' \
                           '/bin/bash "$_hb" </dev/tty' \
-                          'persist_path_front "$_brew_bin"'; do
+                          'persist_path_front "$_brew_bin"' \
+                          'brew_bin_path node@24'; do
             if ! grep -Fq "$required" install.sh; then
               echo "::error::macOS installer is missing required baseline: $required"
               exit 1
@@ -798,6 +799,7 @@ jobs:
           set -euo pipefail
           eval "$(sed -n '/^add_path()/,/^}/p' install.sh)"
           eval "$(sed -n '/^persist_path_front()/,/^}/p' install.sh)"
+          eval "$(sed -n '/^brew_bin_path()/,/^}/p' install.sh)"
           eval "$(sed -n '/^can_install_homebrew()/,/^}/p' install.sh)"
           eval "$(sed -n '/^uv_supports_default()/,/^}/p' install.sh)"
           have() { command -v "$1" >/dev/null 2>&1; }
@@ -810,6 +812,17 @@ jobs:
           printf '#!/bin/sh\nprintf "  --default\\n"\n' > "$new_bin/uv"
           chmod +x "$old_bin/groups" "$old_bin/dseditgroup" "$old_bin/uv" "$new_bin/uv"
           PATH="$old_bin:$new_bin:$PATH"
+
+          mock_prefix="$RUNNER_TEMP/mock-brew-prefix"
+          mkdir -p "$mock_prefix/bin"
+          brew() { printf '%s\n' "$mock_prefix"; }
+          [ "$(brew_bin_path node@24)" = "$mock_prefix/bin" ]
+          brew() { return 1; }
+          if brew_bin_path node@24 >/dev/null; then
+            echo "::error::failed brew prefix lookup was accepted as /bin"
+            exit 1
+          fi
+          unset -f brew
 
           if can_install_homebrew; then
             echo "::error::a simulated non-admin account was allowed into Homebrew installation"
