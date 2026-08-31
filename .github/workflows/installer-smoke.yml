@@ -201,9 +201,13 @@ jobs:
           # Windows PowerShell 5.x renders a progress bar per chunk, costing
           # roughly 10x on a large download. Every fetch must go through
           # Get-RemoteFile, which suppresses it and reports progress itself.
-          $iwr = [regex]::Matches($src, 'Invoke-WebRequest')
-          if ($iwr.Count -ne 1) {
-            Write-Host "::error::found $($iwr.Count) Invoke-WebRequest calls; downloads must go through Get-RemoteFile"
+          # Count invocations, not mentions. An earlier version of this guard
+          # matched the word inside its own explanatory comment.
+          $iwrLines = Get-Content install.ps1 |
+                      Where-Object { $_ -notmatch '^\s*#' -and $_ -match 'Invoke-WebRequest' }
+          if ($iwrLines.Count -ne 1) {
+            Write-Host "::error::found $($iwrLines.Count) Invoke-WebRequest calls; downloads must go through Get-RemoteFile"
+            $iwrLines | ForEach-Object { Write-Host "::error::  $_" }
             $fail = 1
           } else { Write-Host "all downloads go through Get-RemoteFile" }
 
