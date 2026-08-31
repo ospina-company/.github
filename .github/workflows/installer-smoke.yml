@@ -121,6 +121,24 @@ jobs:
           } finally { Pop-Location }
           Write-Host "Node tooling ignores current-directory command hijacks"
 
+          # WinGet's user-scope Node package keeps node.exe and npm.cmd inside
+          # a nested node-v24.x-win-* directory. Prove discovery reaches the
+          # real portable layout instead of checking only the package root.
+          $savedLocalAppDataForNode = $env:LOCALAPPDATA
+          $nodeRoot = Join-Path $env:RUNNER_TEMP 'node-portable-fixture'
+          $env:LOCALAPPDATA = Join-Path $nodeRoot 'localapp'
+          $nodePackage = Join-Path $env:LOCALAPPDATA `
+            'Microsoft\WinGet\Packages\OpenJS.NodeJS.LTS_fixture\node-v24.19.0-win-x64'
+          New-Item -ItemType Directory -Force -Path $nodePackage | Out-Null
+          New-Item -ItemType File -Force -Path (Join-Path $nodePackage 'node.exe'), `
+            (Join-Path $nodePackage 'npm.cmd') | Out-Null
+          try {
+            if ($nodePackage -notin (Get-NodeToolDirectories)) {
+              Write-Host "::error::nested WinGet portable Node directory was not discovered"; exit 1
+            }
+          } finally { $env:LOCALAPPDATA = $savedLocalAppDataForNode }
+          Write-Host "nested WinGet portable Node layout is discovered"
+
           # npm's per-user global prefix is not necessarily beside node.exe.
           # Prove Corepack resolution follows the trusted npm command to that
           # prefix after a global install.
@@ -141,6 +159,21 @@ jobs:
           $savedPath = $env:Path
           $savedLocalAppData = $env:LOCALAPPDATA
           $savedUserPath = [Environment]::GetEnvironmentVariable('Path','User')
+          $savedPreferredUser = [Environment]::GetEnvironmentVariable('OSPINA_PREFERRED_PATH','User')
+          $savedPreferredProcess = $env:OSPINA_PREFERRED_PATH
+          $documents = [Environment]::GetFolderPath('MyDocuments')
+          $profilePaths = @(
+            (Join-Path $documents 'WindowsPowerShell\Microsoft.PowerShell_profile.ps1'),
+            (Join-Path $documents 'PowerShell\Microsoft.PowerShell_profile.ps1'),
+            (Join-Path $env:USERPROFILE '.bash_profile')
+          )
+          $profileBackups = @{}
+          foreach ($profilePath in $profilePaths) {
+            $profileBackups[$profilePath] = [pscustomobject]@{
+              Existed = Test-Path $profilePath
+              Content = if (Test-Path $profilePath) { Get-Content $profilePath -Raw } else { $null }
+            }
+          }
           $uvRoot = Join-Path $env:RUNNER_TEMP 'uv-path-fixture'
           $oldUvDir = Join-Path $uvRoot 'old'
           $newUvDir = Join-Path $uvRoot 'localapp\Microsoft\WinGet\Packages\astral-sh.uv_fixture'
@@ -166,16 +199,31 @@ jobs:
             if (-not (Resolve-UvOnPath) -or -not (Test-UvDefaultInstall)) {
               Write-Host "::error::current user-scoped uv did not replace the old PATH winner"; exit 1
             }
-            Refresh-Path -MachinePath $oldUvDir -UserPath $newUvDir
-            if (-not (Test-UvDefaultInstall)) {
-              Write-Host "::error::PATH refresh restored the obsolete uv behavior"; exit 1
+            # Simulate a fresh Windows shell: machine PATH wins in the parent,
+            # and only the generated PowerShell profile may restore precedence.
+            $env:Path = "$oldUvDir;$savedPath"
+            $freshUv = (& powershell.exe -NoLogo -NonInteractive -Command `
+              '(Get-Command uv.exe -CommandType Application | Select-Object -First 1).Source' |
+              Select-Object -Last 1).Trim()
+            if ($freshUv -ne (Join-Path $newUvDir 'uv.exe')) {
+              Write-Host "::error::new PowerShell resolved '$freshUv' instead of the promoted uv"; exit 1
             }
           } finally {
             $env:Path = $savedPath
             $env:LOCALAPPDATA = $savedLocalAppData
             [Environment]::SetEnvironmentVariable('Path', $savedUserPath, 'User')
+            [Environment]::SetEnvironmentVariable('OSPINA_PREFERRED_PATH', $savedPreferredUser, 'User')
+            $env:OSPINA_PREFERRED_PATH = $savedPreferredProcess
+            foreach ($profilePath in $profilePaths) {
+              $backup = $profileBackups[$profilePath]
+              if ($backup.Existed) {
+                New-Item -ItemType Directory -Force -Path (Split-Path $profilePath -Parent) | Out-Null
+                [IO.File]::WriteAllText($profilePath, $backup.Content,
+                  (New-Object Text.UTF8Encoding($false)))
+              } elseif (Test-Path $profilePath) { Remove-Item $profilePath -Force }
+            }
           }
-          Write-Host "old uv PATH conflict recovers to the current user-scoped executable"
+          Write-Host "old uv PATH conflict stays repaired in a new PowerShell"
 
           # LibreOffice is machine-scoped. A denied installation must return a
           # false capability result rather than throwing and aborting onboarding.
@@ -606,8 +654,12 @@ jobs:
           export HOME
           mkdir -p "$HOME"
           persist_path_front "$new_bin"
+          brew_bin=$(dirname "$(command -v brew)")
+          persist_path_front "$brew_bin"
           uv_supports_default
           [ "$(command -v uv)" = "$new_bin/uv" ]
           resolved=$(PATH="$old_bin:$PATH" zsh -l -c 'command -v uv')
           [ "$resolved" = "$new_bin/uv" ]
-          echo "non-admin guard and competing-old-uv recovery persist in a new login shell"
+          resolved_brew=$(PATH=/usr/bin:/bin zsh -l -c 'command -v brew')
+          [ "$resolved_brew" = "$brew_bin/brew" ]
+          echo "Homebrew and competing-old-uv recovery persist in a new login shell"
