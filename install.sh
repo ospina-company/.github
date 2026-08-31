@@ -96,6 +96,19 @@ load_brew() {
   return 1
 }
 
+brew_bin_path() {
+  # A failed command substitution inside another command does not trip `set -e`.
+  # Validate the prefix separately so a failed lookup can never become `/bin`.
+  local _prefix
+  if [ "$#" -gt 0 ]; then
+    _prefix=$(brew --prefix "$1" 2>/dev/null) || return 1
+  else
+    _prefix=$(brew --prefix 2>/dev/null) || return 1
+  fi
+  [ -n "$_prefix" ] && [ -d "$_prefix/bin" ] || return 1
+  printf '%s/bin\n' "${_prefix%/}"
+}
+
 can_install_homebrew() {
   # Homebrew's supported macOS installer requires sudo access. Starting its
   # prompts on a managed standard account can never succeed, so detect that
@@ -157,7 +170,8 @@ Ask your device administrator to install Homebrew from https://brew.sh, then re-
   # them. Persist the prefix even on a clean first run, before any formula is
   # installed, so brew and every unversioned formula remain available when the
   # employee opens T3 Code or a new terminal.
-  _brew_bin="$(brew --prefix)/bin"
+  _brew_bin=$(brew_bin_path) \
+    || die "Homebrew is callable, but its bin directory could not be resolved."
   add_path "$_brew_bin"
   persist_path_front "$_brew_bin"
 
@@ -189,8 +203,8 @@ Ask your device administrator to install Homebrew from https://brew.sh, then re-
   if ! uv_supports_default; then
     say "  upgrade  uv (the installed version lacks 'python install --default')"
     brew upgrade uv || brew install uv || die "Could not install a current uv."
-    add_path "$(brew --prefix)/bin"
-    persist_path_front "$(brew --prefix)/bin"
+    add_path "$_brew_bin"
+    persist_path_front "$_brew_bin"
     hash -r
     uv_supports_default || die "A conflicting old uv is still first on PATH. Remove it, then re-run."
   fi
@@ -203,8 +217,10 @@ Ask your device administrator to install Homebrew from https://brew.sh, then re-
     # node@24 is versioned and therefore keg-only. Link it deliberately: Node
     # 25+ breaks repositories that cap their supported range below 25.
     brew link --overwrite --force node@24 || true
-    add_path "$(brew --prefix node@24)/bin"
-    persist_path_front "$(brew --prefix node@24)/bin"
+    _node_bin=$(brew_bin_path node@24) \
+      || die "Node 24 installed, but Homebrew could not resolve its bin directory."
+    add_path "$_node_bin"
+    persist_path_front "$_node_bin"
   fi
   _node_major=$(node -p 'process.versions.node.split(".")[0]' 2>/dev/null || true)
   [ "$_node_major" = 24 ] || die "Node 24 installed but is not active. Open a new terminal and re-run."
