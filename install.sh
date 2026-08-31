@@ -3,9 +3,10 @@
 #
 #   /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/ospina-company/.github/main/install.sh)"
 #
-# Installs git, gh and vale, signs you in to GitHub, clones the handbook, and
-# hands off to handbook/bootstrap.sh, which clones every Ospina repo your
-# GitHub account can see and configures your agent.
+# Installs the workstation baseline (Git, Node 24, Python 3.12, document tools
+# and T3 Code), signs you in to GitHub, clones the handbook, and hands off to
+# handbook/bootstrap.sh, which clones only the Ospina repos your account can
+# read and configures your agents.
 #
 # Read before running. It is short on purpose.
 # Safe to re-run: every step checks before it acts.
@@ -17,6 +18,30 @@ say()  { printf '%s\n' "$*"; }
 step() { printf '\n%s==>%s %s\n' "$BOLD" "$RESET" "$*"; }
 die()  { printf '\nERROR: %s\n' "$*" >&2; exit 1; }
 have() { command -v "$1" >/dev/null 2>&1; }
+
+ask_yes_no() {
+  # Default yes: this is how the workflow is set up, so the common answer
+  # should be the one you get by pressing Enter.
+  printf '%s [Y/n] ' "$1"
+  read -r _a </dev/tty || _a=""
+  case "$_a" in ''|[Yy]*) return 0 ;; *) return 1 ;; esac
+}
+
+add_path() {
+  [ -d "$1" ] || return 0
+  case ":$PATH:" in *":$1:"*) : ;; *) PATH="$1:$PATH"; export PATH ;; esac
+}
+
+load_brew() {
+  have brew && return 0
+  for _brew in /opt/homebrew/bin/brew /usr/local/bin/brew; do
+    if [ -x "$_brew" ]; then
+      eval "$("$_brew" shellenv)"
+      return 0
+    fi
+  done
+  return 1
+}
 
 case "$(uname -s)" in
   Darwin) PLATFORM=mac ;;
@@ -32,29 +57,69 @@ say "${DIM}You will need a GitHub account that has been added to the ospina-comp
 step "Checking tools"
 
 if [ "$PLATFORM" = mac ]; then
-  if ! have brew; then
-    say "Homebrew is required and not installed."
-    say "Install it, then re-run this command:"
-    say "  /bin/bash -c \"\$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)\""
-    die "Homebrew missing"
+  if ! load_brew; then
+    say "  --       Homebrew not found"
+    if ! ask_yes_no "           Install Homebrew?"; then
+      die "Homebrew is required. Re-run this command when you are ready to install it."
+    fi
+    _hb=$(mktemp 2>/dev/null || echo "${TMPDIR:-/tmp}/homebrew-install.$$")
+    curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh -o "$_hb" \
+      || die "Could not download the Homebrew installer."
+    /bin/bash "$_hb" || die "Homebrew did not install successfully."
+    rm -f "$_hb"
+    load_brew || die "Homebrew installed but is not callable in this terminal. Open a new terminal and re-run."
+    say "  ok       Homebrew installed"
   fi
-  # git and gh are required. vale only powers the advisory prose linter, so a
-  # failure there must not end onboarding: set -e would otherwise abort the whole
-  # run before auth, clone and bootstrap ever happen.
-  for pkg in git gh; do
-    if have "$pkg"; then say "  ok       $pkg"
+
+  brew_formula() {
+    _cmd=$1; _pkg=$2; _required=$3
+    if have "$_cmd"; then say "  ok       $_cmd"
     else
-      say "  install  $pkg"
+      say "  install  $_pkg"
       # Do not hide this. A first brew install takes minutes, and with the
       # output suppressed a working install is indistinguishable from a hang.
       say "           this can take a few minutes; brew output follows"
-      brew install "$pkg" || die "Could not install $pkg. Install it manually, then re-run."
+      if brew install "$_pkg" && { have "$_cmd" || [ "$_pkg" = node@24 ]; }; then :
+      elif [ "$_required" = required ]; then
+        die "Could not install $_pkg. Install it manually, then re-run."
+      else
+        say "  note     $_pkg did not install. The related quality checks will not work."
+      fi
     fi
-  done
-  if have vale; then say "  ok       vale"
-  elif say "  install  vale" && brew install vale; then say "  ok       vale"
-  else say "  note     vale did not install. Prose linting will not work; everything else will."
+  }
+
+  brew_formula git git required
+  brew_formula gh gh required
+  brew_formula vale vale optional
+  brew_formula uv uv required
+  brew_formula pdftotext poppler required
+
+  _node_major=$(node -p 'process.versions.node.split(".")[0]' 2>/dev/null || true)
+  if [ "$_node_major" != 24 ]; then
+    say "  install  Node 24 LTS"
+    say "           this can take a few minutes; brew output follows"
+    brew install node@24 || die "Could not install Node 24."
+    # node@24 is versioned and therefore keg-only. Link it deliberately: Node
+    # 25+ breaks repositories that cap their supported range below 25.
+    brew link --overwrite --force node@24 || true
+    add_path "$(brew --prefix node@24)/bin"
   fi
+  _node_major=$(node -p 'process.versions.node.split(".")[0]' 2>/dev/null || true)
+  [ "$_node_major" = 24 ] || die "Node 24 installed but is not active. Open a new terminal and re-run."
+  say "  ok       node $(node --version)"
+
+  if ! have soffice && [ ! -x /Applications/LibreOffice.app/Contents/MacOS/soffice ]; then
+    say "  install  LibreOffice"
+    say "           this is a large download; brew output follows"
+    brew install --cask libreoffice || die "Could not install LibreOffice."
+  fi
+  if [ -x /Applications/LibreOffice.app/Contents/MacOS/soffice ]; then
+    mkdir -p "$HOME/.local/bin"
+    ln -sf /Applications/LibreOffice.app/Contents/MacOS/soffice "$HOME/.local/bin/soffice"
+    add_path "$HOME/.local/bin"
+  fi
+  have soffice || die "LibreOffice installed but soffice is not callable. Open a new terminal and re-run."
+  say "  ok       soffice"
 else
   if ! have git; then
     die "git is required.
@@ -69,6 +134,41 @@ else
   fi
   say "  ok       git, gh"
   have vale || say "  ${DIM}note: vale not found. Optional, but prose linting will not work.${RESET}"
+  have node || say "  ${DIM}note: Node 24 is required. Install it from https://nodejs.org, then re-run.${RESET}"
+  have uv || say "  ${DIM}note: uv is required. Install it from https://docs.astral.sh/uv/, then re-run.${RESET}"
+  have soffice || say "  ${DIM}note: LibreOffice is required for document verification.${RESET}"
+  have pdftotext || say "  ${DIM}note: Poppler is required for PDF verification.${RESET}"
+fi
+
+# Node and Python are workstation capabilities, not project-global dependency
+# buckets. Corepack selects each repo's pinned pnpm; uv selects its pinned
+# Python and creates isolated environments.
+if have node; then
+  if ! have corepack && have npm; then
+    say "  install  corepack"
+    npm install -g corepack || die "Could not install Corepack."
+  fi
+  have corepack || die "Node is present but Corepack is missing."
+  mkdir -p "$HOME/.local/bin"
+  corepack enable --install-directory "$HOME/.local/bin" \
+    || die "Corepack could not enable the pnpm shims."
+  add_path "$HOME/.local/bin"
+  say "  ok       corepack $(corepack --version 2>/dev/null || echo present)"
+fi
+
+if have uv; then
+  say "  install  Python 3.12 (managed by uv)"
+  uv python install 3.12 --default || die "uv could not install Python 3.12."
+  _uv_bin=$(uv python dir --bin 2>/dev/null || true)
+  [ -n "$_uv_bin" ] && add_path "$_uv_bin"
+  if uv python find 3.12 >/dev/null 2>&1; then
+    _python_minor=$(python -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")' 2>/dev/null || true)
+    [ "$_python_minor" = 3.12 ] \
+      || die "Python 3.12 is installed, but the 'python' command resolves to ${_python_minor:-nothing}. Open a new terminal and re-run."
+    say "  ok       Python $(python -c 'import platform; print(platform.python_version())')"
+  else
+    die "Python 3.12 was requested but uv cannot find it."
+  fi
 fi
 
 # --------------------------------------------------------------------- auth
@@ -149,14 +249,6 @@ say "  agents that run inside it. You need T3 Code and at least one agent."
 say "  You bring your own Claude or Codex subscription; Ospina does not provide one."
 say ""
 
-ask_yes_no() {
-  # Default yes: this is how the workflow is set up, so the common answer
-  # should be the one you get by pressing Enter.
-  printf '%s [Y/n] ' "$1"
-  read -r _a </dev/tty || _a=""
-  case "$_a" in ''|[Yy]*) return 0 ;; *) return 1 ;; esac
-}
-
 have_t3()     { have t3 || ls -d /Applications/T3\ Code*.app >/dev/null 2>&1; }
 have_claude() { have claude; }
 have_codex()  { have codex; }
@@ -180,7 +272,7 @@ install_claude() {
   fi
 }
 install_codex() {
-  if have brew; then brew install codex
+  if have brew; then brew install --cask codex
   elif have npm; then npm install -g @openai/codex
   else say "          needs Homebrew or npm; see https://github.com/openai/codex"; return 1; fi
 }
@@ -197,6 +289,29 @@ for _agent in "T3 Code|have_t3|install_t3" "Claude Code|have_claude|install_clau
     say "           skipped. Re-run this command later and it will offer again."
   fi
 done
+say ""
+
+_signed_in=0
+if have claude; then
+  if claude auth status >/dev/null 2>&1; then
+    say "  ok       Claude Code signed in"
+    _signed_in=1
+  elif ask_yes_no "           Sign in to Claude Code now?"; then
+    claude auth login || say "  note     Claude Code sign-in did not complete"
+    claude auth status >/dev/null 2>&1 && _signed_in=1
+  fi
+fi
+if have codex; then
+  if codex login status >/dev/null 2>&1; then
+    say "  ok       Codex signed in"
+    _signed_in=1
+  elif ask_yes_no "           Sign in to Codex now?"; then
+    codex login || say "  note     Codex sign-in did not complete"
+    codex login status >/dev/null 2>&1 && _signed_in=1
+  fi
+fi
+[ "$_signed_in" -eq 1 ] \
+  || say "  note     Sign in to at least one agent before starting work in T3 Code."
 say ""
 
 
