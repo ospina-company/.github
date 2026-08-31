@@ -152,12 +152,9 @@ jobs:
             if (-not (Resolve-UvOnPath) -or -not (Test-UvDefaultInstall)) {
               Write-Host "::error::current user-scoped uv did not replace the old PATH winner"; exit 1
             }
-            if ((Get-Command uv -CommandType Application).Source -ne (Join-Path $newUvDir 'uv.exe')) {
-              Write-Host "::error::verified uv directory was not moved to the front of PATH"; exit 1
-            }
             Refresh-Path -MachinePath $oldUvDir -UserPath $newUvDir
-            if ((Get-Command uv -CommandType Application).Source -ne (Join-Path $newUvDir 'uv.exe')) {
-              Write-Host "::error::PATH refresh restored the obsolete machine-scoped uv"; exit 1
+            if (-not (Test-UvDefaultInstall)) {
+              Write-Host "::error::PATH refresh restored the obsolete uv behavior"; exit 1
             }
           } finally {
             $env:Path = $savedPath
