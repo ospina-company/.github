@@ -71,7 +71,12 @@ can_install_homebrew() {
   # Homebrew's supported macOS installer requires sudo access. Starting its
   # prompts on a managed standard account can never succeed, so detect that
   # condition before downloading anything and give the reader the IT handoff.
-  groups "$(id -un)" 2>/dev/null | tr ' ' '\n' | grep -qx admin
+  _admin_user=$(id -un)
+  if have dseditgroup \
+    && dseditgroup -o checkmember -m "$_admin_user" admin >/dev/null 2>&1; then
+    return 0
+  fi
+  groups "$_admin_user" 2>/dev/null | tr ' ' '\n' | grep -qx admin
 }
 
 uv_supports_default() {
