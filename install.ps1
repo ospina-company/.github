@@ -102,6 +102,216 @@ function Find-GitBash {
   return $null
 }
 
+# ---------------------------------------------------------------------
+# All helpers are defined here, above the wrapper. PowerShell executes
+# function definitions in order, so a helper defined further down the
+# file does not exist yet when earlier code calls it.
+# ---------------------------------------------------------------------
+
+function Ask-YesNo ($question) {
+  # Default yes: this is how the workflow is set up, so the common answer should
+  # be the one you get by pressing Enter.
+  $a = Read-Host "$question [Y/n]"
+  return ([string]::IsNullOrWhiteSpace($a) -or $a -match '^[Yy]')
+}
+function Test-Npm {
+  # Get-Command finding npm proves a file exists, not that npm runs. On the
+  # default Restricted execution policy, npm resolves to npm.ps1 and PowerShell
+  # refuses to execute it, so npm is present and unusable at the same time.
+  # Ask cmd, which is the path we would actually install through.
+  if (-not (Have npm)) { return $false }
+  return (Invoke-Native cmd @('/c','npm','--version')) -eq 0
+}
+function Install-CodexBinary {
+  # Codex publishes a standalone executable per architecture, which removes the
+  # Node and execution-policy dependency entirely.
+  try {
+    $arch = if ($env:PROCESSOR_ARCHITECTURE -eq 'ARM64') { 'aarch64' } else { 'x86_64' }
+    $want = "codex-$arch-pc-windows-msvc.exe"
+    Say "          finding the latest Codex release..."
+    $rel = Invoke-RestMethod 'https://api.github.com/repos/openai/codex/releases/latest' `
+                             -Headers @{ 'User-Agent' = 'ospina-installer' }
+    $asset = $rel.assets | Where-Object { $_.name -eq $want } | Select-Object -First 1
+    if (-not $asset) { throw "no $want in the latest release" }
+
+    $dir = Join-Path $env:LOCALAPPDATA 'Programs\codex'
+    New-Item -ItemType Directory -Force -Path $dir | Out-Null
+    $dest = Join-Path $dir 'codex.exe'
+    Say ("          downloading {0} ({1} MB)..." -f $want, [int]($asset.size/1MB))
+    Invoke-WebRequest $asset.browser_download_url -OutFile $dest -UseBasicParsing
+
+    # Put it on PATH for this account and for this session.
+    $userPath = [Environment]::GetEnvironmentVariable('Path','User')
+    if (($userPath -split ';') -notcontains $dir) {
+      [Environment]::SetEnvironmentVariable('Path', (($userPath.TrimEnd(';') + ';' + $dir).TrimStart(';')), 'User')
+      Say "          added $dir to your PATH"
+    }
+    $env:Path = "$env:Path;$dir"
+    return $true
+  } catch {
+    Say ("          standalone install failed: {0}" -f $_.Exception.Message)
+    Say  "          Install manually: https://github.com/openai/codex/releases/latest"
+    return $false
+  }
+}
+function Resolve-OnPath {
+  # A tool that exists but is not callable is a PATH problem, and the installer
+  # knows where it put things. Fix it here rather than telling the reader to
+  # open a new terminal and hope.
+  param(
+    [Parameter(Mandatory)][string] $Command,
+    [Parameter(Mandatory)][string[]] $Directories
+  )
+  if (Have $Command) { return $true }
+  foreach ($dir in ($Directories | Where-Object { $_ })) {
+    foreach ($ext in @('.exe','.cmd','.ps1','')) {
+      if (Test-Path (Join-Path $dir ($Command + $ext))) {
+        Add-UserPathEntry $dir
+        Say ("          added {0} to your PATH" -f $dir)
+        return (Have $Command)
+      }
+    }
+  }
+  return $false
+}
+function Get-ClaudeNativePath {
+  if (-not $env:USERPROFILE) { return $null }
+  $p = Join-Path $env:USERPROFILE '.local\bin\claude.exe'
+  if (Test-Path $p) { return $p }
+  return $null
+}
+function Test-Claude {
+  # The native installer writes ~/.local/bin/claude.exe and adds that folder to
+  # the user PATH, but the running session does not always pick it up. Check the
+  # known location too, or a good install looks like a failed one.
+  if (Have claude) { return $true }
+  return ($null -ne (Get-ClaudeNativePath))
+}
+function Add-UserPathEntry {
+  param([Parameter(Mandatory)][string]$Dir)
+  $userPath = [Environment]::GetEnvironmentVariable('Path','User')
+  if (($userPath -split ';') -notcontains $Dir) {
+    [Environment]::SetEnvironmentVariable('Path', (($userPath.TrimEnd(';') + ';' + $Dir).TrimStart(';')), 'User')
+  }
+  if (($env:Path -split ';') -notcontains $Dir) { $env:Path = "$env:Path;$Dir" }
+}
+function Test-Codex {
+  if (Have codex) { return $true }
+  # npm global installs land in a prefix that is not always on PATH, and a tool
+  # that exists but cannot be found would otherwise be reinstalled every run.
+  $prefix = Invoke-Native-Capture cmd @('/c','npm','prefix','-g')
+  if ($prefix) {
+    foreach ($n in @('codex.cmd','codex.ps1','codex')) {
+      if (Test-Path (Join-Path $prefix $n)) { return $true }
+    }
+  }
+  # The standalone build lands here.
+  if ($env:LOCALAPPDATA -and (Test-Path (Join-Path $env:LOCALAPPDATA 'Programs\codex\codex.exe'))) { return $true }
+  return $false
+}
+function Test-T3Code {
+  if (Have t3) { return $true }
+  $paths = @(
+    (Join-Path $env:LOCALAPPDATA 'Programs\t3code'),
+    (Join-Path $env:LOCALAPPDATA 'Programs\T3 Code'),
+    (Join-Path $env:ProgramFiles 'T3 Code')
+  )
+  foreach ($p in $paths) { if (Test-Path $p) { return $true } }
+  # Anything registered as installed under a matching display name.
+  foreach ($k in @('HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*',
+                   'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*')) {
+    $hit = Get-ItemProperty $k -ErrorAction SilentlyContinue |
+           Where-Object { $_.DisplayName -like '*T3 Code*' }
+    if ($hit) { return $true }
+  }
+  return $false
+}
+function Install-T3Code {
+  # Not on winget, so take the signed installer from the project's own
+  # GitHub releases. Falls back to the download page if anything goes wrong.
+  try {
+    Say "          finding the latest T3 Code release..."
+    $rel = Invoke-RestMethod 'https://api.github.com/repos/pingdotgg/t3code/releases/latest' `
+                             -Headers @{ 'User-Agent' = 'ospina-installer' }
+    $asset = $rel.assets | Where-Object { $_.name -like '*x64.exe' } | Select-Object -First 1
+    if (-not $asset) { throw 'no Windows installer in the latest release' }
+    $out = Join-Path $env:TEMP $asset.name
+    Say "          downloading $($asset.name)..."
+    Invoke-WebRequest $asset.browser_download_url -OutFile $out -UseBasicParsing
+    # This is a downloaded executable, so check what signed it before running.
+    # The publisher name is not asserted here because it is not documented
+    # anywhere authoritative; an unsigned or broken signature asks first.
+    $sig = Get-AuthenticodeSignature -FilePath $out
+    if ($sig.Status -eq 'Valid') {
+      Say ("          signature: valid, signed by {0}" -f $sig.SignerCertificate.Subject)
+    } else {
+      Say ""
+      Say ("          WARNING: the downloaded installer's signature is '{0}'." -f $sig.Status)
+      Say  "          It came from the official pingdotgg/t3code releases, but it is"
+      Say  "          not carrying a signature Windows trusts."
+      if (-not (Ask-YesNo "           Run it anyway?")) {
+        Remove-Item $out -ErrorAction SilentlyContinue
+        Say "          skipped. Install manually from https://t3.codes/download"
+        return $false
+      }
+    }
+    Say "          running the installer..."
+    Start-Process -FilePath $out -ArgumentList '/S' -Wait
+    Remove-Item $out -ErrorAction SilentlyContinue
+    return $true
+  } catch {
+    Say "          could not install automatically: $($_.Exception.Message)"
+    Say "          opening the download page instead"
+    Start-Process 'https://t3.codes/download'
+    return $false
+  }
+}
+function Test-SyncedPath {
+  # One definition, used by the menu, the OSPINA_WORKSPACE route and the typed
+  # path. Sync clients and git both write to .git and eventually corrupt it, so
+  # every route has to apply the same rule.
+  param([string]$Path)
+  if (-not $Path) { return $false }
+  foreach ($root in @($env:OneDrive, $env:OneDriveCommercial, $env:OneDriveConsumer)) {
+    if ($root -and $Path.StartsWith($root, 'OrdinalIgnoreCase')) { return $true }
+  }
+  return ($Path -match '(?i)onedrive|dropbox|google drive|box sync')
+}
+function Get-WorkspaceCandidates {
+  $home_ = $env:USERPROFILE
+  $od    = $env:OneDrive
+  $out   = @()
+
+  function Add-Candidate($path, $why, $rank) {
+    if (-not $path) { return }
+    # OneDrive and Dropbox sync clients write into .git concurrently with git
+    # and corrupt repositories. Never offer a synced location.
+    if (Test-SyncedPath $path) { return }
+    $script:cands += [pscustomobject]@{
+      Path = $path; Why = $why; Rank = $rank; Exists = (Test-Path $path)
+    }
+  }
+
+  $script:cands = @()
+  # Existing developer folders first: if one of these is here, it is where this
+  # person already keeps code.
+  foreach ($d in @('Repositories','repos','source\repos','Projects','projects','dev','code','git','Developer')) {
+    $full = Join-Path $home_ $d
+    if (Test-Path $full) { Add-Candidate (Join-Path $full 'Ospina') "inside your existing $d folder" 10 }
+  }
+  # A short root on the system drive. Shortest paths, which matters on Windows.
+  Add-Candidate 'C:\Ospina' 'short path, avoids Windows path-length limits' 20
+  # Home directory.
+  Add-Candidate (Join-Path $home_ 'Ospina') 'in your home folder' 30
+  # A roomier non-system drive, if one exists.
+  Get-PSDrive -PSProvider FileSystem -ErrorAction SilentlyContinue |
+    Where-Object { $_.Name -match '^[D-Z]$' -and $_.Free -gt 20GB } |
+    Sort-Object Free -Descending | Select-Object -First 1 | ForEach-Object {
+      Add-Candidate ("{0}:\Ospina" -f $_.Name) ("more free space ({0:N0} GB)" -f ($_.Free/1GB)) 15
+    }
+  $script:cands | Sort-Object Rank, Path | Group-Object Path | ForEach-Object { $_.Group[0] }
+}
+
 function Invoke-OspinaInstall {
 
 Say ""
@@ -293,173 +503,15 @@ Say "  agents that run inside it. You need T3 Code and at least one agent."
 Say "  You bring your own Claude or Codex subscription; Ospina does not provide one."
 Say ""
 
-function Ask-YesNo ($question) {
-  # Default yes: this is how the workflow is set up, so the common answer should
-  # be the one you get by pressing Enter.
-  $a = Read-Host "$question [Y/n]"
-  return ([string]::IsNullOrWhiteSpace($a) -or $a -match '^[Yy]')
-}
 
-function Test-Npm {
-  # Get-Command finding npm proves a file exists, not that npm runs. On the
-  # default Restricted execution policy, npm resolves to npm.ps1 and PowerShell
-  # refuses to execute it, so npm is present and unusable at the same time.
-  # Ask cmd, which is the path we would actually install through.
-  if (-not (Have npm)) { return $false }
-  return (Invoke-Native cmd @('/c','npm','--version')) -eq 0
-}
 
-function Install-CodexBinary {
-  # Codex publishes a standalone executable per architecture, which removes the
-  # Node and execution-policy dependency entirely.
-  try {
-    $arch = if ($env:PROCESSOR_ARCHITECTURE -eq 'ARM64') { 'aarch64' } else { 'x86_64' }
-    $want = "codex-$arch-pc-windows-msvc.exe"
-    Say "          finding the latest Codex release..."
-    $rel = Invoke-RestMethod 'https://api.github.com/repos/openai/codex/releases/latest' `
-                             -Headers @{ 'User-Agent' = 'ospina-installer' }
-    $asset = $rel.assets | Where-Object { $_.name -eq $want } | Select-Object -First 1
-    if (-not $asset) { throw "no $want in the latest release" }
 
-    $dir = Join-Path $env:LOCALAPPDATA 'Programs\codex'
-    New-Item -ItemType Directory -Force -Path $dir | Out-Null
-    $dest = Join-Path $dir 'codex.exe'
-    Say ("          downloading {0} ({1} MB)..." -f $want, [int]($asset.size/1MB))
-    Invoke-WebRequest $asset.browser_download_url -OutFile $dest -UseBasicParsing
 
-    # Put it on PATH for this account and for this session.
-    $userPath = [Environment]::GetEnvironmentVariable('Path','User')
-    if (($userPath -split ';') -notcontains $dir) {
-      [Environment]::SetEnvironmentVariable('Path', (($userPath.TrimEnd(';') + ';' + $dir).TrimStart(';')), 'User')
-      Say "          added $dir to your PATH"
-    }
-    $env:Path = "$env:Path;$dir"
-    return $true
-  } catch {
-    Say ("          standalone install failed: {0}" -f $_.Exception.Message)
-    Say  "          Install manually: https://github.com/openai/codex/releases/latest"
-    return $false
-  }
-}
 
-function Resolve-OnPath {
-  # A tool that exists but is not callable is a PATH problem, and the installer
-  # knows where it put things. Fix it here rather than telling the reader to
-  # open a new terminal and hope.
-  param(
-    [Parameter(Mandatory)][string] $Command,
-    [Parameter(Mandatory)][string[]] $Directories
-  )
-  if (Have $Command) { return $true }
-  foreach ($dir in ($Directories | Where-Object { $_ })) {
-    foreach ($ext in @('.exe','.cmd','.ps1','')) {
-      if (Test-Path (Join-Path $dir ($Command + $ext))) {
-        Add-UserPathEntry $dir
-        Say ("          added {0} to your PATH" -f $dir)
-        return (Have $Command)
-      }
-    }
-  }
-  return $false
-}
 
-function Get-ClaudeNativePath {
-  if (-not $env:USERPROFILE) { return $null }
-  $p = Join-Path $env:USERPROFILE '.local\bin\claude.exe'
-  if (Test-Path $p) { return $p }
-  return $null
-}
 
-function Test-Claude {
-  # The native installer writes ~/.local/bin/claude.exe and adds that folder to
-  # the user PATH, but the running session does not always pick it up. Check the
-  # known location too, or a good install looks like a failed one.
-  if (Have claude) { return $true }
-  return ($null -ne (Get-ClaudeNativePath))
-}
 
-function Add-UserPathEntry {
-  param([Parameter(Mandatory)][string]$Dir)
-  $userPath = [Environment]::GetEnvironmentVariable('Path','User')
-  if (($userPath -split ';') -notcontains $Dir) {
-    [Environment]::SetEnvironmentVariable('Path', (($userPath.TrimEnd(';') + ';' + $Dir).TrimStart(';')), 'User')
-  }
-  if (($env:Path -split ';') -notcontains $Dir) { $env:Path = "$env:Path;$Dir" }
-}
 
-function Test-Codex {
-  if (Have codex) { return $true }
-  # npm global installs land in a prefix that is not always on PATH, and a tool
-  # that exists but cannot be found would otherwise be reinstalled every run.
-  $prefix = Invoke-Native-Capture cmd @('/c','npm','prefix','-g')
-  if ($prefix) {
-    foreach ($n in @('codex.cmd','codex.ps1','codex')) {
-      if (Test-Path (Join-Path $prefix $n)) { return $true }
-    }
-  }
-  # The standalone build lands here.
-  if ($env:LOCALAPPDATA -and (Test-Path (Join-Path $env:LOCALAPPDATA 'Programs\codex\codex.exe'))) { return $true }
-  return $false
-}
-
-function Test-T3Code {
-  if (Have t3) { return $true }
-  $paths = @(
-    (Join-Path $env:LOCALAPPDATA 'Programs\t3code'),
-    (Join-Path $env:LOCALAPPDATA 'Programs\T3 Code'),
-    (Join-Path $env:ProgramFiles 'T3 Code')
-  )
-  foreach ($p in $paths) { if (Test-Path $p) { return $true } }
-  # Anything registered as installed under a matching display name.
-  foreach ($k in @('HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*',
-                   'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*')) {
-    $hit = Get-ItemProperty $k -ErrorAction SilentlyContinue |
-           Where-Object { $_.DisplayName -like '*T3 Code*' }
-    if ($hit) { return $true }
-  }
-  return $false
-}
-
-function Install-T3Code {
-  # Not on winget, so take the signed installer from the project's own
-  # GitHub releases. Falls back to the download page if anything goes wrong.
-  try {
-    Say "          finding the latest T3 Code release..."
-    $rel = Invoke-RestMethod 'https://api.github.com/repos/pingdotgg/t3code/releases/latest' `
-                             -Headers @{ 'User-Agent' = 'ospina-installer' }
-    $asset = $rel.assets | Where-Object { $_.name -like '*x64.exe' } | Select-Object -First 1
-    if (-not $asset) { throw 'no Windows installer in the latest release' }
-    $out = Join-Path $env:TEMP $asset.name
-    Say "          downloading $($asset.name)..."
-    Invoke-WebRequest $asset.browser_download_url -OutFile $out -UseBasicParsing
-    # This is a downloaded executable, so check what signed it before running.
-    # The publisher name is not asserted here because it is not documented
-    # anywhere authoritative; an unsigned or broken signature asks first.
-    $sig = Get-AuthenticodeSignature -FilePath $out
-    if ($sig.Status -eq 'Valid') {
-      Say ("          signature: valid, signed by {0}" -f $sig.SignerCertificate.Subject)
-    } else {
-      Say ""
-      Say ("          WARNING: the downloaded installer's signature is '{0}'." -f $sig.Status)
-      Say  "          It came from the official pingdotgg/t3code releases, but it is"
-      Say  "          not carrying a signature Windows trusts."
-      if (-not (Ask-YesNo "           Run it anyway?")) {
-        Remove-Item $out -ErrorAction SilentlyContinue
-        Say "          skipped. Install manually from https://t3.codes/download"
-        return $false
-      }
-    }
-    Say "          running the installer..."
-    Start-Process -FilePath $out -ArgumentList '/S' -Wait
-    Remove-Item $out -ErrorAction SilentlyContinue
-    return $true
-  } catch {
-    Say "          could not install automatically: $($_.Exception.Message)"
-    Say "          opening the download page instead"
-    Start-Process 'https://t3.codes/download'
-    return $false
-  }
-}
 
 $agents = @(
   @{ Name = 'T3 Code'; Command = $null;     Test = { Test-T3Code };  Install = { Install-T3Code }
@@ -589,52 +641,7 @@ Step "Workspace location"
 # Offer places that already exist and make sense on this machine, rather than
 # inventing one path and hoping. A free-text prompt puts the burden on someone
 # who has no idea what the constraints are.
-function Test-SyncedPath {
-  # One definition, used by the menu, the OSPINA_WORKSPACE route and the typed
-  # path. Sync clients and git both write to .git and eventually corrupt it, so
-  # every route has to apply the same rule.
-  param([string]$Path)
-  if (-not $Path) { return $false }
-  foreach ($root in @($env:OneDrive, $env:OneDriveCommercial, $env:OneDriveConsumer)) {
-    if ($root -and $Path.StartsWith($root, 'OrdinalIgnoreCase')) { return $true }
-  }
-  return ($Path -match '(?i)onedrive|dropbox|google drive|box sync')
-}
 
-function Get-WorkspaceCandidates {
-  $home_ = $env:USERPROFILE
-  $od    = $env:OneDrive
-  $out   = @()
-
-  function Add-Candidate($path, $why, $rank) {
-    if (-not $path) { return }
-    # OneDrive and Dropbox sync clients write into .git concurrently with git
-    # and corrupt repositories. Never offer a synced location.
-    if (Test-SyncedPath $path) { return }
-    $script:cands += [pscustomobject]@{
-      Path = $path; Why = $why; Rank = $rank; Exists = (Test-Path $path)
-    }
-  }
-
-  $script:cands = @()
-  # Existing developer folders first: if one of these is here, it is where this
-  # person already keeps code.
-  foreach ($d in @('Repositories','repos','source\repos','Projects','projects','dev','code','git','Developer')) {
-    $full = Join-Path $home_ $d
-    if (Test-Path $full) { Add-Candidate (Join-Path $full 'Ospina') "inside your existing $d folder" 10 }
-  }
-  # A short root on the system drive. Shortest paths, which matters on Windows.
-  Add-Candidate 'C:\Ospina' 'short path, avoids Windows path-length limits' 20
-  # Home directory.
-  Add-Candidate (Join-Path $home_ 'Ospina') 'in your home folder' 30
-  # A roomier non-system drive, if one exists.
-  Get-PSDrive -PSProvider FileSystem -ErrorAction SilentlyContinue |
-    Where-Object { $_.Name -match '^[D-Z]$' -and $_.Free -gt 20GB } |
-    Sort-Object Free -Descending | Select-Object -First 1 | ForEach-Object {
-      Add-Candidate ("{0}:\Ospina" -f $_.Name) ("more free space ({0:N0} GB)" -f ($_.Free/1GB)) 15
-    }
-  $script:cands | Sort-Object Rank, Path | Group-Object Path | ForEach-Object { $_.Group[0] }
-}
 
 if ($env:OSPINA_WORKSPACE) {
   $ws = $env:OSPINA_WORKSPACE
