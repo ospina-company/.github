@@ -546,10 +546,11 @@ say "  workspace: $WS"
 step "Handbook"
 if [ -d "$WS/handbook/.git" ]; then
   say "  ok       already cloned, updating"
-  # A stale handbook still bootstraps, so this is deliberately not fatal. Do not
-  # guess the cause: diverged history, credentials and network all land here.
   git -C "$WS/handbook" pull -q --ff-only \
-    || say "  ${DIM}could not update the handbook; continuing with the existing copy${RESET}"
+    || die "Could not update the handbook, so its existing bootstrap will not run.
+  Older bootstrap versions can disclose repository names your account cannot read.
+  Resolve any local handbook changes, network issue or access problem, then re-run.
+  Your repositories were not touched."
 else
   gh repo clone ospina-company/handbook "$WS/handbook" -- -q \
     || die "Could not clone the handbook into $WS/handbook.
