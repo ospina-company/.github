@@ -383,10 +383,13 @@ function Find-ByteSequence {
   param(
     [byte[]]$Bytes,
     [byte[]]$Needle,
-    [int]$StartAt = 0
+    [int]$StartAt = 0,
+    [ValidateRange(1, 2)][int]$Alignment = 1,
+    [int]$AlignmentOffset = 0
   )
   if (-not $Bytes -or -not $Needle -or $Needle.Length -gt $Bytes.Length) { return -1 }
   for ($i = [Math]::Max(0, $StartAt); $i -le $Bytes.Length - $Needle.Length; $i++) {
+    if ((($i - $AlignmentOffset) % $Alignment) -ne 0) { continue }
     $matched = $true
     for ($j = 0; $j -lt $Needle.Length; $j++) {
       if ($Bytes[$i + $j] -ne $Needle[$j]) { $matched = $false; break }
@@ -427,12 +430,14 @@ function Add-OspinaProfileBlock {
   } else {
     $encoding = New-Object Text.UTF8Encoding($false)
   }
+  $searchAlignment = if ($encoding.CodePage -in @(1200, 1201)) { 2 } else { 1 }
 
   $existingText = if ($bytes.Length -gt $preambleLength) {
     $encoding.GetString($bytes, $preambleLength, $bytes.Length - $preambleLength)
   } else { '' }
   $blockBytes = $encoding.GetBytes($Block.Trim())
-  if ((Find-ByteSequence -Bytes $bytes -Needle $blockBytes -StartAt $preambleLength) -ge 0) {
+  if ((Find-ByteSequence -Bytes $bytes -Needle $blockBytes -StartAt $preambleLength `
+                         -Alignment $searchAlignment -AlignmentOffset $preambleLength) -ge 0) {
     return
   }
 
@@ -449,9 +454,12 @@ function Add-OspinaProfileBlock {
 
   $startBytes = $encoding.GetBytes($Start)
   $endBytes = $encoding.GetBytes($End)
-  $startIndex = Find-ByteSequence -Bytes $bytes -Needle $startBytes -StartAt $preambleLength
+  $startIndex = Find-ByteSequence -Bytes $bytes -Needle $startBytes -StartAt $preambleLength `
+                                  -Alignment $searchAlignment -AlignmentOffset $preambleLength
   $endIndex = if ($startIndex -ge 0) {
-    Find-ByteSequence -Bytes $bytes -Needle $endBytes -StartAt ($startIndex + $startBytes.Length)
+    Find-ByteSequence -Bytes $bytes -Needle $endBytes `
+                      -StartAt ($startIndex + $startBytes.Length) `
+                      -Alignment $searchAlignment -AlignmentOffset $preambleLength
   } else { -1 }
   if ($startIndex -ge 0 -and $endIndex -lt 0) {
     Die "The managed Ospina block in '$Path' is incomplete. Restore its closing marker, then re-run."
