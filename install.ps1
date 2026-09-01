@@ -351,11 +351,31 @@ function Test-Claude {
 }
 function Add-UserPathEntry {
   param([Parameter(Mandatory)][string]$Dir)
-  $userPath = [Environment]::GetEnvironmentVariable('Path','User')
-  $userParts = @($userPath -split ';' | Where-Object {
-    $_ -and -not [string]::Equals($_, $Dir, [StringComparison]::OrdinalIgnoreCase)
-  })
-  [Environment]::SetEnvironmentVariable('Path', ((@($Dir) + $userParts) -join ';'), 'User')
+  # Read and write the raw registry value so an employee's REG_EXPAND_SZ Path
+  # retains both its value kind and expressions such as %USERPROFILE%.
+  $userEnvironmentKey = [Microsoft.Win32.Registry]::CurrentUser.CreateSubKey('Environment')
+  if (-not $userEnvironmentKey) { Die 'The current-user Environment registry key is unavailable.' }
+  try {
+    $pathExists = $userEnvironmentKey.GetValueNames() -contains 'Path'
+    $userPathKind = if ($pathExists) {
+      $userEnvironmentKey.GetValueKind('Path')
+    } else { [Microsoft.Win32.RegistryValueKind]::String }
+    if ($userPathKind -notin @([Microsoft.Win32.RegistryValueKind]::String,
+                               [Microsoft.Win32.RegistryValueKind]::ExpandString)) {
+      Die "The current-user Path has unsupported registry kind '$userPathKind'. Ask your device administrator to repair it, then re-run."
+    }
+    $userPath = if ($pathExists) {
+      [string]$userEnvironmentKey.GetValue(
+        'Path', $null, [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+    } else { '' }
+    $userParts = @($userPath -split ';' | Where-Object {
+      $_ -and -not [string]::Equals($_, $Dir, [StringComparison]::OrdinalIgnoreCase)
+    })
+    $userEnvironmentKey.SetValue(
+      'Path', ((@($Dir) + $userParts) -join ';'), $userPathKind)
+  } finally {
+    $userEnvironmentKey.Dispose()
+  }
 
   # Windows creates a new process PATH as machine entries followed by user
   # entries. A per-user Node/Python/uv install therefore cannot outrank an old
@@ -539,11 +559,28 @@ fi
 if [ -n "$_ospina_preferred_windows_path" ]; then
   _ospina_preferred_path=$(cygpath -p "$_ospina_preferred_windows_path" 2>/dev/null || true)
   if [ -n "$_ospina_preferred_path" ]; then
-    PATH="$_ospina_preferred_path:$PATH"
+    _ospina_current_path=
+    _ospina_old_ifs=$IFS
+    IFS=:
+    for _ospina_current_part in $PATH; do
+      _ospina_duplicate=
+      for _ospina_preferred_part in $_ospina_preferred_path; do
+        if [ "$_ospina_current_part" = "$_ospina_preferred_part" ]; then
+          _ospina_duplicate=1
+          break
+        fi
+      done
+      if [ -z "$_ospina_duplicate" ]; then
+        _ospina_current_path=${_ospina_current_path:+$_ospina_current_path:}$_ospina_current_part
+      fi
+    done
+    IFS=$_ospina_old_ifs
+    PATH=$_ospina_preferred_path${_ospina_current_path:+:$_ospina_current_path}
     export PATH
   fi
 fi
-unset _ospina_preferred_path _ospina_preferred_windows_path
+unset _ospina_current_part _ospina_current_path _ospina_duplicate _ospina_old_ifs
+unset _ospina_preferred_part _ospina_preferred_path _ospina_preferred_windows_path
 # <<< ospina workstation PATH <<<
 '@
   $bashProfiles = @('.bash_profile','.bash_login','.profile') |
@@ -558,6 +595,10 @@ unset _ospina_preferred_path _ospina_preferred_windows_path
   $bashProfile = $bashProfiles | Where-Object { Test-Path $_ } | Select-Object -First 1
   if (-not $bashProfile) { $bashProfile = $bashProfiles[0] }
   Add-OspinaProfileBlock -Path $bashProfile -Start $start -End $end -Block $bashBlock
+  $bashRc = Join-Path $env:USERPROFILE '.bashrc'
+  if (-not [string]::Equals($bashRc, $bashProfile, [StringComparison]::OrdinalIgnoreCase)) {
+    Add-OspinaProfileBlock -Path $bashRc -Start $start -End $end -Block $bashBlock
+  }
 }
 function Test-Codex {
   if (Have codex) { return $true }

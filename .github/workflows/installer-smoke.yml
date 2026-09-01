@@ -179,7 +179,16 @@ jobs:
           # the capability-verified executable.
           $savedPath = $env:Path
           $savedLocalAppData = $env:LOCALAPPDATA
-          $savedUserPath = [Environment]::GetEnvironmentVariable('Path','User')
+          $userEnvironmentKey = [Microsoft.Win32.Registry]::CurrentUser.CreateSubKey('Environment')
+          $savedUserPathExists = $userEnvironmentKey.GetValueNames() -contains 'Path'
+          $savedUserPathRaw = if ($savedUserPathExists) {
+            $userEnvironmentKey.GetValue(
+              'Path', $null, [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+          } else { $null }
+          $savedUserPathKind = if ($savedUserPathExists) {
+            $userEnvironmentKey.GetValueKind('Path')
+          } else { $null }
+          $userEnvironmentKey.Dispose()
           $savedPreferredUser = [Environment]::GetEnvironmentVariable('OSPINA_PREFERRED_PATH','User')
           $savedPreferredProcess = $env:OSPINA_PREFERRED_PATH
           $preferredStateFile = Join-Path $env:USERPROFILE '.ospina\preferred-path'
@@ -193,7 +202,8 @@ jobs:
             (Join-Path $documents 'PowerShell\Microsoft.PowerShell_profile.ps1'),
             (Join-Path $env:USERPROFILE '.bash_profile'),
             (Join-Path $env:USERPROFILE '.bash_login'),
-            (Join-Path $env:USERPROFILE '.profile')
+            (Join-Path $env:USERPROFILE '.profile'),
+            (Join-Path $env:USERPROFILE '.bashrc')
           )
           $profileBackups = @{}
           foreach ($profilePath in $profilePaths) {
@@ -203,6 +213,11 @@ jobs:
             }
           }
           try {
+            $userEnvironmentKey = [Microsoft.Win32.Registry]::CurrentUser.CreateSubKey('Environment')
+            $userEnvironmentKey.SetValue(
+              'Path', '%USERPROFILE%\OspinaPathFixture',
+              [Microsoft.Win32.RegistryValueKind]::ExpandString)
+            $userEnvironmentKey.Dispose()
             # Seed three different encodings. The installer must append its block
             # without changing a single pre-existing byte. All mutations stay
             # inside this restoration guard so a fixture/setup failure is safe.
@@ -241,6 +256,15 @@ jobs:
             }
             if (-not (Resolve-UvOnPath) -or -not (Test-UvDefaultInstall)) {
               Write-Host "::error::current user-scoped uv did not replace the old PATH winner"; exit 1
+            }
+            $userEnvironmentKey = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey('Environment')
+            $updatedUserPathKind = $userEnvironmentKey.GetValueKind('Path')
+            $updatedUserPathRaw = [string]$userEnvironmentKey.GetValue(
+              'Path', $null, [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+            $userEnvironmentKey.Dispose()
+            if ($updatedUserPathKind -ne [Microsoft.Win32.RegistryValueKind]::ExpandString -or
+                -not $updatedUserPathRaw.Contains('%USERPROFILE%\OspinaPathFixture')) {
+              Write-Host "::error::user Path lost its REG_EXPAND_SZ kind or raw expression"; exit 1
             }
             # Simulate a fresh Windows shell: machine PATH wins in the parent,
             # and only the generated PowerShell profile may restore precedence.
@@ -361,6 +385,10 @@ jobs:
                                   [regex]::Escape($start))).Count -ne 1) {
               Write-Host "::error::migrated Git Bash block is not idempotent"; exit 1
             }
+            if (([regex]::Matches([IO.File]::ReadAllText($profilePaths[5]),
+                                  [regex]::Escape($start))).Count -ne 1) {
+              Write-Host "::error::.bashrc block is not idempotent"; exit 1
+            }
             # Remove the inherited process value. Git Bash must read the current
             # installer-owned state file and still promote uv in a login shell.
             $env:OSPINA_PREFERRED_PATH = $null
@@ -369,6 +397,18 @@ jobs:
             $expectedUvBash = (& $bash -c "cygpath -u '$newUvDir\uv.exe'").Trim()
             if ($freshUvBash -ne $expectedUvBash) {
               Write-Host "::error::new Git Bash resolved '$freshUvBash' instead of '$expectedUvBash'"; exit 1
+            }
+            $freshUvInteractiveBash = (& $bash -ic 'command -v uv.exe || command -v uv' 2>$null |
+              Select-Object -Last 1).Trim()
+            if ($freshUvInteractiveBash -ne $expectedUvBash) {
+              Write-Host "::error::.bashrc did not promote uv in non-login Git Bash"; exit 1
+            }
+            $expectedUvBashDir = (& $bash -c "cygpath -u '$newUvDir'").Trim()
+            $doubleSourcedPath = (& $bash -lc 'source "$HOME/.bashrc"; printf "%s\n" "$PATH"' 2>$null |
+              Select-Object -Last 1).Trim()
+            if ((@($doubleSourcedPath -split ':' |
+                   Where-Object { $_ -eq $expectedUvBashDir })).Count -ne 1) {
+              Write-Host "::error::login plus .bashrc duplicated the preferred path"; exit 1
             }
 
             # Any Authenticode state other than NotSigned is immutable here,
@@ -406,7 +446,13 @@ jobs:
           } finally {
             $env:Path = $savedPath
             $env:LOCALAPPDATA = $savedLocalAppData
-            [Environment]::SetEnvironmentVariable('Path', $savedUserPath, 'User')
+            $userEnvironmentKey = [Microsoft.Win32.Registry]::CurrentUser.CreateSubKey('Environment')
+            if ($savedUserPathExists) {
+              $userEnvironmentKey.SetValue('Path', $savedUserPathRaw, $savedUserPathKind)
+            } else {
+              $userEnvironmentKey.DeleteValue('Path', $false)
+            }
+            $userEnvironmentKey.Dispose()
             [Environment]::SetEnvironmentVariable('OSPINA_PREFERRED_PATH', $savedPreferredUser, 'User')
             $env:OSPINA_PREFERRED_PATH = $savedPreferredProcess
             if ($preferredStateExisted) {
@@ -798,6 +844,14 @@ jobs:
             exit 1
           fi
           echo "all installers in install.sh stream their output"
+          eval "$(sed -n '/^install_codex()/,/^}/p' install.sh)"
+          have() { command -v "$1" >/dev/null 2>&1; }
+          brew() { echo "::error::Linux Codex attempted the macOS cask"; return 99; }
+          npm() { [ "$*" = 'install -g @openai/codex' ]; }
+          PLATFORM=linux
+          install_codex
+          unset -f brew npm
+          echo "Linux Codex uses npm even when Linuxbrew is present"
           sudo apt-get update -qq && sudo apt-get install -y shellcheck -qq
           shellcheck -S warning install.sh || true
 
@@ -813,7 +867,8 @@ jobs:
           bash -n install.sh
           for required in 'node@24' 'corepack enable' 'uv python install 3.12' \
                           'brew install --cask libreoffice' 'pdftotext' \
-                          'brew install --cask codex' 'brew install --cask t3-code' \
+                          'if [ "$PLATFORM" = mac ] && have brew; then brew install --cask codex' \
+                          'brew install --cask t3-code' \
                           '/bin/bash "$_hb" </dev/tty' \
                           'persist_path_front "$_brew_bin"' \
                           'brew_bin_path node@24'; do
@@ -830,6 +885,11 @@ jobs:
           if ! printf '%s\n' "$libreoffice_block" |
                grep -Fq 'persist_path_front "$HOME/.local/bin"'; then
             echo "::error::the LibreOffice block does not persist soffice for new shells"
+            exit 1
+          fi
+          if grep -Fq 'die "Could not install LibreOffice' install.sh ||
+             grep -Fq 'have soffice || die' install.sh; then
+            echo "::error::LibreOffice remains a fatal optional capability"
             exit 1
           fi
           if grep -nE '(brew install|npm install -g)[^|]*>/dev/null' install.sh; then
