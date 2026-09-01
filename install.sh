@@ -545,12 +545,42 @@ say "  workspace: $WS"
 
 step "Handbook"
 if [ -d "$WS/handbook/.git" ]; then
-  say "  ok       already cloned, updating"
-  git -C "$WS/handbook" pull -q --ff-only \
-    || die "Could not update the handbook, so its existing bootstrap will not run.
-  Older bootstrap versions can disclose repository names your account cannot read.
-  Resolve any local handbook changes, network issue or access problem, then re-run.
+  say "  ok       already cloned, verifying and updating"
+  _handbook_origin=$(git -C "$WS/handbook" remote get-url origin 2>/dev/null || true)
+  _handbook_origin=${_handbook_origin%/}
+  _handbook_origin=${_handbook_origin%.git}
+  case "$_handbook_origin" in
+    https://github.com/ospina-company/handbook|\
+    git@github.com:ospina-company/handbook|\
+    ssh://git@github.com/ospina-company/handbook) ;;
+    *) die "The existing handbook checkout does not use Ospina's official origin.
+  Expected: https://github.com/ospina-company/handbook
+  Got:      ${_handbook_origin:-no origin}
+  Its bootstrap will not run. Move that checkout aside, then re-run." ;;
+  esac
+  _handbook_branch=$(git -C "$WS/handbook" symbolic-ref --quiet --short HEAD 2>/dev/null || true)
+  [ "$_handbook_branch" = main ] \
+    || die "The existing handbook checkout is on '${_handbook_branch:-a detached commit}', not main.
+  Its bootstrap will not run. Preserve or commit your work, switch the handbook to main,
+  then re-run. Your repositories were not touched."
+  [ -z "$(git -C "$WS/handbook" status --porcelain --untracked-files=no)" ] \
+    || die "The existing handbook has local changes, so its bootstrap will not run.
+  Preserve or commit those changes, restore a clean main checkout, then re-run.
   Your repositories were not touched."
+  git -C "$WS/handbook" fetch -q origin main \
+    || die "Could not fetch the official handbook main branch, so its existing bootstrap will not run.
+  Older bootstrap versions can disclose repository names your account cannot read.
+  Check the network and your access, then re-run. Your repositories were not touched."
+  _handbook_target=$(git -C "$WS/handbook" rev-parse --verify FETCH_HEAD 2>/dev/null || true)
+  [ -n "$_handbook_target" ] \
+    && git -C "$WS/handbook" merge -q --ff-only "$_handbook_target" \
+    || die "The handbook main branch could not fast-forward to the official version.
+  Preserve any local commits, restore main from the official origin, then re-run.
+  Its existing bootstrap did not run."
+  _handbook_head=$(git -C "$WS/handbook" rev-parse HEAD 2>/dev/null || true)
+  [ "$_handbook_head" = "$_handbook_target" ] \
+    || die "The handbook did not resolve to the fetched official main commit.
+  Its existing bootstrap did not run. Restore a clean official main checkout, then re-run."
 else
   gh repo clone ospina-company/handbook "$WS/handbook" -- -q \
     || die "Could not clone the handbook into $WS/handbook.

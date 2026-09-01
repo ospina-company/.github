@@ -1241,14 +1241,49 @@ Say "  workspace: $ws"
 Step "Handbook"
 $hb = Join-Path $ws 'handbook'
 if (Test-Path (Join-Path $hb '.git')) {
-  Say "  ok       already cloned, updating"
-  if ((Invoke-Native git @('-C',$hb,'pull','-q','--ff-only')) -ne 0) {
+  Say "  ok       already cloned, verifying and updating"
+  $handbookOrigin = Invoke-Native-Capture git @('-C',$hb,'remote','get-url','origin')
+  $handbookOrigin = if ($handbookOrigin) {
+    ($handbookOrigin.TrimEnd('/') -replace '\.git$','')
+  } else { '' }
+  $officialHandbookOrigins = @(
+    'https://github.com/ospina-company/handbook',
+    'git@github.com:ospina-company/handbook',
+    'ssh://git@github.com/ospina-company/handbook'
+  )
+  if ($officialHandbookOrigins -notcontains $handbookOrigin) {
     Die @"
-Could not update the handbook, so its existing bootstrap will not run.
+The existing handbook checkout does not use Ospina's official origin.
+Expected: https://github.com/ospina-company/handbook
+Got:      $(if ($handbookOrigin) { $handbookOrigin } else { 'no origin' })
+Its bootstrap will not run. Move that checkout aside, then re-run.
+"@
+  }
+  $handbookBranch = Invoke-Native-Capture git @('-C',$hb,'symbolic-ref','--quiet','--short','HEAD')
+  if ($handbookBranch -ne 'main') {
+    $branchLabel = if ($handbookBranch) { $handbookBranch } else { 'a detached commit' }
+    Die "The existing handbook checkout is on '$branchLabel', not main.`nIts bootstrap will not run. Preserve or commit your work, switch the handbook to main, then re-run.`nYour repositories were not touched."
+  }
+  $handbookDirty = Invoke-Native-Capture git @('-C',$hb,'status','--porcelain','--untracked-files=no')
+  if ($handbookDirty) {
+    Die "The existing handbook has local changes, so its bootstrap will not run.`nPreserve or commit those changes, restore a clean main checkout, then re-run.`nYour repositories were not touched."
+  }
+  if ((Invoke-Native git @('-C',$hb,'fetch','-q','origin','main')) -ne 0) {
+    Die @"
+Could not fetch the official handbook main branch, so its existing bootstrap will not run.
 Older bootstrap versions can disclose repository names your account cannot read.
-Resolve any local handbook changes, network issue or access problem, then re-run.
+Check the network and your access, then re-run.
 Your repositories were not touched.
 "@
+  }
+  $handbookTarget = Invoke-Native-Capture git @('-C',$hb,'rev-parse','--verify','FETCH_HEAD')
+  if (-not $handbookTarget -or
+      (Invoke-Native git @('-C',$hb,'merge','-q','--ff-only',$handbookTarget)) -ne 0) {
+    Die "The handbook main branch could not fast-forward to the official version.`nPreserve any local commits, restore main from the official origin, then re-run.`nIts existing bootstrap did not run."
+  }
+  $handbookHead = Invoke-Native-Capture git @('-C',$hb,'rev-parse','HEAD')
+  if ($handbookHead -ne $handbookTarget) {
+    Die "The handbook did not resolve to the fetched official main commit.`nIts existing bootstrap did not run. Restore a clean official main checkout, then re-run."
   }
 } else {
   if ((Invoke-Native gh @('repo','clone','ospina-company/handbook',$hb,'--','-q')) -ne 0) {
