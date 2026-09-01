@@ -229,16 +229,22 @@ Ask your device administrator to install Homebrew from https://brew.sh, then re-
   if ! have soffice && [ ! -x /Applications/LibreOffice.app/Contents/MacOS/soffice ]; then
     say "  install  LibreOffice"
     say "           this is a large download; brew output follows"
-    brew install --cask libreoffice || die "Could not install LibreOffice."
+    brew install --cask libreoffice \
+      || say "  note     LibreOffice did not install. Document and workbook QA will be unavailable."
   fi
   if [ -x /Applications/LibreOffice.app/Contents/MacOS/soffice ]; then
-    mkdir -p "$HOME/.local/bin"
-    ln -sf /Applications/LibreOffice.app/Contents/MacOS/soffice "$HOME/.local/bin/soffice"
-    add_path "$HOME/.local/bin"
-    persist_path_front "$HOME/.local/bin"
+    if mkdir -p "$HOME/.local/bin" \
+      && ln -sf /Applications/LibreOffice.app/Contents/MacOS/soffice "$HOME/.local/bin/soffice"; then
+      add_path "$HOME/.local/bin"
+      persist_path_front "$HOME/.local/bin" \
+        || say "  note     soffice is available now but could not be persisted for new shells."
+    else
+      say "  note     LibreOffice is installed but its soffice command could not be linked."
+    fi
   fi
-  have soffice || die "LibreOffice installed but soffice is not callable. Open a new terminal and re-run."
-  say "  ok       soffice"
+  if have soffice; then say "  ok       soffice"
+  else say "  note     soffice is not callable. Document and workbook QA will be unavailable."
+  fi
 else
   if ! have git; then
     die "git is required.
@@ -278,7 +284,7 @@ if have node; then
     mkdir -p "$HOME/.local/bin"
     if corepack enable --install-directory "$HOME/.local/bin"; then
       add_path "$HOME/.local/bin"
-      [ "$PLATFORM" = mac ] && persist_path_front "$HOME/.local/bin"
+      if [ "$PLATFORM" = mac ]; then persist_path_front "$HOME/.local/bin"; fi
       say "  ok       corepack $(corepack --version 2>/dev/null || echo present)"
     else
       say "  note     Corepack could not enable pnpm. Setup will continue."
@@ -295,7 +301,7 @@ if have uv; then
   _uv_bin=$(uv python dir --bin 2>/dev/null || true)
   if [ -n "$_uv_bin" ]; then
     add_path "$_uv_bin"
-    [ "$PLATFORM" = mac ] && persist_path_front "$_uv_bin"
+    if [ "$PLATFORM" = mac ]; then persist_path_front "$_uv_bin"; fi
   fi
   if uv python find 3.12 >/dev/null 2>&1; then
     _python_minor=$(python -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")' 2>/dev/null || true)
@@ -408,7 +414,7 @@ install_claude() {
   fi
 }
 install_codex() {
-  if have brew; then brew install --cask codex
+  if [ "$PLATFORM" = mac ] && have brew; then brew install --cask codex
   elif have npm; then npm install -g @openai/codex
   else say "          needs Homebrew or npm; see https://github.com/openai/codex"; return 1; fi
 }
