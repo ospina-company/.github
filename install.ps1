@@ -1242,7 +1242,14 @@ Step "Handbook"
 $hb = Join-Path $ws 'handbook'
 if (Test-Path (Join-Path $hb '.git')) {
   Say "  ok       already cloned, updating"
-  $null = Invoke-Native git @('-C',$hb,'pull','-q','--ff-only')
+  if ((Invoke-Native git @('-C',$hb,'pull','-q','--ff-only')) -ne 0) {
+    Die @"
+Could not update the handbook, so its existing bootstrap will not run.
+Older bootstrap versions can disclose repository names your account cannot read.
+Resolve any local handbook changes, network issue or access problem, then re-run.
+Your repositories were not touched.
+"@
+  }
 } else {
   if ((Invoke-Native gh @('repo','clone','ospina-company/handbook',$hb,'--','-q')) -ne 0) {
     Die "Could not clone the handbook."
