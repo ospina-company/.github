@@ -12,6 +12,10 @@ $ErrorActionPreference = 'Continue'
 
 function Have ($c) { $null -ne (Get-Command $c -ErrorAction SilentlyContinue) }
 function Test-StorePythonPackage {
+  if (-not (Get-Command Get-AppxPackage -ErrorAction SilentlyContinue |
+            Select-Object -First 1)) {
+    return $null
+  }
   return $null -ne (Get-AppxPackage -Name 'PythonSoftwareFoundation.Python*' `
                      -ErrorAction SilentlyContinue | Select-Object -First 1)
 }
@@ -21,7 +25,14 @@ function Have-UsablePython ($c) {
   if ($cmd.Source -notmatch '(?i)\\Microsoft\\WindowsApps\\') { return $true }
   # Windows creates zero-function Store aliases even when Python is absent.
   # Count one only when this user actually has a Store Python package.
-  return (Test-StorePythonPackage)
+  $storePackage = Test-StorePythonPackage
+  if ($null -eq $storePackage) {
+    # Without Appx discovery we cannot prove that the visible alias is empty.
+    # Keep the account out of the clean bucket instead of claiming it will
+    # exercise Python installation from nothing.
+    return $true
+  }
+  return $storePackage
 }
 function Test-IsUserScopedTool ($Tool, $Source) {
   if (-not $Source) { return $false }

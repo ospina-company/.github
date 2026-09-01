@@ -525,6 +525,27 @@ jobs:
               Write-Host "::error::an empty Windows Store alias was labeled user-installed"; exit 1
             }
 
+            function Get-Command {
+              param($Name,$ErrorAction)
+              if ($Name -eq 'Get-AppxPackage') { return $null }
+              if ($Name -eq 'python') {
+                return [pscustomobject]@{ Source = $storeAlias }
+              }
+              return Microsoft.PowerShell.Core\Get-Command $Name -ErrorAction $ErrorAction
+            }
+            Remove-Item Function:\Test-StorePythonPackage
+            foreach ($f in $ast.FindAll({
+              $args[0] -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+              $args[0].Name -eq 'Test-StorePythonPackage'
+            }, $true)) { Invoke-Expression $f.Extent.Text }
+            if ($null -ne (Test-StorePythonPackage)) {
+              Write-Host "::error::missing Appx discovery did not remain distinguishable"; exit 1
+            }
+            if (-not (Have-UsablePython 'python')) {
+              Write-Host "::error::an unverified Windows Store alias made the account look clean"; exit 1
+            }
+            Remove-Item Function:\Get-Command
+
             Remove-Item $t3 -Recurse -Force
             function Get-ItemProperty {
               param($Path,$ErrorAction)
