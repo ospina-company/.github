@@ -160,7 +160,9 @@ foreach ($t in 'git','gh','node','npm','corepack','uv','python','python3',
   elseif ($t -eq 't3') { $specialPath = Get-T3CodePath; $present = $null -ne $specialPath }
   else { $present = Have $t }
   if ($present) {
-    $src = if ($specialPath) { $specialPath } else { (Get-Command $t).Source }
+    $src = if ($specialPath) { $specialPath } else {
+      (Get-Command $t -ErrorAction SilentlyContinue | Select-Object -First 1).Source
+    }
     # A binary under the user profile was installed for this account, so it is
     # not evidence that the machine provides it to everyone.
     # WindowsApps holds app execution aliases, which Windows provides. A binary

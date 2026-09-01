@@ -268,6 +268,50 @@ jobs:
             }
             $start = '# >>> ospina workstation PATH >>>'
             $end = '# <<< ospina workstation PATH <<<'
+            function New-Utf16OddOffsetDecoy {
+              param([Parameter(Mandatory)][string]$Text)
+              # In valid UTF-16, the marker's byte pattern can occur starting at
+              # the high byte of one code unit. That is not a real text marker.
+              $chars = @([char]((([int][char]$Text[0]) -shl 8) -bor 1))
+              for ($i = 1; $i -lt $Text.Length; $i++) {
+                $chars += [char](([int][char]$Text[$i]) -shl 8)
+              }
+              $chars += [char]0x0100
+              return -join $chars
+            }
+            $unicode = [Text.Encoding]::Unicode
+            $utf16UserPrefix = "# UTF-16 user prefix`r`n" +
+              (New-Utf16OddOffsetDecoy $start) + "`r`n" +
+              (New-Utf16OddOffsetDecoy $end) + "`r`n"
+            $utf16UserSuffix = "`r`n# UTF-16 user suffix`r`n"
+            $utf16LegacyText = $utf16UserPrefix + $start +
+              "`r`n# legacy UTF-16 block`r`n" + $end + $utf16UserSuffix
+            $utf16PrefixBytes = [byte[]]($unicode.GetPreamble() +
+              $unicode.GetBytes($utf16UserPrefix))
+            $utf16SuffixBytes = $unicode.GetBytes($utf16UserSuffix)
+            [IO.File]::WriteAllBytes($profilePaths[0], [byte[]](
+              $unicode.GetPreamble() + $unicode.GetBytes($utf16LegacyText)))
+            Add-OspinaProfileBlock -Path $profilePaths[0] -Start $start -End $end `
+              -Block "$start`n# current UTF-16 block`n$end" -PowerShellProfile
+            $utf16UpdatedBytes = [IO.File]::ReadAllBytes($profilePaths[0])
+            $utf16UpdatedPrefix = [byte[]]$utf16UpdatedBytes[0..($utf16PrefixBytes.Length - 1)]
+            $utf16UpdatedSuffix = [byte[]]$utf16UpdatedBytes[
+              ($utf16UpdatedBytes.Length - $utf16SuffixBytes.Length)..($utf16UpdatedBytes.Length - 1)]
+            if ([Convert]::ToBase64String($utf16UpdatedPrefix) -ne
+                [Convert]::ToBase64String($utf16PrefixBytes) -or
+                [Convert]::ToBase64String($utf16UpdatedSuffix) -ne
+                [Convert]::ToBase64String($utf16SuffixBytes)) {
+              Write-Host "::error::UTF-16 replacement changed user-owned bytes"; exit 1
+            }
+            $strictUnicode = [Text.UnicodeEncoding]::new($false, $true, $true)
+            $utf16UpdatedText = $strictUnicode.GetString(
+              $utf16UpdatedBytes, 2, $utf16UpdatedBytes.Length - 2)
+            if (-not $utf16UpdatedText.Contains('# current UTF-16 block') -or
+                $utf16UpdatedText.Contains('# legacy UTF-16 block') -or
+                ([regex]::Matches($utf16UpdatedText, [regex]::Escape($start))).Count -ne 1 -or
+                ([regex]::Matches($utf16UpdatedText, [regex]::Escape($end))).Count -ne 1) {
+              Write-Host "::error::UTF-16 managed block was not replaced exactly once"; exit 1
+            }
             $legacyEnvBlock = @'
           # >>> ospina workstation PATH >>>
           if [ -n "${OSPINA_PREFERRED_PATH:-}" ]; then
