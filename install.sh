@@ -152,7 +152,8 @@ Ask your device administrator to install Homebrew from https://brew.sh, then re-
     # a changed privileged installer must fail closed until Platform reviews it.
     HOMEBREW_INSTALL_COMMIT=2c31714faddf35de11f9daff6c131f30bcd54588
     HOMEBREW_INSTALL_SHA256=12479a24be3f5307eecac7cde670fad7118640f031229e964f544b1367b52a41
-    _hb=$(mktemp 2>/dev/null || echo "${TMPDIR:-/tmp}/homebrew-install.$$")
+    _hb=$(mktemp 2>/dev/null) \
+      || die "Could not create a private temporary file for the Homebrew installer."
     curl -fsSL "https://raw.githubusercontent.com/Homebrew/install/$HOMEBREW_INSTALL_COMMIT/install.sh" -o "$_hb" \
       || die "Could not download the Homebrew installer."
     _hb_actual=$(shasum -a 256 "$_hb" | awk '{print $1}')
@@ -404,11 +405,15 @@ install_claude() {
   else
     # Download first, then run, so the script that executes is a file that can
     # be inspected afterwards rather than a stream piped straight into a shell.
-    _ci="${TMPDIR:-/tmp}/claude-install.$$.sh"
+    _ci=$(mktemp 2>/dev/null) || {
+      say "          could not create a private temporary file for the Claude installer"
+      return 1
+    }
     if curl -fsSL https://claude.ai/install.sh -o "$_ci"; then
-      bash "$_ci"; _rc=$?
+      if bash "$_ci"; then _rc=0; else _rc=$?; fi
       rm -f "$_ci"; return $_rc
     else
+      rm -f "$_ci"
       return 1
     fi
   fi
@@ -467,7 +472,8 @@ if [ -n "${OSPINA_WORKSPACE:-}" ]; then
 else
   # Newline-delimited in a temp file, not a space-separated string: a
   # candidate like "~/My Projects/Ospina" would otherwise word-split into two.
-  CANDFILE=$(mktemp 2>/dev/null || echo "${TMPDIR:-/tmp}/ospina-cands.$$")
+  CANDFILE=$(mktemp 2>/dev/null) \
+    || die "Could not create a private temporary file for workspace choices."
   : > "$CANDFILE"
   add_cand() {
     # Skip anything a sync client owns: git and sync both write .git.

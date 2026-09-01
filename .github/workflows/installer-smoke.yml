@@ -419,7 +419,7 @@ jobs:
             $signedBefore = [IO.File]::ReadAllBytes($signedFixture)
             $savedDieFunction = (Get-Item Function:\Die).ScriptBlock
             $savedSignatureFunction = Get-Item Function:\Get-AuthenticodeSignature -ErrorAction SilentlyContinue
-            $signatureBlocked = $false
+            $signedProfileSkipped = $false
             try {
               function Get-AuthenticodeSignature {
                 param($FilePath,$ErrorAction)
@@ -429,7 +429,10 @@ jobs:
               try {
                 Add-OspinaProfileBlock -Path $signedFixture -Start $start -End $end `
                                        -Block "$start`n# current`n$end" -PowerShellProfile
-              } catch { $signatureBlocked = $true }
+                $signedProfileSkipped = $true
+              } catch {
+                Write-Host "::error::a signed profile aborted the surrounding installation: $_"; exit 1
+              }
             } finally {
               if ($savedSignatureFunction) {
                 Set-Item Function:\Get-AuthenticodeSignature -Value $savedSignatureFunction.ScriptBlock
@@ -438,10 +441,10 @@ jobs:
               }
               Set-Item Function:\Die -Value $savedDieFunction
             }
-            if (-not $signatureBlocked -or
+            if (-not $signedProfileSkipped -or
                 [Convert]::ToBase64String($signedBefore) -ne
                 [Convert]::ToBase64String([IO.File]::ReadAllBytes($signedFixture))) {
-              Write-Host "::error::untrusted signed profile was modified"; exit 1
+              Write-Host "::error::untrusted signed profile was not skipped safely"; exit 1
             }
           } finally {
             $env:Path = $savedPath
@@ -722,6 +725,10 @@ jobs:
             Write-Host "::error::PowerShell 5.1 strips embedded quotes from native expression arguments; parse --version output instead"
             $fail = 1
           }
+          if ($src -notmatch '(?s)\$uvBin\s+-and\s+\(Test-Path\s+-LiteralPath\s+\$uvBin\s+-PathType\s+Container\)') {
+            Write-Host "::error::uv's reported Python bin path must be a real directory before PATH persistence"
+            $fail = 1
+          }
 
           $preflight = Get-Content preflight.ps1 -Raw
           if ($preflight -notmatch 'Have-UsablePython') {
@@ -864,6 +871,10 @@ jobs:
             echo "::error::an installer above hides its output; let it stream"
             exit 1
           fi
+          if grep -nF '$$' install.sh; then
+            echo "::error::temporary files must not use predictable process-ID names"
+            exit 1
+          fi
           echo "all installers in install.sh stream their output"
           eval "$(sed -n '/^install_codex()/,/^}/p' install.sh)"
           have() { command -v "$1" >/dev/null 2>&1; }
@@ -915,6 +926,10 @@ jobs:
           fi
           if grep -nE '(brew install|npm install -g)[^|]*>/dev/null' install.sh; then
             echo "::error::an installer above hides its output; let it stream"
+            exit 1
+          fi
+          if grep -nF '$$' install.sh; then
+            echo "::error::temporary files must not use predictable process-ID names"
             exit 1
           fi
 

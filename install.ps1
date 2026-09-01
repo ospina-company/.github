@@ -465,10 +465,14 @@ function Add-OspinaProfileBlock {
     try {
       $signature = Get-AuthenticodeSignature -FilePath $Path -ErrorAction Stop
     } catch {
-      Die "The PowerShell signature on '$Path' could not be checked safely. Ask your device administrator to add OSPINA_PREFERRED_PATH at the start of PATH, then re-run."
+      Say ("  note     The PowerShell signature on '{0}' could not be checked safely." -f $Path)
+      Say  "           Ask your device administrator to add OSPINA_PREFERRED_PATH at the start of PATH."
+      return
     }
     if (-not $signature -or [string]$signature.Status -ne 'NotSigned') {
-      Die "The signed PowerShell profile '$Path' cannot be changed safely. Ask your device administrator to add OSPINA_PREFERRED_PATH at the start of PATH, then re-run."
+      Say ("  note     The signed PowerShell profile '{0}' was not changed." -f $Path)
+      Say  "           Ask your device administrator to add OSPINA_PREFERRED_PATH at the start of PATH."
+      return
     }
   }
 
@@ -898,7 +902,11 @@ if ((Invoke-Native uv @('python','install','3.12','--default') -Interactive) -ne
   Die "uv could not install Python 3.12."
 }
 $uvBin = Invoke-Native-Capture uv @('python','dir','--bin')
-if ($uvBin) { Add-UserPathEntry $uvBin }
+if ($uvBin -and (Test-Path -LiteralPath $uvBin -PathType Container)) {
+  Add-UserPathEntry $uvBin
+} else {
+  Say "  note     uv did not report an existing Python bin directory; PATH was not changed."
+}
 if ((Invoke-Native uv @('python','find','3.12')) -ne 0) {
   Die "Python 3.12 was requested but uv cannot find it."
 }
