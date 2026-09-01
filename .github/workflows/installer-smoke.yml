@@ -398,9 +398,9 @@ jobs:
             if ($freshUvBash -ne $expectedUvBash) {
               Write-Host "::error::new Git Bash resolved '$freshUvBash' instead of '$expectedUvBash'"; exit 1
             }
-            $freshUvInteractiveBash = (& $bash -ic 'command -v uv.exe || command -v uv' 2>$null |
+            $freshUvNonLoginBash = (& $bash -c 'source "$HOME/.bashrc"; command -v uv.exe || command -v uv' |
               Select-Object -Last 1).Trim()
-            if ($freshUvInteractiveBash -ne $expectedUvBash) {
+            if ($freshUvNonLoginBash -ne $expectedUvBash) {
               Write-Host "::error::.bashrc did not promote uv in non-login Git Bash"; exit 1
             }
             $expectedUvBashDir = (& $bash -c "cygpath -u '$newUvDir'").Trim()
