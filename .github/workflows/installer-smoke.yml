@@ -911,10 +911,22 @@ jobs:
           echo "all installers in install.sh stream their output"
           eval "$(sed -n '/^install_codex()/,/^}/p' install.sh)"
           have() { command -v "$1" >/dev/null 2>&1; }
-          brew() { echo "::error::Linux Codex attempted the macOS cask"; return 99; }
-          npm() { [ "$*" = 'install -g @openai/codex' ]; }
+          brew() { echo "::error::Linux Codex attempted the macOS cask"; exit 1; }
+          npm_marker="$RUNNER_TEMP/codex-npm-called"
+          npm() {
+            if [ "$*" != 'install -g @openai/codex' ]; then
+              echo "::error::Linux Codex used unexpected npm arguments: $*"
+              return 1
+            fi
+            : > "$npm_marker"
+          }
           PLATFORM=linux
           install_codex
+          if [ ! -f "$npm_marker" ]; then
+            echo "::error::Linux Codex did not install through npm"
+            exit 1
+          fi
+          rm -f "$npm_marker"
           unset -f brew npm
           echo "Linux Codex uses npm even when Linuxbrew is present"
           sudo apt-get update -qq && sudo apt-get install -y shellcheck -qq
