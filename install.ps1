@@ -290,12 +290,12 @@ function Install-CodexOfficial {
     Say "          running OpenAI's official Codex installer..."
     # Reviewed on 2026-08-31. The official endpoint is mutable, so authenticate
     # the content before executing it and fail closed on an upstream change.
-    $expected = '391f247de2c70c7e99041979ec02dae7e76be27ac9cfc1dfe7c1eb21d48d8b97'
+    $expectedCodexDigest = '391f247de2c70c7e99041979ec02dae7e76be27ac9cfc1dfe7c1eb21d48d8b97'
     $tempInstaller = Join-Path ([IO.Path]::GetTempPath()) ("ospina-codex-install-{0}.ps1" -f $PID)
     Get-RemoteFile -Uri 'https://chatgpt.com/codex/install.ps1' -OutFile $tempInstaller `
                    -Label 'OpenAI Codex installer'
     $actual = (Get-FileHash -Algorithm SHA256 $tempInstaller).Hash.ToLowerInvariant()
-    if ($actual -ne $expected) {
+    if ($actual -ne $expectedCodexDigest) {
       throw "OpenAI Codex installer digest changed; Platform must review the new installer"
     }
     $installer = Get-Content $tempInstaller -Raw
@@ -309,6 +309,40 @@ function Install-CodexOfficial {
   } catch {
     Say ("          official install failed: {0}" -f $_.Exception.Message)
     Say  "          Install manually: https://learn.chatgpt.com/docs/codex/cli"
+    return $false
+  } finally {
+    if ($tempInstaller -and (Test-Path $tempInstaller)) {
+      Remove-Item $tempInstaller -Force -ErrorAction SilentlyContinue
+    }
+  }
+}
+function Install-ClaudeOfficial {
+  # Use the native installer so T3 Code can call Claude's native updater. A
+  # WinGet-managed install lands outside that update path.
+  $tempInstaller = $null
+  try {
+    Say "          running Anthropic's official native installer..."
+    # Reviewed on 2026-09-04. The endpoint is mutable, so authenticate the
+    # downloaded bytes before executing them and fail closed on a change.
+    $expectedClaudeDigest = 'cd17c6b555f761d60373659824bf805e1510538226e4c7028e19d7494937a333'
+    $tempInstaller = Join-Path ([IO.Path]::GetTempPath()) ("ospina-claude-install-{0}.ps1" -f $PID)
+    Get-RemoteFile -Uri 'https://claude.ai/install.ps1' -OutFile $tempInstaller `
+                   -Label 'Anthropic Claude installer'
+    $actual = (Get-FileHash -Algorithm SHA256 $tempInstaller).Hash.ToLowerInvariant()
+    if ($actual -ne $expectedClaudeDigest) {
+      throw "Anthropic Claude installer digest changed; Platform must review the new installer"
+    }
+    $installer = Get-Content $tempInstaller -Raw
+    & ([scriptblock]::Create($installer))
+    Refresh-Path
+    $null = Resolve-OnPath -Command 'claude' -Directories @(
+      (Join-Path $env:USERPROFILE '.local\bin')
+    )
+    return (Test-Claude)
+  } catch {
+    Say ("          native install failed: {0}" -f $_.Exception.Message)
+    Say  "          Fallback: winget install Anthropic.ClaudeCode"
+    Say  "          (note: a winget install cannot be updated from T3 Code)"
     return $false
   } finally {
     if ($tempInstaller -and (Test-Path $tempInstaller)) {
@@ -1058,31 +1092,7 @@ $agents = @(
      Manual = 'download from https://t3.codes/download' },
   @{ Name = 'Claude Code'; Command = 'claude'; Test = { Test-Claude }
      Manual = 'irm https://claude.ai/install.ps1 | iex'
-     Install = {
-       # The native installer, deliberately not winget. T3 Code updates Claude by
-       # running its native update command, and only offers that when the binary
-       # sits at ~/.local/bin/claude.exe, which is where the native installer puts
-       # it. A winget install lands outside that path, so T3 falls back to
-       # manual-only, and Anthropic documents that the native update command does
-       # not update a winget-managed install either. Native also self-updates.
-       Say "          running the official native installer..."
-       try {
-         & ([scriptblock]::Create((Invoke-RestMethod 'https://claude.ai/install.ps1')))
-         Refresh-Path
-         # Finish the job rather than telling the reader to open a new terminal:
-         # if the binary is where the native installer puts it but is not
-         # callable, put its folder on PATH ourselves.
-         $null = Resolve-OnPath -Command 'claude' -Directories @(
-           (Join-Path $env:USERPROFILE '.local\bin')
-         )
-         return (Test-Claude)
-       } catch {
-         Say ("          native install failed: {0}" -f $_.Exception.Message)
-         Say  "          Fallback: winget install Anthropic.ClaudeCode"
-         Say  "          (note: a winget install cannot be updated from T3 Code)"
-         return $false
-       }
-     } },
+     Install = { Install-ClaudeOfficial } },
   @{ Name = 'Codex'; Command = 'codex';       Test = { Test-Codex }; Manual = 'irm https://chatgpt.com/codex/install.ps1 | iex';
      Diagnose = {
        # npm can install into a prefix that is not on PATH. Show where it went.

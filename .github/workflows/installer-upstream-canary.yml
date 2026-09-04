@@ -93,7 +93,7 @@ jobs:
 
           $codexMatch = [regex]::Match(
             $source,
-            '\$expected\s*=\s*''(?<digest>[0-9a-f]{64})'''
+            '\$expectedCodexDigest\s*=\s*''(?<digest>[0-9a-f]{64})'''
           )
           if (-not $codexMatch.Success) {
             throw 'Could not read the pinned Codex installer digest from install.ps1.'
@@ -110,6 +110,19 @@ jobs:
           $claudePath = Join-Path $env:RUNNER_TEMP 'claude-install.ps1'
           Invoke-WebRequest 'https://claude.ai/install.ps1' `
             -OutFile $claudePath -UseBasicParsing
+          $claudeMatch = [regex]::Match(
+            $source,
+            '\$expectedClaudeDigest\s*=\s*''(?<digest>[0-9a-f]{64})'''
+          )
+          if (-not $claudeMatch.Success) {
+            throw 'Could not read the pinned Claude installer digest from install.ps1.'
+          }
+          $actualClaudeDigest = (Get-FileHash -Algorithm SHA256 $claudePath).Hash.ToLowerInvariant()
+          if ($actualClaudeDigest -ne $claudeMatch.Groups['digest'].Value) {
+            throw "The official Claude installer changed (observed $actualClaudeDigest). Review it before updating the pin."
+          }
+          Write-Host 'digest ok: official Claude installer'
+
           $claudeSource = Get-Content $claudePath -Raw
           $tokens = $null
           $parseErrors = $null

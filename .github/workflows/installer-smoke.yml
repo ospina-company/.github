@@ -701,11 +701,16 @@ jobs:
           $shellSrc = Get-Content install.sh -Raw
           foreach ($digest in @(
             '12479a24be3f5307eecac7cde670fad7118640f031229e964f544b1367b52a41',
-            '391f247de2c70c7e99041979ec02dae7e76be27ac9cfc1dfe7c1eb21d48d8b97')) {
+            '391f247de2c70c7e99041979ec02dae7e76be27ac9cfc1dfe7c1eb21d48d8b97',
+            'cd17c6b555f761d60373659824bf805e1510538226e4c7028e19d7494937a333')) {
             if ($src -notmatch $digest -and $shellSrc -notmatch $digest) {
               Write-Host "::error::missing reviewed installer digest $digest"
               $fail = 1
             }
+          }
+          if ($src -match "Invoke-RestMethod\s+'https://claude\.ai/install\.ps1'") {
+            Write-Host "::error::Claude installer must be downloaded, digest-checked and only then executed"
+            $fail = 1
           }
           if ($shellSrc -match 'Homebrew/install/HEAD/install\.sh') {
             Write-Host "::error::Homebrew installer must use a reviewed immutable revision"
