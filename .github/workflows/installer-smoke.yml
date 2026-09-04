@@ -4,6 +4,7 @@ name: Installer smoke test
 # the only reason we can afford to test on a real Windows runner at all.
 on:
   push:
+    branches: [ main ]
     paths: [ 'install.ps1', 'install.sh', 'preflight.ps1', '.github/workflows/installer-smoke.yml' ]
   pull_request:
     paths: [ 'install.ps1', 'install.sh', 'preflight.ps1', '.github/workflows/installer-smoke.yml' ]
