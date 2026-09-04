@@ -545,6 +545,9 @@ jobs:
             if ($null -ne (Test-StorePythonPackage)) {
               Write-Host "::error::missing Appx discovery did not remain distinguishable"; exit 1
             }
+            if ($null -ne (Test-IsUserScopedTool 'python' $storeAlias)) {
+              Write-Host "::error::unknown Store Python scope was collapsed to true or false"; exit 1
+            }
             if (-not (Have-UsablePython 'python')) {
               Write-Host "::error::an unverified Windows Store alias made the account look clean"; exit 1
             }
@@ -703,7 +706,8 @@ jobs:
           foreach ($digest in @(
             '12479a24be3f5307eecac7cde670fad7118640f031229e964f544b1367b52a41',
             '391f247de2c70c7e99041979ec02dae7e76be27ac9cfc1dfe7c1eb21d48d8b97',
-            'cd17c6b555f761d60373659824bf805e1510538226e4c7028e19d7494937a333')) {
+            'cd17c6b555f761d60373659824bf805e1510538226e4c7028e19d7494937a333',
+            '3a68d3406cf674e17bed1733a4dcf37805e2e47d87417700007d7e1aa766a944')) {
             if ($src -notmatch $digest -and $shellSrc -notmatch $digest) {
               Write-Host "::error::missing reviewed installer digest $digest"
               $fail = 1
