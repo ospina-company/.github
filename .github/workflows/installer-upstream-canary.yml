@@ -2,6 +2,7 @@ name: Installer upstream canary
 
 on:
   push:
+    branches: [ main ]
     paths:
       - install.ps1
       - install.sh
