@@ -1,0 +1,170 @@
+name: Installer upstream canary
+
+on:
+  push:
+    paths:
+      - install.ps1
+      - install.sh
+      - .github/workflows/installer-upstream-canary.yml
+  pull_request:
+    paths:
+      - install.ps1
+      - install.sh
+      - .github/workflows/installer-upstream-canary.yml
+  schedule:
+    # Scheduled workflows run from the default branch. Monday morning Eastern,
+    # away from the top of the hour where GitHub reports higher queue pressure.
+    - cron: '17 13 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: installer-upstream-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  windows:
+    name: Windows package contracts
+    runs-on: windows-2025
+    timeout-minutes: 15
+    steps:
+      - name: Check out the installer source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Verify WinGet packages and pinned Node version
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          if (-not (Get-Command winget.exe -ErrorAction SilentlyContinue)) {
+            throw 'The Windows canary image does not provide WinGet.'
+          }
+
+          & winget source update --name winget --disable-interactivity
+          if ($LASTEXITCODE -ne 0) {
+            throw "WinGet source update failed with exit code $LASTEXITCODE."
+          }
+
+          $packageIds = @(
+            'Git.Git',
+            'GitHub.cli',
+            'OpenJS.NodeJS.LTS',
+            'astral-sh.uv',
+            'oschwartz10612.Poppler',
+            'errata-ai.Vale',
+            'TheDocumentFoundation.LibreOffice',
+            'T3Tools.T3Code',
+            'Anthropic.ClaudeCode'
+          )
+
+          foreach ($packageId in $packageIds) {
+            & winget show --id $packageId --exact --source winget `
+              --accept-source-agreements --disable-interactivity
+            if ($LASTEXITCODE -ne 0) {
+              throw "Required WinGet package '$packageId' is unavailable."
+            }
+            Write-Host "catalog ok: $packageId"
+          }
+
+          $source = Get-Content install.ps1 -Raw
+          $nodeMatch = [regex]::Match($source, '\$NodeVersion\s*=\s*''(?<version>[^'']+)''')
+          if (-not $nodeMatch.Success) {
+            throw 'Could not read the pinned Node version from install.ps1.'
+          }
+          $nodeVersion = $nodeMatch.Groups['version'].Value
+          & winget show --id OpenJS.NodeJS.LTS --exact --source winget `
+            --version $nodeVersion --accept-source-agreements --disable-interactivity
+          if ($LASTEXITCODE -ne 0) {
+            throw "Pinned Node version '$nodeVersion' is no longer available from WinGet."
+          }
+          Write-Host "catalog ok: OpenJS.NodeJS.LTS $nodeVersion"
+
+      - name: Verify mutable vendor installer contracts
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $ProgressPreference = 'SilentlyContinue'
+          $source = Get-Content install.ps1 -Raw
+
+          $codexMatch = [regex]::Match(
+            $source,
+            '\$expected\s*=\s*''(?<digest>[0-9a-f]{64})'''
+          )
+          if (-not $codexMatch.Success) {
+            throw 'Could not read the pinned Codex installer digest from install.ps1.'
+          }
+          $codexPath = Join-Path $env:RUNNER_TEMP 'codex-install.ps1'
+          Invoke-WebRequest 'https://chatgpt.com/codex/install.ps1' `
+            -OutFile $codexPath -UseBasicParsing
+          $actualDigest = (Get-FileHash -Algorithm SHA256 $codexPath).Hash.ToLowerInvariant()
+          if ($actualDigest -ne $codexMatch.Groups['digest'].Value) {
+            throw "The official Codex installer changed (observed $actualDigest). Review it before updating the pin."
+          }
+          Write-Host 'digest ok: official Codex installer'
+
+          $claudeSource = (Invoke-WebRequest 'https://claude.ai/install.ps1' -UseBasicParsing).Content
+          $tokens = $null
+          $parseErrors = $null
+          $null = [System.Management.Automation.Language.Parser]::ParseInput(
+            $claudeSource,
+            [ref]$tokens,
+            [ref]$parseErrors
+          )
+          if ($parseErrors.Count -ne 0) {
+            $messages = ($parseErrors | ForEach-Object Message) -join '; '
+            throw "The official Claude installer does not parse under Windows PowerShell: $messages"
+          }
+          Write-Host 'syntax ok: official Claude installer'
+
+  macos:
+    name: macOS package contracts
+    runs-on: macos-15
+    timeout-minutes: 15
+    env:
+      HOMEBREW_NO_ANALYTICS: '1'
+      HOMEBREW_NO_AUTO_UPDATE: '1'
+    steps:
+      - name: Check out the installer source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Refresh Homebrew metadata
+        run: brew update
+
+      - name: Verify Homebrew package contracts
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          for formula in git gh node@24 uv poppler vale; do
+            brew info --formula "$formula" >/dev/null
+            echo "catalog ok: formula $formula"
+          done
+
+          for cask in libreoffice t3-code claude-code codex; do
+            brew info --cask "$cask" >/dev/null
+            echo "catalog ok: cask $cask"
+          done
+
+      - name: Verify pinned Homebrew installer
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          commit=$(awk -F= '/^[[:space:]]*HOMEBREW_INSTALL_COMMIT=/{print $2; exit}' install.sh)
+          expected=$(awk -F= '/^[[:space:]]*HOMEBREW_INSTALL_SHA256=/{print $2; exit}' install.sh)
+          if [[ ! "$commit" =~ ^[0-9a-f]{40}$ || ! "$expected" =~ ^[0-9a-f]{64}$ ]]; then
+            echo 'Could not read the pinned Homebrew installer commit and digest.' >&2
+            exit 1
+          fi
+
+          installer="$RUNNER_TEMP/homebrew-install.sh"
+          curl -fsSL "https://raw.githubusercontent.com/Homebrew/install/$commit/install.sh" \
+            -o "$installer"
+          actual=$(shasum -a 256 "$installer" | awk '{print $1}')
+          if [[ "$actual" != "$expected" ]]; then
+            echo "Pinned Homebrew installer digest mismatch: observed $actual" >&2
+            exit 1
+          fi
+          echo 'digest ok: pinned Homebrew installer'
