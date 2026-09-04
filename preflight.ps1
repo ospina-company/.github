@@ -162,6 +162,7 @@ Write-Host "  Your test will NOT exercise installing these. Scope is inferred fr
 Write-Host "  the path: something under your profile is yours alone, not the machine's." -ForegroundColor DarkGray
 
 $inherited = 0
+$scopeUnknown = 0
 foreach ($t in 'git','gh','node','npm','corepack','uv','python','python3',
                     'pdftotext','pdftoppm','pdfinfo','soffice','vale',
                     't3','claude','codex','winget') {
@@ -179,8 +180,16 @@ foreach ($t in 'git','gh','node','npm','corepack','uv','python','python3',
     # WindowsApps holds app execution aliases, which Windows provides. A binary
     # there sits under the profile but was not installed by this account.
     $userScoped = Test-IsUserScopedTool $t $src
-    Line 'NOTE' $t ("{0}  [{1}]" -f $src, $(if ($userScoped) { 'this user' } else { 'machine-wide' }))
-    if ($t -ne 'winget' -and -not $userScoped) { $inherited++ }
+    $scopeLabel = if ($null -eq $userScoped) {
+      $scopeUnknown++
+      'scope unknown'
+    } elseif ($userScoped) {
+      'this user'
+    } else {
+      'machine-wide'
+    }
+    Line 'NOTE' $t ("{0}  [{1}]" -f $src, $scopeLabel)
+    if ($t -ne 'winget' -and $false -eq $userScoped) { $inherited++ }
   } else {
     Line 'CLEAN' $t 'not installed, so the install path WILL be tested'
   }
@@ -200,6 +209,11 @@ if ($inherited -gt 0) {
   Write-Host "$inherited tool(s) are inherited machine-wide, so this test covers the" -ForegroundColor Yellow
   Write-Host "auth, profile, skills and clone paths, but not winget installing them" -ForegroundColor Yellow
   Write-Host "from nothing. Windows Sandbox or a VM is the only way to cover that." -ForegroundColor Yellow
+}
+if ($scopeUnknown -gt 0) {
+  Write-Host ""
+  Write-Host "$scopeUnknown tool scope(s) could not be verified, so preflight did not" -ForegroundColor Yellow
+  Write-Host "classify them as either per-user or machine-wide." -ForegroundColor Yellow
 }
 Write-Host ""
 Write-Host "Next, if the account is clean:"

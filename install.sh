@@ -410,6 +410,22 @@ install_claude() {
       return 1
     }
     if curl -fsSL https://claude.ai/install.sh -o "$_ci"; then
+      _expected_claude_sha256=3a68d3406cf674e17bed1733a4dcf37805e2e47d87417700007d7e1aa766a944
+      if have sha256sum; then
+        _actual_claude_sha256=$(sha256sum "$_ci" | awk '{print $1}')
+      elif have shasum; then
+        _actual_claude_sha256=$(shasum -a 256 "$_ci" | awk '{print $1}')
+      else
+        say "          cannot verify the Claude installer: SHA-256 tool not found"
+        rm -f "$_ci"
+        return 1
+      fi
+      if [ "$_actual_claude_sha256" != "$_expected_claude_sha256" ]; then
+        say "          Claude installer changed; refusing to run unreviewed code"
+        say "          observed SHA-256: $_actual_claude_sha256"
+        rm -f "$_ci"
+        return 1
+      fi
       if bash "$_ci"; then _rc=0; else _rc=$?; fi
       rm -f "$_ci"; return $_rc
     else

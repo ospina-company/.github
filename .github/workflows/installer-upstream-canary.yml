@@ -189,3 +189,24 @@ jobs:
             exit 1
           fi
           echo 'digest ok: pinned Homebrew installer'
+
+      - name: Verify pinned Claude shell installer
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          expected=$(awk -F= '/^[[:space:]]*_expected_claude_sha256=/{print $2; exit}' install.sh)
+          if [[ ! "$expected" =~ ^[0-9a-f]{64}$ ]]; then
+            echo 'Could not read the pinned Claude shell installer digest.' >&2
+            exit 1
+          fi
+
+          installer="$RUNNER_TEMP/claude-install.sh"
+          curl -fsSL https://claude.ai/install.sh -o "$installer"
+          actual=$(shasum -a 256 "$installer" | awk '{print $1}')
+          if [[ "$actual" != "$expected" ]]; then
+            echo "The official Claude shell installer changed (observed $actual). Review it before updating the pin." >&2
+            exit 1
+          fi
+          bash -n "$installer"
+          echo 'digest and syntax ok: official Claude shell installer'
