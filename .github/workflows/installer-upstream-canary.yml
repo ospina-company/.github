@@ -33,6 +33,8 @@ jobs:
     steps:
       - name: Check out the installer source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Verify WinGet packages and pinned Node version
         shell: powershell
@@ -132,6 +134,8 @@ jobs:
     steps:
       - name: Check out the installer source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Refresh Homebrew metadata
         run: brew update
