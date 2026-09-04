@@ -104,7 +104,10 @@ jobs:
           }
           Write-Host 'digest ok: official Codex installer'
 
-          $claudeSource = (Invoke-WebRequest 'https://claude.ai/install.ps1' -UseBasicParsing).Content
+          $claudePath = Join-Path $env:RUNNER_TEMP 'claude-install.ps1'
+          Invoke-WebRequest 'https://claude.ai/install.ps1' `
+            -OutFile $claudePath -UseBasicParsing
+          $claudeSource = Get-Content $claudePath -Raw
           $tokens = $null
           $parseErrors = $null
           $null = [System.Management.Automation.Language.Parser]::ParseInput(
