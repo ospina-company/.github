@@ -4,9 +4,10 @@ name: Installer smoke test
 # the only reason we can afford to test on a real Windows runner at all.
 on:
   push:
+    branches: [ main ]
     paths: [ 'install.ps1', 'install.sh', 'preflight.ps1', '.github/workflows/installer-smoke.yml' ]
   pull_request:
-    paths: [ 'install.ps1', 'install.sh', 'preflight.ps1' ]
+    paths: [ 'install.ps1', 'install.sh', 'preflight.ps1', '.github/workflows/installer-smoke.yml' ]
   workflow_dispatch:
 
 # Least privilege: this workflow only reads the repository.
@@ -17,7 +18,7 @@ jobs:
   windows:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
@@ -67,10 +68,600 @@ jobs:
           if (-not $env:Path) { Write-Host "::error::Refresh-Path produced an empty PATH"; exit 1 }
           Write-Host "Refresh-Path ok"
 
+          # Vendor launchers use `exit` on failure. They must run in a child so
+          # an optional-agent failure cannot terminate the onboarding shell, and
+          # the authenticated file must remain immutable until that child exits.
+          $vendorFixture = Join-Path $env:RUNNER_TEMP 'vendor-exit-fixture.ps1'
+          Set-Content -LiteralPath $vendorFixture -Encoding ASCII -Value @'
+          Write-Output 'vendor failure fixture'
+          exit 23
+          '@
+          $vendorDigest = (Get-FileHash -LiteralPath $vendorFixture -Algorithm SHA256).Hash.ToLowerInvariant()
+          $vendorRc = Invoke-VerifiedInstallerScript -Path $vendorFixture `
+            -ExpectedDigest $vendorDigest -Label 'vendor failure fixture'
+          if ($vendorRc -ne 23) {
+            Write-Host "::error::isolated vendor exit returned $vendorRc instead of 23"; exit 1
+          }
+          Write-Host "vendor exit stayed inside its child process"
+
+          $lockedFixture = Join-Path $env:RUNNER_TEMP 'vendor-lock-fixture.ps1'
+          Set-Content -LiteralPath $lockedFixture -Encoding ASCII -Value @'
+          try {
+            Set-Content -LiteralPath $MyInvocation.MyCommand.Path -Value 'tampered' -ErrorAction Stop
+            exit 99
+          } catch {
+            Write-Output 'authenticated installer remained write-locked'
+            exit 0
+          }
+          '@
+          $lockedDigest = (Get-FileHash -LiteralPath $lockedFixture -Algorithm SHA256).Hash.ToLowerInvariant()
+          $lockedRc = Invoke-VerifiedInstallerScript -Path $lockedFixture `
+            -ExpectedDigest $lockedDigest -Label 'vendor lock fixture'
+          if ($lockedRc -ne 0 -or
+              (Get-FileHash -LiteralPath $lockedFixture -Algorithm SHA256).Hash.ToLowerInvariant() -ne $lockedDigest) {
+            Write-Host "::error::authenticated installer changed while its child was running"; exit 1
+          }
+          Write-Host "vendor installer bytes remain locked from digest through child exit"
+
           $bash = Find-GitBash
           if (-not $bash) { Write-Host "::error::Find-GitBash found nothing on a runner that has Git"; exit 1 }
           Write-Host "Find-GitBash -> $bash"
           & $bash -c "echo bash works: \$(uname -s)"
+
+          $nodeMajor = Get-NodeMajor
+          if ($nodeMajor -notmatch '^[0-9]+$') {
+            Write-Host "::error::Get-NodeMajor returned '$nodeMajor'"; exit 1
+          }
+          $pythonMinor = Get-PythonMinor
+          if ($pythonMinor -notmatch '^[0-9]+\.[0-9]+$') {
+            Write-Host "::error::Get-PythonMinor returned '$pythonMinor'"; exit 1
+          }
+          Write-Host "native version probes work: Node $nodeMajor, Python $pythonMinor"
+
+          # The runner's inherited Node version is not the installer's contract.
+          # Feed the parsers the exact required outputs as a controlled test.
+          function Invoke-Native-Capture {
+            param([string]$Exe, [string[]]$Arguments = @())
+            if ($Exe -eq 'node') { return 'v24.19.0' }
+            if ($Exe -eq 'python') { return 'Python 3.12.10' }
+            return $null
+          }
+          if ((Get-NodeMajor) -ne '24') {
+            Write-Host "::error::Get-NodeMajor did not recognize the required Node 24 output"; exit 1
+          }
+          if ((Get-PythonMinor) -ne '3.12') {
+            Write-Host "::error::Get-PythonMinor did not recognize the required Python 3.12 output"; exit 1
+          }
+          Write-Host "exact Node 24 / Python 3.12 parsing works"
+
+          # cmd.exe searches the current directory before PATH. Prove the helper
+          # selects npm.cmd beside the active node.exe and ignores a malicious
+          # same-name file in the checkout.
+          $trustedDir = Join-Path $env:RUNNER_TEMP 'trusted-node'
+          $untrustedDir = Join-Path $env:RUNNER_TEMP 'untrusted-checkout'
+          New-Item -ItemType Directory -Force -Path $trustedDir,$untrustedDir | Out-Null
+          Copy-Item (Join-Path $env:SystemRoot 'System32\cmd.exe') (Join-Path $trustedDir 'node.exe')
+          Set-Content -Path (Join-Path $trustedDir 'npm.cmd') -Value '@echo trusted-npm' -Encoding ASCII
+          Set-Content -Path (Join-Path $untrustedDir 'npm.cmd') -Value '@echo MALICIOUS-NPM' -Encoding ASCII
+          $env:Path = "$trustedDir;$env:Path"
+          Push-Location $untrustedDir
+          try {
+            $npm = Get-NodeToolPath 'npm'
+            if ($npm -ne (Join-Path $trustedDir 'npm.cmd')) {
+              Write-Host "::error::trusted npm resolver returned '$npm'"; exit 1
+            }
+            $npmOut = (& $npm --version | Out-String).Trim()
+            if ($npmOut -ne 'trusted-npm') {
+              Write-Host "::error::absolute npm invocation returned '$npmOut'"; exit 1
+            }
+          } finally { Pop-Location }
+          Write-Host "Node tooling ignores current-directory command hijacks"
+
+          # WinGet's user-scope Node package keeps node.exe and npm.cmd inside
+          # a nested node-v24.x-win-* directory. Prove discovery reaches the
+          # real portable layout instead of checking only the package root.
+          $savedLocalAppDataForNode = $env:LOCALAPPDATA
+          $nodeRoot = Join-Path $env:RUNNER_TEMP 'node-portable-fixture'
+          $env:LOCALAPPDATA = Join-Path $nodeRoot 'localapp'
+          $nodePackage = Join-Path $env:LOCALAPPDATA `
+            'Microsoft\WinGet\Packages\OpenJS.NodeJS.LTS_fixture\node-v24.19.0-win-x64'
+          New-Item -ItemType Directory -Force -Path $nodePackage | Out-Null
+          New-Item -ItemType File -Force -Path (Join-Path $nodePackage 'node.exe'), `
+            (Join-Path $nodePackage 'npm.cmd') | Out-Null
+          try {
+            if ($nodePackage -notin (Get-NodeToolDirectories)) {
+              Write-Host "::error::nested WinGet portable Node directory was not discovered"; exit 1
+            }
+            $savedCaptureFunction = (Get-Item Function:\Invoke-Native-Capture).ScriptBlock
+            $savedAddPathFunction = (Get-Item Function:\Add-UserPathEntry).ScriptBlock
+            $script:promotedNodeDirectory = $null
+            function Invoke-Native-Capture {
+              param($Exe,$Arguments)
+              if ($Exe -eq (Join-Path $nodePackage 'node.exe')) { return 'v24.19.0' }
+              if ((Split-Path $Exe -Leaf) -eq 'node.exe') { return 'v23.0.0' }
+              return $null
+            }
+            function Add-UserPathEntry { param($Dir) $script:promotedNodeDirectory = $Dir }
+            if (-not (Resolve-NodeToolchainPath) -or $script:promotedNodeDirectory -ne $nodePackage) {
+              Write-Host "::error::nested WinGet portable Node was not resolved and promoted"; exit 1
+            }
+          } finally {
+            if ($savedCaptureFunction) {
+              Set-Item Function:\Invoke-Native-Capture -Value $savedCaptureFunction
+            }
+            if ($savedAddPathFunction) {
+              Set-Item Function:\Add-UserPathEntry -Value $savedAddPathFunction
+            }
+            $env:LOCALAPPDATA = $savedLocalAppDataForNode
+          }
+          Write-Host "nested WinGet portable Node layout is resolved and promoted"
+
+          # npm's per-user global prefix is not necessarily beside node.exe.
+          # Prove Corepack resolution follows the trusted npm command to that
+          # prefix after a global install.
+          $corepackPrefix = Join-Path $env:RUNNER_TEMP 'npm-global-prefix'
+          New-Item -ItemType Directory -Force -Path $corepackPrefix | Out-Null
+          Set-Content -Path (Join-Path $corepackPrefix 'corepack.cmd') `
+                      -Value '@echo corepack-fixture' -Encoding ASCII
+          function Get-NodeToolPath { param($Name) return $null }
+          function Invoke-NodeToolCapture { param($Name,$Arguments) return $corepackPrefix }
+          if ((Get-CorepackPath) -ne (Join-Path $corepackPrefix 'corepack.cmd')) {
+            Write-Host "::error::Corepack was not resolved from npm's global prefix"; exit 1
+          }
+          Write-Host "Corepack resolves from npm's per-user global prefix"
+
+          # Simulate an old uv winning on PATH while a current user-scoped
+          # WinGet package is present. Resolve-UvOnPath must select and prepend
+          # the capability-verified executable.
+          $savedPath = $env:Path
+          $savedLocalAppData = $env:LOCALAPPDATA
+          $userEnvironmentKey = [Microsoft.Win32.Registry]::CurrentUser.CreateSubKey('Environment')
+          $savedUserPathExists = $userEnvironmentKey.GetValueNames() -contains 'Path'
+          $savedUserPathRaw = if ($savedUserPathExists) {
+            $userEnvironmentKey.GetValue(
+              'Path', $null, [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+          } else { $null }
+          $savedUserPathKind = if ($savedUserPathExists) {
+            $userEnvironmentKey.GetValueKind('Path')
+          } else { $null }
+          $userEnvironmentKey.Dispose()
+          $savedPreferredUser = [Environment]::GetEnvironmentVariable('OSPINA_PREFERRED_PATH','User')
+          $savedPreferredProcess = $env:OSPINA_PREFERRED_PATH
+          $preferredStateFile = Join-Path $env:USERPROFILE '.ospina\preferred-path'
+          $preferredStateExisted = Test-Path $preferredStateFile
+          $preferredStateBytes = if ($preferredStateExisted) {
+            [IO.File]::ReadAllBytes($preferredStateFile)
+          } else { $null }
+          $documents = [Environment]::GetFolderPath('MyDocuments')
+          $profilePaths = @(
+            (Join-Path $documents 'WindowsPowerShell\Microsoft.PowerShell_profile.ps1'),
+            (Join-Path $documents 'PowerShell\Microsoft.PowerShell_profile.ps1'),
+            (Join-Path $env:USERPROFILE '.bash_profile'),
+            (Join-Path $env:USERPROFILE '.bash_login'),
+            (Join-Path $env:USERPROFILE '.profile'),
+            (Join-Path $env:USERPROFILE '.bashrc')
+          )
+          $profileBackups = @{}
+          foreach ($profilePath in $profilePaths) {
+            $profileBackups[$profilePath] = [pscustomobject]@{
+              Existed = Test-Path $profilePath
+              Bytes = if (Test-Path $profilePath) { [IO.File]::ReadAllBytes($profilePath) } else { $null }
+            }
+          }
+          try {
+            $userEnvironmentKey = [Microsoft.Win32.Registry]::CurrentUser.CreateSubKey('Environment')
+            $userEnvironmentKey.SetValue(
+              'Path', '%USERPROFILE%\OspinaPathFixture',
+              [Microsoft.Win32.RegistryValueKind]::ExpandString)
+            $userEnvironmentKey.Dispose()
+            # Seed three different encodings. The installer must append its block
+            # without changing a single pre-existing byte. All mutations stay
+            # inside this restoration guard so a fixture/setup failure is safe.
+            $profileFixtures = @{}
+            $profileFixtures[$profilePaths[0]] = [byte[]]([Text.Encoding]::Unicode.GetPreamble() +
+              [Text.Encoding]::Unicode.GetBytes("# café`r`n"))
+            $profileFixtures[$profilePaths[1]] = [byte[]]((New-Object Text.UTF8Encoding($true)).GetPreamble() +
+              (New-Object Text.UTF8Encoding($true)).GetBytes("# привет`n"))
+            # Seed only .profile so creating .bash_profile would suppress it.
+            $profileFixtures[$profilePaths[4]] = (New-Object Text.UTF8Encoding($false)).GetBytes("# café`n")
+            Remove-Item $profilePaths[2],$profilePaths[3] -Force -ErrorAction SilentlyContinue
+            foreach ($profilePath in $profileFixtures.Keys) {
+              New-Item -ItemType Directory -Force -Path (Split-Path $profilePath -Parent) | Out-Null
+              [IO.File]::WriteAllBytes($profilePath, $profileFixtures[$profilePath])
+            }
+            $uvRoot = Join-Path $env:RUNNER_TEMP 'uv-path-fixture'
+            $oldUvDir = Join-Path $uvRoot 'old'
+            $newUvDir = Join-Path $uvRoot 'localapp\Microsoft\WinGet\Packages\astral-sh.uv_fixture'
+            New-Item -ItemType Directory -Force -Path $oldUvDir,$newUvDir | Out-Null
+            Set-Content -Path (Join-Path $oldUvDir 'uv.cmd') -Encoding ASCII -Value @'
+          @echo off
+          if "%*"=="python install --default --preview-features python-install-default --help" exit /b 0
+          if "%*"=="python install ospina-capability-probe-invalid --default --preview-features python-install-default --offline --no-python-downloads" echo warning: Pass --preview-features python-install-default to disable this warning 1>&2
+          exit /b 2
+          '@
+            $uvSource = @'
+          using System;
+          public class UvFixture {
+            public static int Main(string[] args) {
+              var actual = String.Join(" ", args);
+              var help = "python install --default --preview-features python-install-default --help";
+              var probe = "python install ospina-capability-probe-invalid --default --preview-features python-install-default --offline --no-python-downloads";
+              if (actual == help) return 0;
+              if (actual == probe) Console.Error.WriteLine("error: invalid Python request");
+              return 2;
+            }
+          }
+          '@
+            Add-Type -TypeDefinition $uvSource -Language CSharp `
+                     -OutputAssembly (Join-Path $newUvDir 'uv.exe') -OutputType ConsoleApplication
+            $env:LOCALAPPDATA = Join-Path $uvRoot 'localapp'
+            $env:Path = "$oldUvDir;$savedPath"
+            if (Test-UvDefaultInstall) {
+              Write-Host "::error::old uv fixture was accepted"; exit 1
+            }
+            if (-not (Resolve-UvOnPath) -or -not (Test-UvDefaultInstall)) {
+              Write-Host "::error::current user-scoped uv did not replace the old PATH winner"; exit 1
+            }
+            $userEnvironmentKey = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey('Environment')
+            $updatedUserPathKind = $userEnvironmentKey.GetValueKind('Path')
+            $updatedUserPathRaw = [string]$userEnvironmentKey.GetValue(
+              'Path', $null, [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+            $userEnvironmentKey.Dispose()
+            if ($updatedUserPathKind -ne [Microsoft.Win32.RegistryValueKind]::ExpandString -or
+                -not $updatedUserPathRaw.Contains('%USERPROFILE%\OspinaPathFixture')) {
+              Write-Host "::error::user Path lost its REG_EXPAND_SZ kind or raw expression"; exit 1
+            }
+            # Simulate a fresh Windows shell: machine PATH wins in the parent,
+            # and only the generated PowerShell profile may restore precedence.
+            $env:Path = "$oldUvDir;$savedPath"
+            $freshUv = (& powershell.exe -NoLogo -NonInteractive -Command `
+              '(Get-Command uv.exe -CommandType Application | Select-Object -First 1).Source' |
+              Select-Object -Last 1).Trim()
+            if ($freshUv -ne (Join-Path $newUvDir 'uv.exe')) {
+              Write-Host "::error::new PowerShell resolved '$freshUv' instead of the promoted uv"; exit 1
+            }
+            if ((Test-Path $profilePaths[2]) -or (Test-Path $profilePaths[3])) {
+              Write-Host "::error::installer hid an existing .profile behind a new Bash profile"; exit 1
+            }
+            foreach ($profilePath in $profileFixtures.Keys) {
+              $after = [IO.File]::ReadAllBytes($profilePath)
+              $before = [byte[]]$profileFixtures[$profilePath]
+              if ($after.Length -le $before.Length) {
+                Write-Host "::error::profile block was not appended: $profilePath"; exit 1
+              }
+              $prefixAfter = [byte[]]$after[0..($before.Length - 1)]
+              if ([Convert]::ToBase64String($before) -ne
+                  [Convert]::ToBase64String($prefixAfter)) {
+                Write-Host "::error::existing profile bytes changed: $profilePath"; exit 1
+              }
+            }
+            $start = '# >>> ospina workstation PATH >>>'
+            $end = '# <<< ospina workstation PATH <<<'
+            function New-Utf16OddOffsetDecoy {
+              param([Parameter(Mandatory)][string]$Text)
+              # In valid UTF-16, the marker's byte pattern can occur starting at
+              # the high byte of one code unit. That is not a real text marker.
+              $chars = @([char]((([int][char]$Text[0]) -shl 8) -bor 1))
+              for ($i = 1; $i -lt $Text.Length; $i++) {
+                $chars += [char](([int][char]$Text[$i]) -shl 8)
+              }
+              $chars += [char]0x0100
+              return -join $chars
+            }
+            $unicode = [Text.Encoding]::Unicode
+            $utf16UserPrefix = "# UTF-16 user prefix`r`n" +
+              (New-Utf16OddOffsetDecoy $start) + "`r`n" +
+              (New-Utf16OddOffsetDecoy $end) + "`r`n"
+            $utf16UserSuffix = "`r`n# UTF-16 user suffix`r`n"
+            $utf16LegacyText = $utf16UserPrefix + $start +
+              "`r`n# legacy UTF-16 block`r`n" + $end + $utf16UserSuffix
+            $utf16PrefixBytes = [byte[]]($unicode.GetPreamble() +
+              $unicode.GetBytes($utf16UserPrefix))
+            $utf16SuffixBytes = $unicode.GetBytes($utf16UserSuffix)
+            [IO.File]::WriteAllBytes($profilePaths[0], [byte[]](
+              $unicode.GetPreamble() + $unicode.GetBytes($utf16LegacyText)))
+            Add-OspinaProfileBlock -Path $profilePaths[0] -Start $start -End $end `
+              -Block "$start`n# current UTF-16 block`n$end" -PowerShellProfile
+            $utf16UpdatedBytes = [IO.File]::ReadAllBytes($profilePaths[0])
+            $utf16UpdatedPrefix = [byte[]]$utf16UpdatedBytes[0..($utf16PrefixBytes.Length - 1)]
+            $utf16UpdatedSuffix = [byte[]]$utf16UpdatedBytes[
+              ($utf16UpdatedBytes.Length - $utf16SuffixBytes.Length)..($utf16UpdatedBytes.Length - 1)]
+            if ([Convert]::ToBase64String($utf16UpdatedPrefix) -ne
+                [Convert]::ToBase64String($utf16PrefixBytes) -or
+                [Convert]::ToBase64String($utf16UpdatedSuffix) -ne
+                [Convert]::ToBase64String($utf16SuffixBytes)) {
+              Write-Host "::error::UTF-16 replacement changed user-owned bytes"; exit 1
+            }
+            $strictUnicode = [Text.UnicodeEncoding]::new($false, $true, $true)
+            $utf16UpdatedText = $strictUnicode.GetString(
+              $utf16UpdatedBytes, 2, $utf16UpdatedBytes.Length - 2)
+            if (-not $utf16UpdatedText.Contains('# current UTF-16 block') -or
+                $utf16UpdatedText.Contains('# legacy UTF-16 block') -or
+                ([regex]::Matches($utf16UpdatedText, [regex]::Escape($start))).Count -ne 1 -or
+                ([regex]::Matches($utf16UpdatedText, [regex]::Escape($end))).Count -ne 1) {
+              Write-Host "::error::UTF-16 managed block was not replaced exactly once"; exit 1
+            }
+            $legacyEnvBlock = @'
+          # >>> ospina workstation PATH >>>
+          if [ -n "${OSPINA_PREFERRED_PATH:-}" ]; then
+            _ospina_preferred_path=$(cygpath -p "$OSPINA_PREFERRED_PATH" 2>/dev/null || true)
+            if [ -n "$_ospina_preferred_path" ]; then
+              PATH="$_ospina_preferred_path:$PATH"
+              export PATH
+            fi
+            unset _ospina_preferred_path
+          fi
+          # <<< ospina workstation PATH <<<
+          '@
+            # The oldest installer created an Ospina-only .bash_profile even
+            # when it hid an employee's .profile. A rerun must remove our file.
+            [IO.File]::WriteAllText($profilePaths[2], $legacyEnvBlock.Trim() + "`n",
+                                    (New-Object Text.UTF8Encoding($false)))
+            Install-OspinaPathProfiles
+            if (Test-Path $profilePaths[2]) {
+              Write-Host "::error::legacy installer-only .bash_profile still hides .profile"; exit 1
+            }
+
+            $legacyRegistryBlock = @'
+          # user-owned sentinel
+          # >>> ospina workstation PATH >>>
+          _ospina_preferred_windows_path=$(reg.exe query 'HKCU\Environment' /v OSPINA_PREFERRED_PATH 2>/dev/null |
+            tr -d '\r' | sed -n 's/^[[:space:]]*OSPINA_PREFERRED_PATH[[:space:]]*REG_[A-Z0-9_]*[[:space:]]*//p')
+          if [ -n "$_ospina_preferred_windows_path" ]; then
+            _ospina_preferred_path=$(cygpath -p "$_ospina_preferred_windows_path" 2>/dev/null || true)
+            PATH="$_ospina_preferred_path:$PATH"
+            export PATH
+          fi
+          # <<< ospina workstation PATH <<<
+          '@
+            # The immediately previous block used reg.exe. Preserve the user's
+            # byte prefix while replacing only the marked installer-owned bytes.
+            [IO.File]::WriteAllText($profilePaths[3], $legacyRegistryBlock.Trim() + "`n",
+                                    (New-Object Text.UTF8Encoding($false)))
+            Install-OspinaPathProfiles
+            $migratedBashLogin = [IO.File]::ReadAllText($profilePaths[3])
+            if (-not $migratedBashLogin.Contains('# user-owned sentinel') -or
+                -not $migratedBashLogin.Contains('$HOME/.ospina/preferred-path') -or
+                $migratedBashLogin.Contains('reg.exe query')) {
+              Write-Host "::error::previous Git Bash block was not migrated safely"; exit 1
+            }
+            Install-OspinaPathProfiles
+            if (([regex]::Matches([IO.File]::ReadAllText($profilePaths[3]),
+                                  [regex]::Escape($start))).Count -ne 1) {
+              Write-Host "::error::migrated Git Bash block is not idempotent"; exit 1
+            }
+            if (([regex]::Matches([IO.File]::ReadAllText($profilePaths[5]),
+                                  [regex]::Escape($start))).Count -ne 1) {
+              Write-Host "::error::.bashrc block is not idempotent"; exit 1
+            }
+            # Remove the inherited process value. Git Bash must read the current
+            # installer-owned state file and still promote uv in a login shell.
+            $env:OSPINA_PREFERRED_PATH = $null
+            $freshUvBash = (& $bash -lc 'command -v uv.exe || command -v uv' |
+              Select-Object -Last 1).Trim()
+            $expectedUvBash = (& $bash -c "cygpath -u '$newUvDir\uv.exe'").Trim()
+            if ($freshUvBash -ne $expectedUvBash) {
+              Write-Host "::error::new Git Bash resolved '$freshUvBash' instead of '$expectedUvBash'"; exit 1
+            }
+            $freshUvNonLoginBash = (& $bash -c 'source "$HOME/.bashrc"; command -v uv.exe || command -v uv' |
+              Select-Object -Last 1).Trim()
+            if ($freshUvNonLoginBash -ne $expectedUvBash) {
+              Write-Host "::error::.bashrc did not promote uv in non-login Git Bash"; exit 1
+            }
+            $expectedUvBashDir = (& $bash -c "cygpath -u '$newUvDir'").Trim()
+            $doubleSourcedPath = (& $bash -lc 'source "$HOME/.bashrc"; printf "%s\n" "$PATH"' 2>$null |
+              Select-Object -Last 1).Trim()
+            if ((@($doubleSourcedPath -split ':' |
+                   Where-Object { $_ -eq $expectedUvBashDir })).Count -ne 1) {
+              Write-Host "::error::login plus .bashrc duplicated the preferred path"; exit 1
+            }
+
+            # Any Authenticode state other than NotSigned is immutable here,
+            # even when trust validation failed rather than returning Valid.
+            $signedFixture = Join-Path $env:RUNNER_TEMP 'signed-profile-fixture.ps1'
+            [IO.File]::WriteAllText($signedFixture, '# signed sentinel',
+                                    (New-Object Text.UTF8Encoding($false)))
+            $signedBefore = [IO.File]::ReadAllBytes($signedFixture)
+            $savedDieFunction = (Get-Item Function:\Die).ScriptBlock
+            $savedSignatureFunction = Get-Item Function:\Get-AuthenticodeSignature -ErrorAction SilentlyContinue
+            $signedProfileSkipped = $false
+            try {
+              function Get-AuthenticodeSignature {
+                param($FilePath,$ErrorAction)
+                return [pscustomobject]@{ Status = 'NotTrusted'; SignerCertificate = [pscustomobject]@{} }
+              }
+              function Die { param($m) throw $m }
+              try {
+                Add-OspinaProfileBlock -Path $signedFixture -Start $start -End $end `
+                                       -Block "$start`n# current`n$end" -PowerShellProfile
+                $signedProfileSkipped = $true
+              } catch {
+                Write-Host "::error::a signed profile aborted the surrounding installation: $_"; exit 1
+              }
+            } finally {
+              if ($savedSignatureFunction) {
+                Set-Item Function:\Get-AuthenticodeSignature -Value $savedSignatureFunction.ScriptBlock
+              } else {
+                Remove-Item Function:\Get-AuthenticodeSignature -ErrorAction SilentlyContinue
+              }
+              Set-Item Function:\Die -Value $savedDieFunction
+            }
+            if (-not $signedProfileSkipped -or
+                [Convert]::ToBase64String($signedBefore) -ne
+                [Convert]::ToBase64String([IO.File]::ReadAllBytes($signedFixture))) {
+              Write-Host "::error::untrusted signed profile was not skipped safely"; exit 1
+            }
+          } finally {
+            $env:Path = $savedPath
+            $env:LOCALAPPDATA = $savedLocalAppData
+            $userEnvironmentKey = [Microsoft.Win32.Registry]::CurrentUser.CreateSubKey('Environment')
+            if ($savedUserPathExists) {
+              $userEnvironmentKey.SetValue('Path', $savedUserPathRaw, $savedUserPathKind)
+            } else {
+              $userEnvironmentKey.DeleteValue('Path', $false)
+            }
+            $userEnvironmentKey.Dispose()
+            [Environment]::SetEnvironmentVariable('OSPINA_PREFERRED_PATH', $savedPreferredUser, 'User')
+            $env:OSPINA_PREFERRED_PATH = $savedPreferredProcess
+            if ($preferredStateExisted) {
+              New-Item -ItemType Directory -Force -Path (Split-Path $preferredStateFile -Parent) | Out-Null
+              [IO.File]::WriteAllBytes($preferredStateFile, $preferredStateBytes)
+            } elseif (Test-Path $preferredStateFile) {
+              Remove-Item $preferredStateFile -Force
+            }
+            foreach ($profilePath in $profilePaths) {
+              $backup = $profileBackups[$profilePath]
+              if ($backup.Existed) {
+                New-Item -ItemType Directory -Force -Path (Split-Path $profilePath -Parent) | Out-Null
+                [IO.File]::WriteAllBytes($profilePath, $backup.Bytes)
+              } elseif (Test-Path $profilePath) { Remove-Item $profilePath -Force }
+            }
+          }
+          Write-Host "old uv PATH conflict stays repaired in a new PowerShell"
+
+          # LibreOffice is machine-scoped. A denied installation must return a
+          # false capability result rather than throwing and aborting onboarding.
+          function Have { param($c) return $false }
+          function Resolve-OnPath { param($Command,$Directories) return $false }
+          function Invoke-Native { param($Exe,$Arguments,[switch]$Interactive) return 7 }
+          function Refresh-Path { }
+          function Say { param($m,$ForegroundColor) }
+          $script:OspinaLibreOfficeExitCode = 0
+          if (Ensure-LibreOffice) {
+            Write-Host "::error::failed LibreOffice fixture reported success"; exit 1
+          }
+          if ($script:OspinaLibreOfficeExitCode -ne 7) {
+            Write-Host "::error::LibreOffice failure code was not preserved"; exit 1
+          }
+          Write-Host "machine-scope LibreOffice denial remains a non-fatal capability gap"
+
+      - name: Preflight detects inherited applications and Store scope
+        shell: powershell
+        run: |
+          $ast = [System.Management.Automation.Language.Parser]::ParseFile(
+                   (Resolve-Path preflight.ps1), [ref]$null, [ref]$null)
+          foreach ($f in $ast.FindAll({
+            $args[0] -is [System.Management.Automation.Language.FunctionDefinitionAst]
+          }, $true)) { Invoke-Expression $f.Extent.Text }
+
+          $fixture = Join-Path $env:RUNNER_TEMP 'preflight-fixture'
+          $savedProgramFiles = $env:ProgramFiles
+          $savedLocalAppData = $env:LOCALAPPDATA
+          $savedUserProfile = $env:USERPROFILE
+          try {
+            $env:ProgramFiles = Join-Path $fixture 'Program Files'
+            $env:LOCALAPPDATA = Join-Path $fixture 'User\AppData\Local'
+            $env:USERPROFILE = Join-Path $fixture 'User'
+            $lo = Join-Path $env:ProgramFiles 'LibreOffice\program\soffice.exe'
+            $t3 = Join-Path $env:LOCALAPPDATA 'Programs\T3 Code'
+            New-Item -ItemType Directory -Force -Path (Split-Path $lo -Parent),$t3 | Out-Null
+            New-Item -ItemType File -Force -Path $lo | Out-Null
+            if ((Get-LibreOfficePath) -ne $lo) {
+              Write-Host "::error::preflight missed an inherited LibreOffice installation"; exit 1
+            }
+            if (Get-T3CodePath) {
+              Write-Host "::error::an empty T3 Code directory was treated as an application"; exit 1
+            }
+            $t3Executable = Join-Path $t3 'T3 Code (Alpha).exe'
+            New-Item -ItemType File -Force -Path $t3Executable | Out-Null
+            if ((Get-T3CodePath) -ne $t3Executable) {
+              Write-Host "::error::preflight missed an inherited T3 Code executable"; exit 1
+            }
+
+            $storeAlias = Join-Path $env:USERPROFILE 'AppData\Local\Microsoft\WindowsApps\python.exe'
+            function Test-StorePythonPackage { return $true }
+            if (-not (Test-IsUserScopedTool 'python' $storeAlias)) {
+              Write-Host "::error::a confirmed per-user Store Python was labeled machine-wide"; exit 1
+            }
+            function Test-StorePythonPackage { return $false }
+            if (Test-IsUserScopedTool 'python' $storeAlias) {
+              Write-Host "::error::an empty Windows Store alias was labeled user-installed"; exit 1
+            }
+
+            function Get-Command {
+              param($Name,$ErrorAction)
+              if ($Name -eq 'Get-AppxPackage') { return $null }
+              if ($Name -eq 'python') {
+                return [pscustomobject]@{ Source = $storeAlias }
+              }
+              return Microsoft.PowerShell.Core\Get-Command $Name -ErrorAction $ErrorAction
+            }
+            Remove-Item Function:\Test-StorePythonPackage
+            foreach ($f in $ast.FindAll({
+              $args[0] -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+              $args[0].Name -eq 'Test-StorePythonPackage'
+            }, $true)) { Invoke-Expression $f.Extent.Text }
+            if ($null -ne (Test-StorePythonPackage)) {
+              Write-Host "::error::missing Appx discovery did not remain distinguishable"; exit 1
+            }
+            if ($null -ne (Test-IsUserScopedTool 'python' $storeAlias)) {
+              Write-Host "::error::unknown Store Python scope was collapsed to true or false"; exit 1
+            }
+            if (-not (Have-UsablePython 'python')) {
+              Write-Host "::error::an unverified Windows Store alias made the account look clean"; exit 1
+            }
+            Remove-Item Function:\Get-Command
+
+            Remove-Item $t3 -Recurse -Force
+            function Get-ItemProperty {
+              param($Path,$ErrorAction)
+              if ($Path -like 'HKCU:*') {
+                return [pscustomobject]@{ DisplayName = 'T3 Code' }
+              }
+              return $null
+            }
+            $registeredT3 = Get-T3CodePath
+            if (-not $registeredT3.StartsWith('HKCU:', 'OrdinalIgnoreCase') -or
+                -not (Test-IsUserScopedTool 't3' $registeredT3)) {
+              Write-Host "::error::a per-user T3 registry entry lost its scope"; exit 1
+            }
+          } finally {
+            $env:ProgramFiles = $savedProgramFiles
+            $env:LOCALAPPDATA = $savedLocalAppData
+            $env:USERPROFILE = $savedUserProfile
+          }
+          Write-Host "preflight application and Store-scope fixtures pass"
+
+      - name: Preflight rejects partial bootstrap state
+        shell: powershell
+        run: |
+          $fixture = Join-Path $env:RUNNER_TEMP 'preflight-codex-state'
+          $savedUserProfile = $env:USERPROFILE
+          $savedPreferredPath = $env:OSPINA_PREFERRED_PATH
+          try {
+            $env:USERPROFILE = Join-Path $fixture 'User'
+            $env:OSPINA_PREFERRED_PATH = 'C:\fixture\python;C:\fixture\node'
+            $codexSkill = Join-Path $env:USERPROFILE '.codex\skills\.hidden-fixture'
+            New-Item -ItemType Directory -Force -Path $codexSkill | Out-Null
+            (Get-Item -LiteralPath $codexSkill -Force).Attributes = `
+              (Get-Item -LiteralPath $codexSkill -Force).Attributes -bor `
+              [IO.FileAttributes]::Hidden
+            $preferredState = Join-Path $env:USERPROFILE '.ospina\preferred-path'
+            New-Item -ItemType Directory -Force -Path (Split-Path $preferredState -Parent) | Out-Null
+            Set-Content -LiteralPath $preferredState -Value 'C:\fixture\python' -Encoding ASCII
+            $powerShellProfile = Join-Path $env:USERPROFILE `
+              'Documents\WindowsPowerShell\Microsoft.PowerShell_profile.ps1'
+            New-Item -ItemType Directory -Force -Path (Split-Path $powerShellProfile -Parent) | Out-Null
+            Set-Content -LiteralPath $powerShellProfile `
+              -Value '# >>> ospina workstation PATH >>>' -Encoding ASCII
+            $output = (& powershell.exe -NoProfile -ExecutionPolicy Bypass `
+                         -File (Resolve-Path preflight.ps1) 2>&1 | Out-String)
+            foreach ($requiredDirty in @(
+              'agent skills \(\.codex\\skills\)',
+              'OSPINA_PREFERRED_PATH',
+              'preferred PATH state',
+              'shell profiles.*Microsoft\.PowerShell_profile\.ps1')) {
+              if ($output -notmatch "(?m)DIRTY\s+$requiredDirty") {
+                Write-Host "::error::preflight missed partial bootstrap state: $requiredDirty"
+                exit 1
+              }
+            }
+          } finally {
+            $env:USERPROFILE = $savedUserProfile
+            $env:OSPINA_PREFERRED_PATH = $savedPreferredPath
+            Remove-Item $fixture -Recurse -Force -ErrorAction SilentlyContinue
+          }
+          Write-Host "all partial bootstrap state invalidates the clean-account preflight"
 
       - name: Native stderr does not kill the script (regression)
         shell: powershell
@@ -115,10 +706,12 @@ jobs:
           $src = Get-Content install.ps1 -Raw
           $fail = 0
 
-          # npm on Windows resolves to npm.ps1, which the default Restricted
-          # execution policy refuses to run. It must be invoked through cmd.
-          if ($src -match "Invoke-Native npm ") {
-            Write-Host "::error::install.ps1 calls npm directly; use cmd /c npm so the execution policy does not block npm.ps1"
+          # npm.ps1 is blocked by the default execution policy, while cmd /c
+          # searches the current checkout first. Resolve the trusted .cmd by
+          # absolute path beside node.exe instead.
+          if ($src -match "cmd @\('/c','(npm|corepack)'" -or
+              $src -notmatch 'Get-NodeToolPath') {
+            Write-Host "::error::npm/corepack must use an absolute .cmd resolved from the active Node installation"
             $fail = 1
           }
 
@@ -165,6 +758,139 @@ jobs:
             Write-Host "::error::npm is gated on Have npm; use the functional Test-Npm check instead"
             $fail = 1
           } else { Write-Host "npm is checked functionally" }
+
+          # The machine baseline is contractual. These package IDs are the
+          # cross-platform capabilities that make T3 and artifact work usable.
+          foreach ($required in @('OpenJS.NodeJS.LTS','astral-sh.uv',
+                                   'oschwartz10612.Poppler',
+                                   'TheDocumentFoundation.LibreOffice',
+                                   'T3Tools.T3Code')) {
+            if ($src -notmatch [regex]::Escape($required)) {
+              Write-Host "::error::missing required package $required"
+              $fail = 1
+            }
+          }
+          if ($src -match 'api.github.com/repos/pingdotgg/t3code/releases/latest') {
+            Write-Host "::error::T3 Code must use its official winget package, not scrape latest release assets"
+            $fail = 1
+          }
+          $t3Detector = [regex]::Match(
+            $src, '(?s)function Test-T3Code.*?function Install-T3Code')
+          if (-not $t3Detector.Success -or
+              $t3Detector.Value -notmatch 'Get-ChildItem.*\.exe' -or
+              $t3Detector.Value -notmatch 't3code\.exe') {
+            Write-Host "::error::T3 Code detection must require an executable, not an empty install directory"
+            $fail = 1
+          }
+          if ($src -notmatch 'https://chatgpt.com/codex/install.ps1') {
+            Write-Host "::error::Codex must use OpenAI's official Windows installer"
+            $fail = 1
+          }
+          if ($src -notmatch '\$NodeVersion = ''24\.19\.0''') {
+            Write-Host "::error::Windows Node must stay pinned to the reviewed 24.x Winget version"
+            $fail = 1
+          }
+          $nodeResolverCalls = [regex]::Matches(
+            $src, 'if \(\$p\.Cmd -eq ''node''\) \{ \$null = Resolve-NodeToolchainPath \}')
+          if ($nodeResolverCalls.Count -lt 2) {
+            Write-Host "::error::both WinGet attempts must resolve portable Node before the generic required-tool failure"
+            $fail = 1
+          }
+          if ($src -notmatch 'Test-UvDefaultInstall' -or
+              $src -notmatch 'python install --default --preview-features') {
+            Write-Host "::error::the installer must reject uv without the exact default-Python preview capability"
+            $fail = 1
+          }
+          if ($src -notmatch "'python','install','3\.12','--default','--preview-features','python-install-default'") {
+            Write-Host "::error::the Windows installer must enable only uv's python-install-default preview feature"
+            $fail = 1
+          }
+          if ($src -notmatch 'function Invoke-VerifiedInstallerScript' -or
+              $src -notmatch 'ComputeHash\(\$installerStream\)' -or
+              $src -notmatch '\[IO\.FileShare\]::Read' -or
+              $src -notmatch '\$PSVersionTable\.PSEdition' -or
+              $src -notmatch '\-File \$Path' -or
+              $src -match 'Get-Content \$tempInstaller') {
+            Write-Host "::error::vendor installers must hash, lock and execute the same file in an isolated child"
+            $fail = 1
+          }
+          if ($src -notmatch 'GetRandomFileName\(\)') {
+            Write-Host "::error::vendor installer staging names must be unpredictable"
+            $fail = 1
+          }
+          $shellSrc = Get-Content install.sh -Raw
+          foreach ($digest in @(
+            '12479a24be3f5307eecac7cde670fad7118640f031229e964f544b1367b52a41',
+            '391f247de2c70c7e99041979ec02dae7e76be27ac9cfc1dfe7c1eb21d48d8b97',
+            'cd17c6b555f761d60373659824bf805e1510538226e4c7028e19d7494937a333',
+            '3a68d3406cf674e17bed1733a4dcf37805e2e47d87417700007d7e1aa766a944')) {
+            if ($src -notmatch $digest -and $shellSrc -notmatch $digest) {
+              Write-Host "::error::missing reviewed installer digest $digest"
+              $fail = 1
+            }
+          }
+          if ($src -match "Invoke-RestMethod\s+'https://claude\.ai/install\.ps1'") {
+            Write-Host "::error::Claude installer must be downloaded, digest-checked and only then executed"
+            $fail = 1
+          }
+          if ($shellSrc -match 'Homebrew/install/HEAD/install\.sh') {
+            Write-Host "::error::Homebrew installer must use a reviewed immutable revision"
+            $fail = 1
+          }
+          $wingetBuilders = [regex]::Matches(
+            $src, "(?s)(?:@\(|= @\()'(?:install|upgrade)'.{0,450}?\)")
+          foreach ($builder in $wingetBuilders) {
+            if ($builder.Value -match "--id" -and
+                $builder.Value -notmatch "'--source','winget'") {
+              Write-Host "::error::WinGet package arguments are not pinned to the reviewed winget source: $($builder.Value)"
+              $fail = 1
+            }
+          }
+          if ($src -match "Invoke-Native-Capture node @\('-p'" -or
+              $src -match "Invoke-Native-Capture python @\('-c'") {
+            Write-Host "::error::PowerShell 5.1 strips embedded quotes from native expression arguments; parse --version output instead"
+            $fail = 1
+          }
+          if ($src -notmatch '(?s)\$uvBin\s+-and\s+\(Test-Path\s+-LiteralPath\s+\$uvBin\s+-PathType\s+Container\)') {
+            Write-Host "::error::uv's reported Python bin path must be a real directory before PATH persistence"
+            $fail = 1
+          }
+
+          # An existing handbook must be clean official main at the just-fetched
+          # commit before handoff. A pull on an arbitrary branch or foreign
+          # origin can succeed while leaving an old shared manifest executable.
+          $handbookUpdate = [regex]::Match(
+            $src,
+            '(?s)if \(Test-Path \(Join-Path \$hb ''\.git''\)\).*?# -+ handoff')
+          if (-not $handbookUpdate.Success -or
+              $handbookUpdate.Value -notmatch '''remote'',''get-url'',''origin''' -or
+              $handbookUpdate.Value -notmatch '''symbolic-ref'',''--quiet'',''--short'',''HEAD''' -or
+              $handbookUpdate.Value -notmatch '''status'',''--porcelain''' -or
+              $handbookUpdate.Value -match '--untracked-files=no' -or
+              $handbookUpdate.Value -notmatch '''fetch'',''-q'',''origin'',''main''' -or
+              $handbookUpdate.Value -notmatch '''merge'',''-q'',''--ff-only'',\$handbookTarget' -or
+              $handbookUpdate.Value -notmatch '\$handbookHead -ne \$handbookTarget' -or
+              $handbookUpdate.Value -notmatch 'Die @"') {
+            Write-Host "::error::an unverified handbook checkout can reach the existing bootstrap"
+            $fail = 1
+          } else { Write-Host "handbook origin, branch, cleanliness and fetched head are verified before handoff" }
+          if ($handbookUpdate.Value -notmatch 'already exists but is not a Git checkout') {
+            Write-Host "::error::a non-git handbook path needs local-conflict guidance"
+            $fail = 1
+          }
+
+          $preflight = Get-Content preflight.ps1 -Raw
+          if ($preflight -notmatch 'Have-UsablePython') {
+            Write-Host "::error::preflight must distinguish Microsoft Store aliases from usable Python"
+            $fail = 1
+          }
+          foreach ($detector in @('Get-LibreOfficePath','Get-T3CodePath',
+                                   'Test-IsUserScopedTool','Test-StorePythonPackage')) {
+            if ($preflight -notmatch $detector) {
+              Write-Host "::error::preflight does not mirror installer detection through $detector"
+              $fail = 1
+            }
+          }
 
           # Every installer invocation must be visible. Hiding subprocess output
           # is what made a working install look like a hang on a bare machine.
@@ -259,6 +985,26 @@ jobs:
             Write-Host "$p -> $unix"
             if ($unix -notmatch '^/[a-z]/') { Write-Host "::error::bad conversion for $p"; exit 1 }
           }
+          $bash = Join-Path $env:ProgramFiles 'Git\bin\bash.exe'
+          $specialRoot = Join-Path $env:RUNNER_TEMP "Ospina O'Brien & partners"
+          New-Item -ItemType Directory -Force -Path $specialRoot | Out-Null
+          Set-Content -Path (Join-Path $specialRoot 'bootstrap.sh') -Value 'exit 0'
+          $specialFull = (Resolve-Path $specialRoot).Path
+          $specialDrive = $specialFull.Substring(0,1).ToLower()
+          $specialRest = $specialFull.Substring(2) -replace '\\','/'
+          $specialUnix = "/$specialDrive$specialRest"
+          & $bash "$specialUnix/bootstrap.sh"
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "::error::Git Bash could not run the special workspace path as a native argument"
+            exit 1
+          }
+          $source = Get-Content install.ps1 -Raw
+          if ($source -notmatch '\$hbScriptUnix\s*=\s*"\$hbUnix/bootstrap\.sh"' -or
+              $source -notmatch 'Invoke-Native \$bash @\(\$hbScriptUnix,''--no-login''\)' -or
+              $source.Contains("Invoke-Native `$bash @('-lc'")) {
+            Write-Host "::error::the installer does not pass the handbook script as a native Bash argument"
+            exit 1
+          }
 
       - name: bootstrap.sh Windows branch runs under Git Bash
         shell: powershell
@@ -282,7 +1028,7 @@ jobs:
   posix:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - name: Shellcheck + POSIX syntax
@@ -294,6 +1040,167 @@ jobs:
             echo "::error::an installer above hides its output; let it stream"
             exit 1
           fi
+          if grep -nF '$$' install.sh; then
+            echo "::error::temporary files must not use predictable process-ID names"
+            exit 1
+          fi
+          handbook_update_block=$(sed -n \
+            '/^if \[ -d "$WS\/handbook\/\.git" \]; then$/,/^else$/p' install.sh)
+          for required in \
+            'remote get-url origin' \
+            'symbolic-ref --quiet --short HEAD' \
+            'status --porcelain' \
+            'fetch -q origin main' \
+            'merge -q --ff-only "$_handbook_target"' \
+            '[ "$_handbook_head" = "$_handbook_target" ]'; do
+            if ! printf '%s\n' "$handbook_update_block" | grep -Fq "$required"; then
+              echo "::error::existing handbook verification is missing: $required"
+              exit 1
+            fi
+          done
+          if printf '%s\n' "$handbook_update_block" | grep -Fq -- '--untracked-files=no'; then
+            echo "::error::untracked handbook content must invalidate the executable checkout"
+            exit 1
+          fi
+          if ! grep -Fq 'already exists but is not a Git checkout' install.sh; then
+            echo "::error::a non-git handbook path needs local-conflict guidance"
+            exit 1
+          fi
+          if ! sed -n '/^have_t3()/,/^}/p' install.sh | grep -Fq 'Contents/MacOS'; then
+            echo "::error::T3 Code detection must require an executable, not an empty app directory"
+            exit 1
+          fi
+          echo "handbook origin, branch, cleanliness and fetched head are verified before handoff"
           echo "all installers in install.sh stream their output"
+          eval "$(sed -n '/^install_codex()/,/^}/p' install.sh)"
+          have() { command -v "$1" >/dev/null 2>&1; }
+          brew() { echo "::error::Linux Codex attempted the macOS cask"; exit 1; }
+          npm_marker="$RUNNER_TEMP/codex-npm-called"
+          npm() {
+            if [ "$*" != 'install -g @openai/codex' ]; then
+              echo "::error::Linux Codex used unexpected npm arguments: $*"
+              return 1
+            fi
+            : > "$npm_marker"
+          }
+          PLATFORM=linux
+          install_codex
+          if [ ! -f "$npm_marker" ]; then
+            echo "::error::Linux Codex did not install through npm"
+            exit 1
+          fi
+          rm -f "$npm_marker"
+          unset -f brew npm
+          echo "Linux Codex uses npm even when Linuxbrew is present"
           sudo apt-get update -qq && sudo apt-get install -y shellcheck -qq
-          shellcheck -S warning install.sh || true
+          shellcheck -S warning install.sh
+
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Parse and guard the actual macOS path
+        shell: bash
+        run: |
+          bash -n install.sh
+          for required in 'node@24' 'corepack enable' 'uv python install 3.12' \
+                          'uv python install 3.12 --default --preview-features python-install-default' \
+                          'brew install --cask libreoffice' 'pdftotext' \
+                          'if [ "$PLATFORM" = mac ] && have brew; then brew install --cask codex' \
+                          'brew install --cask t3-code' \
+                          '/bin/bash "$_hb" </dev/tty' \
+                          'persist_path_front "$_brew_bin"' \
+                          'brew_bin_path node@24'; do
+            if ! grep -Fq "$required" install.sh; then
+              echo "::error::macOS installer is missing required baseline: $required"
+              exit 1
+            fi
+          done
+          libreoffice_block=$(awk '
+            /^  if \[ -x \/Applications\/LibreOffice\.app\/Contents\/MacOS\/soffice \]; then$/ { inside=1 }
+            inside { print }
+            inside && /^  fi$/ { exit }
+          ' install.sh)
+          if ! printf '%s\n' "$libreoffice_block" |
+               grep -Fq 'persist_path_front "$HOME/.local/bin"'; then
+            echo "::error::the LibreOffice block does not persist soffice for new shells"
+            exit 1
+          fi
+          if grep -Fq 'die "Could not install LibreOffice' install.sh ||
+             grep -Fq 'have soffice || die' install.sh; then
+            echo "::error::LibreOffice remains a fatal optional capability"
+            exit 1
+          fi
+          if grep -nE '(brew install|npm install -g)[^|]*>/dev/null' install.sh; then
+            echo "::error::an installer above hides its output; let it stream"
+            exit 1
+          fi
+          if grep -nF '$$' install.sh; then
+            echo "::error::temporary files must not use predictable process-ID names"
+            exit 1
+          fi
+
+      - name: macOS prerequisite and uv capability behavior
+        shell: bash
+        run: |
+          set -euo pipefail
+          eval "$(sed -n '/^add_path()/,/^}/p' install.sh)"
+          eval "$(sed -n '/^persist_path_front()/,/^}/p' install.sh)"
+          eval "$(sed -n '/^brew_bin_path()/,/^}/p' install.sh)"
+          eval "$(sed -n '/^can_install_homebrew()/,/^}/p' install.sh)"
+          eval "$(sed -n '/^uv_supports_default()/,/^}/p' install.sh)"
+          have() { command -v "$1" >/dev/null 2>&1; }
+          old_bin="$RUNNER_TEMP/ospina-mocks-old"
+          new_bin="$RUNNER_TEMP/ospina-mocks-new"
+          mkdir -p "$old_bin" "$new_bin"
+          printf '#!/bin/sh\nprintf "staff\\n"\n' > "$old_bin/groups"
+          printf '#!/bin/sh\ncase "${MOCK_DS_ADMIN:-0}" in 1) printf "yes fixture is a member of admin\\n";; *) printf "no fixture is NOT a member of admin\\n";; esac\n' > "$old_bin/dseditgroup"
+          printf '#!/bin/sh\ncase "$*" in "python install --default --preview-features python-install-default --help") exit 0;; "python install ospina-capability-probe-invalid --default --preview-features python-install-default --offline --no-python-downloads") printf "warning: Pass --preview-features python-install-default to disable this warning\\n" >&2; exit 2;; *) exit 2;; esac\n' > "$old_bin/uv"
+          printf '#!/bin/sh\ncase "$*" in "python install --default --preview-features python-install-default --help") exit 0;; "python install ospina-capability-probe-invalid --default --preview-features python-install-default --offline --no-python-downloads") printf "error: invalid Python request\\n" >&2; exit 2;; *) exit 2;; esac\n' > "$new_bin/uv"
+          chmod +x "$old_bin/groups" "$old_bin/dseditgroup" "$old_bin/uv" "$new_bin/uv"
+          PATH="$old_bin:$new_bin:$PATH"
+
+          mock_prefix="$RUNNER_TEMP/mock-brew-prefix"
+          mkdir -p "$mock_prefix/bin"
+          brew() { printf '%s\n' "$mock_prefix"; }
+          [ "$(brew_bin_path node@24)" = "$mock_prefix/bin" ]
+          brew() { return 1; }
+          if brew_bin_path node@24 >/dev/null; then
+            echo "::error::failed brew prefix lookup was accepted as /bin"
+            exit 1
+          fi
+          unset -f brew
+
+          if can_install_homebrew; then
+            echo "::error::a simulated non-admin account was allowed into Homebrew installation"
+            exit 1
+          fi
+          MOCK_DS_ADMIN=1; export MOCK_DS_ADMIN
+          can_install_homebrew
+          MOCK_DS_ADMIN=0; export MOCK_DS_ADMIN
+          if uv_supports_default; then
+            echo "::error::old uv simulation was accepted"
+            exit 1
+          fi
+          add_path "$new_bin"
+          HOME="$RUNNER_TEMP/ospina-home"
+          export HOME
+          mkdir -p "$HOME"
+          printf 'profile sentinel\n' > "$HOME/.profile"
+          # Simulate the legacy installer suppressing .profile with a file that
+          # contains only Ospina's own PATH lines. A rerun must remove our file.
+          printf '\n# Ospina workstation PATH\nexport PATH=/legacy/bin:$PATH\n' > "$HOME/.bash_profile"
+          persist_path_front "$new_bin"
+          brew_bin=$(dirname "$(command -v brew)")
+          persist_path_front "$brew_bin"
+          uv_supports_default
+          [ "$(command -v uv)" = "$new_bin/uv" ]
+          resolved=$(PATH="$old_bin:$PATH" zsh -l -c 'command -v uv')
+          [ "$resolved" = "$new_bin/uv" ]
+          resolved_brew=$(PATH=/usr/bin:/bin zsh -l -c 'command -v brew')
+          [ "$resolved_brew" = "$brew_bin/brew" ]
+          [ ! -e "$HOME/.bash_profile" ]
+          grep -Fq 'profile sentinel' "$HOME/.profile"
+          echo "Homebrew and competing-old-uv recovery persist in a new login shell"

@@ -2,9 +2,9 @@
 #
 #   irm https://raw.githubusercontent.com/ospina-company/.github/main/install.ps1 | iex
 #
-# Installs Git, GitHub CLI and Vale via winget, signs you in to GitHub, clones
-# the handbook, and hands off to handbook/bootstrap.sh running under the Git
-# Bash that Git for Windows installs.
+# Installs the workstation baseline via winget (Git, Node 24, Python 3.12 and
+# document tools), signs you in to GitHub, clones the handbook, and hands off
+# to handbook/bootstrap.sh under the Git Bash that Git for Windows installs.
 #
 # Read before running. Safe to re-run: every step checks before it acts.
 
@@ -57,6 +57,46 @@ function Get-RemoteFile {
   } finally { $ProgressPreference = $prev }
 }
 
+function Invoke-VerifiedInstallerScript {
+  # Hold the file open without write/delete sharing from hashing until the
+  # child exits. The child reads the same immutable file object we authenticated,
+  # while its own PowerShell process contains any vendor `exit` statements.
+  param(
+    [Parameter(Mandatory)][string]$Path,
+    [Parameter(Mandatory)][string]$ExpectedDigest,
+    [Parameter(Mandatory)][string]$Label
+  )
+  $installerStream = [IO.File]::Open(
+    $Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
+  try {
+    $sha256 = [Security.Cryptography.SHA256]::Create()
+    try {
+      $actual = ([BitConverter]::ToString(
+        $sha256.ComputeHash($installerStream))).Replace('-','').ToLowerInvariant()
+    } finally { $sha256.Dispose() }
+    if ($actual -ne $ExpectedDigest) {
+      throw "$Label digest changed; Platform must review the new installer"
+    }
+
+    $powerShellName = if ($PSVersionTable.PSEdition -eq 'Core') {
+      'pwsh.exe'
+    } else {
+      'powershell.exe'
+    }
+    $powershell = Join-Path $PSHOME $powerShellName
+    if (-not (Test-Path $powershell -PathType Leaf)) {
+      throw "$Label cannot run because the current PowerShell executable was not found"
+    }
+    $prev = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+      & $powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass `
+        -File $Path 2>&1 | Out-Host
+      return $LASTEXITCODE
+    } finally { $ErrorActionPreference = $prev }
+  } finally { $installerStream.Dispose() }
+}
+
 function Invoke-Native-Capture {
   # Same stderr problem, but we want stdout back as a string.
   param([Parameter(Mandatory)][string] $Exe, [string[]] $Arguments = @())
@@ -86,14 +126,18 @@ function Invoke-Native {
 }
 
 function Refresh-Path {
+  param(
+    [string]$MachinePath = [Environment]::GetEnvironmentVariable('Path','Machine'),
+    [string]$UserPath = [Environment]::GetEnvironmentVariable('Path','User')
+  )
   # Merge, do not replace. A tool that added itself to this process's PATH only
   # would otherwise disappear the moment we rebuild from the registry.
   # winget writes the new PATH to the registry; this session still holds the old
   # one. Rebuild from Machine + User so freshly installed tools are callable now
-  # instead of only after a restart.
-  $machine = [Environment]::GetEnvironmentVariable('Path','Machine')
-  $user    = [Environment]::GetEnvironmentVariable('Path','User')
-  $merged = @($machine, $user, $env:Path) | Where-Object { $_ } |
+  # instead of only after a restart. Keep the current process first: helpers may
+  # already have promoted a capability-verified user tool over an obsolete
+  # machine-scoped copy, and a later refresh must not undo that repair.
+  $merged = @($env:Path, $UserPath, $MachinePath) | Where-Object { $_ } |
             ForEach-Object { $_ -split ';' } | Where-Object { $_ } |
             Select-Object -Unique
   $env:Path = ($merged -join ';')
@@ -140,43 +184,234 @@ function Ask-YesNo ($question) {
   return ([string]::IsNullOrWhiteSpace($a) -or $a -match '^[Yy]')
 }
 function Test-Npm {
-  # Get-Command finding npm proves a file exists, not that npm runs. On the
-  # default Restricted execution policy, npm resolves to npm.ps1 and PowerShell
-  # refuses to execute it, so npm is present and unusable at the same time.
-  # Ask cmd, which is the path we would actually install through.
-  if (-not (Have npm)) { return $false }
-  return (Invoke-Native cmd @('/c','npm','--version')) -eq 0
+  # Get-Command finding npm proves a file exists, not that npm runs. Resolve the
+  # .cmd next to the active Node installation so the default Restricted policy
+  # cannot select npm.ps1 and cmd.exe cannot select a file in the current repo.
+  $npm = Get-NodeToolPath 'npm'
+  if (-not $npm) { return $false }
+  return (Invoke-Native $npm @('--version')) -eq 0
 }
-function Install-CodexBinary {
-  # Codex publishes a standalone executable per architecture, which removes the
-  # Node and execution-policy dependency entirely.
-  try {
-    $arch = if ($env:PROCESSOR_ARCHITECTURE -eq 'ARM64') { 'aarch64' } else { 'x86_64' }
-    $want = "codex-$arch-pc-windows-msvc.exe"
-    Say "          finding the latest Codex release..."
-    $rel = Invoke-RestMethod 'https://api.github.com/repos/openai/codex/releases/latest' `
-                             -Headers @{ 'User-Agent' = 'ospina-installer' }
-    $asset = $rel.assets | Where-Object { $_.name -eq $want } | Select-Object -First 1
-    if (-not $asset) { throw "no $want in the latest release" }
-
-    $dir = Join-Path $env:LOCALAPPDATA 'Programs\codex'
-    New-Item -ItemType Directory -Force -Path $dir | Out-Null
-    $dest = Join-Path $dir 'codex.exe'
-    Get-RemoteFile -Uri $asset.browser_download_url -OutFile $dest `
-                   -Label $want -SizeMB ([int]($asset.size/1MB))
-
-    # Put it on PATH for this account and for this session.
-    $userPath = [Environment]::GetEnvironmentVariable('Path','User')
-    if (($userPath -split ';') -notcontains $dir) {
-      [Environment]::SetEnvironmentVariable('Path', (($userPath.TrimEnd(';') + ';' + $dir).TrimStart(';')), 'User')
-      Say "          added $dir to your PATH"
+function Get-NodeMajor {
+  $version = Invoke-Native-Capture node @('--version')
+  if ($version -match '^v?([0-9]+)\.') { return $Matches[1] }
+  return $null
+}
+function Get-PythonMinor {
+  $version = Invoke-Native-Capture python @('--version')
+  if ($version -match '^Python\s+([0-9]+\.[0-9]+)\.') { return $Matches[1] }
+  return $null
+}
+function Get-NodeToolDirectories {
+  # Do not ask cmd.exe to find npm/corepack: cmd searches the current working
+  # directory before PATH, so running setup from a checkout containing npm.cmd
+  # would execute repository code. Derive tools from the active node.exe and
+  # WinGet's per-user portable-package directory instead.
+  $dirs = @()
+  $node = Get-Command node.exe -CommandType Application -ErrorAction SilentlyContinue |
+          Select-Object -First 1
+  if ($node -and $node.Source) {
+    $dirs += (Split-Path $node.Source -Parent)
+    try {
+      $item = Get-Item $node.Source -Force -ErrorAction Stop
+      foreach ($target in @($item.Target)) {
+        if (-not $target) { continue }
+        $resolvedTarget = $target
+        if (-not [IO.Path]::IsPathRooted($resolvedTarget)) {
+          $resolvedTarget = Join-Path (Split-Path $node.Source -Parent) $resolvedTarget
+        }
+        $resolvedTarget = [IO.Path]::GetFullPath($resolvedTarget)
+        $dirs += (Split-Path $resolvedTarget -Parent)
+      }
+    } catch { }
+  }
+  $wingetPackages = Join-Path $env:LOCALAPPDATA 'Microsoft\WinGet\Packages'
+  if (Test-Path $wingetPackages) {
+    Get-ChildItem $wingetPackages -Directory -Filter 'OpenJS.NodeJS.LTS_*' `
+      -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending |
+      ForEach-Object {
+        # The non-admin WinGet fallback is a portable archive. Its package root
+        # contains node-v24.x-win-<arch>\node.exe rather than node.exe directly.
+        # Find only directories that carry both Node and its matching npm shim.
+        Get-ChildItem $_.FullName -File -Filter 'node.exe' -Recurse `
+          -ErrorAction SilentlyContinue | ForEach-Object {
+            $candidateDir = Split-Path $_.FullName -Parent
+            if (Test-Path (Join-Path $candidateDir 'npm.cmd')) {
+              $dirs += $candidateDir
+            }
+          }
+      }
+  }
+  return @($dirs | Where-Object { $_ } | Select-Object -Unique)
+}
+function Get-NodeToolPath ($Name) {
+  foreach ($dir in (Get-NodeToolDirectories)) {
+    $candidate = Join-Path $dir ($Name + '.cmd')
+    if (Test-Path $candidate) { return $candidate }
+  }
+  return $null
+}
+function Resolve-NodeToolchainPath {
+  foreach ($dir in (Get-NodeToolDirectories)) {
+    $nodeExe = Join-Path $dir 'node.exe'
+    $npmCmd = Join-Path $dir 'npm.cmd'
+    if ((Test-Path $nodeExe) -and (Test-Path $npmCmd)) {
+      $version = Invoke-Native-Capture $nodeExe @('--version')
+      if ($version -notmatch '^v?24\.') { continue }
+      Add-UserPathEntry $dir
+      return $true
     }
-    $env:Path = "$env:Path;$dir"
+  }
+  return $false
+}
+function Invoke-NodeToolCapture ($Name, [string[]] $Arguments = @()) {
+  $tool = Get-NodeToolPath $Name
+  if (-not $tool) { return $null }
+  return (Invoke-Native-Capture $tool $Arguments)
+}
+function Get-CorepackPath {
+  $tool = Get-NodeToolPath 'corepack'
+  if ($tool) { return $tool }
+
+  # A per-user `npm install -g corepack` writes its command shim to npm's
+  # global prefix, which need not be beside node.exe or inside WinGet's package
+  # directory. Resolve npm itself by trusted absolute path, then inspect only
+  # the prefix npm reports.
+  $prefix = Invoke-NodeToolCapture 'npm' @('prefix','-g')
+  if ($prefix) {
+    $candidate = Join-Path $prefix 'corepack.cmd'
+    if (Test-Path $candidate) { return $candidate }
+  }
+  return $null
+}
+function Test-UvDefaultInstall ([string] $UvExe = 'uv') {
+  if ($UvExe -eq 'uv' -and -not (Have uv)) { return $false }
+  if ($UvExe -ne 'uv' -and -not (Test-Path $UvExe)) { return $false }
+  # clap exits successfully on --help before it validates preview-feature names.
+  # Follow the help check with a real parse against an impossible directory.
+  # The temporary file makes that directory impossible and prevents any Python
+  # download or user-state change.
+  $prev = $ErrorActionPreference
+  $probeFile = $null
+  $hadInstallDir = Test-Path Env:\UV_PYTHON_INSTALL_DIR
+  $hadBinDir = Test-Path Env:\UV_PYTHON_BIN_DIR
+  $previousInstallDir = if ($hadInstallDir) { $env:UV_PYTHON_INSTALL_DIR } else { $null }
+  $previousBinDir = if ($hadBinDir) { $env:UV_PYTHON_BIN_DIR } else { $null }
+  $ErrorActionPreference = 'Continue'
+  try {
+    & $UvExe python install --default --preview-features `
+      python-install-default --help *> $null
+    if ($LASTEXITCODE -ne 0) { return $false }
+
+    $probeFile = [IO.Path]::GetTempFileName()
+    $env:UV_PYTHON_INSTALL_DIR = Join-Path $probeFile 'install'
+    $env:UV_PYTHON_BIN_DIR = Join-Path $probeFile 'bin'
+    $probeOutput = (& $UvExe python install ospina-capability-probe-invalid `
+      --default --preview-features python-install-default --offline `
+      --no-python-downloads 2>&1 | Out-String)
+    $probeRc = $LASTEXITCODE
+    return ($probeRc -ne 0 -and
+            $probeOutput -notmatch '(?i)preview-features|python-install-default')
+  } catch {
+    return $false
+  } finally {
+    if ($hadInstallDir) { $env:UV_PYTHON_INSTALL_DIR = $previousInstallDir }
+    else { Remove-Item Env:\UV_PYTHON_INSTALL_DIR -ErrorAction SilentlyContinue }
+    if ($hadBinDir) { $env:UV_PYTHON_BIN_DIR = $previousBinDir }
+    else { Remove-Item Env:\UV_PYTHON_BIN_DIR -ErrorAction SilentlyContinue }
+    if ($probeFile) { Remove-Item $probeFile -Force -ErrorAction SilentlyContinue }
+    $ErrorActionPreference = $prev
+  }
+}
+function Get-UvCandidatePaths {
+  $paths = @()
+  $active = Get-Command uv.exe -CommandType Application -ErrorAction SilentlyContinue |
+            Select-Object -First 1
+  if ($active -and $active.Source) { $paths += $active.Source }
+  if ($env:USERPROFILE) { $paths += (Join-Path $env:USERPROFILE '.local\bin\uv.exe') }
+  if ($env:LOCALAPPDATA) {
+    $packages = Join-Path $env:LOCALAPPDATA 'Microsoft\WinGet\Packages'
+    if (Test-Path $packages) {
+      Get-ChildItem $packages -Directory -Filter 'astral-sh.uv_*' -ErrorAction SilentlyContinue |
+        Sort-Object LastWriteTime -Descending | ForEach-Object {
+          $candidate = Get-ChildItem $_.FullName -File -Filter 'uv.exe' -Recurse `
+                         -ErrorAction SilentlyContinue | Select-Object -First 1
+          if ($candidate) { $paths += $candidate.FullName }
+        }
+    }
+  }
+  return @($paths | Where-Object { $_ -and (Test-Path $_) } | Select-Object -Unique)
+}
+function Resolve-UvOnPath {
+  foreach ($candidate in (Get-UvCandidatePaths)) {
+    if (Test-UvDefaultInstall $candidate) {
+      Add-UserPathEntry (Split-Path $candidate -Parent)
+      return $true
+    }
+  }
+  return $false
+}
+function Install-CodexOfficial {
+  # Keep vendor installation logic with OpenAI. Their supported PowerShell
+  # installer selects the right Windows architecture and install location.
+  $tempInstaller = $null
+  try {
+    Say "          running OpenAI's official Codex installer..."
+    # Reviewed on 2026-08-31. The official endpoint is mutable, so authenticate
+    # the content before executing it and fail closed on an upstream change.
+    $expectedCodexDigest = '391f247de2c70c7e99041979ec02dae7e76be27ac9cfc1dfe7c1eb21d48d8b97'
+    $tempInstaller = Join-Path ([IO.Path]::GetTempPath()) `
+      ("ospina-codex-install-{0}.ps1" -f [IO.Path]::GetRandomFileName())
+    Get-RemoteFile -Uri 'https://chatgpt.com/codex/install.ps1' -OutFile $tempInstaller `
+                   -Label 'OpenAI Codex installer'
+    $rc = Invoke-VerifiedInstallerScript -Path $tempInstaller `
+      -ExpectedDigest $expectedCodexDigest -Label 'OpenAI Codex installer'
+    if ($rc -ne 0) { throw "OpenAI Codex installer exited with code $rc" }
+    Refresh-Path
+    $null = Resolve-OnPath -Command 'codex' -Directories @(
+      (Join-Path $env:USERPROFILE '.local\bin'),
+      (Join-Path $env:USERPROFILE '.codex\bin')
+    )
     return $true
   } catch {
-    Say ("          standalone install failed: {0}" -f $_.Exception.Message)
-    Say  "          Install manually: https://github.com/openai/codex/releases/latest"
+    Say ("          official install failed: {0}" -f $_.Exception.Message)
+    Say  "          Install manually: https://learn.chatgpt.com/docs/codex/cli"
     return $false
+  } finally {
+    if ($tempInstaller -and (Test-Path $tempInstaller)) {
+      Remove-Item $tempInstaller -Force -ErrorAction SilentlyContinue
+    }
+  }
+}
+function Install-ClaudeOfficial {
+  # Use the native installer so T3 Code can call Claude's native updater. A
+  # WinGet-managed install lands outside that update path.
+  $tempInstaller = $null
+  try {
+    Say "          running Anthropic's official native installer..."
+    # Reviewed on 2026-09-04. The endpoint is mutable, so authenticate the
+    # downloaded bytes before executing them and fail closed on a change.
+    $expectedClaudeDigest = 'cd17c6b555f761d60373659824bf805e1510538226e4c7028e19d7494937a333'
+    $tempInstaller = Join-Path ([IO.Path]::GetTempPath()) `
+      ("ospina-claude-install-{0}.ps1" -f [IO.Path]::GetRandomFileName())
+    Get-RemoteFile -Uri 'https://claude.ai/install.ps1' -OutFile $tempInstaller `
+                   -Label 'Anthropic Claude installer'
+    $rc = Invoke-VerifiedInstallerScript -Path $tempInstaller `
+      -ExpectedDigest $expectedClaudeDigest -Label 'Anthropic Claude installer'
+    if ($rc -ne 0) { throw "Anthropic Claude installer exited with code $rc" }
+    Refresh-Path
+    $null = Resolve-OnPath -Command 'claude' -Directories @(
+      (Join-Path $env:USERPROFILE '.local\bin')
+    )
+    return (Test-Claude)
+  } catch {
+    Say ("          native install failed: {0}" -f $_.Exception.Message)
+    Say  "          Fallback: winget install Anthropic.ClaudeCode"
+    Say  "          (note: a winget install cannot be updated from T3 Code)"
+    return $false
+  } finally {
+    if ($tempInstaller -and (Test-Path $tempInstaller)) {
+      Remove-Item $tempInstaller -Force -ErrorAction SilentlyContinue
+    }
   }
 }
 function Resolve-OnPath {
@@ -214,24 +449,273 @@ function Test-Claude {
 }
 function Add-UserPathEntry {
   param([Parameter(Mandatory)][string]$Dir)
-  $userPath = [Environment]::GetEnvironmentVariable('Path','User')
-  if (($userPath -split ';') -notcontains $Dir) {
-    [Environment]::SetEnvironmentVariable('Path', (($userPath.TrimEnd(';') + ';' + $Dir).TrimStart(';')), 'User')
+  # Read and write the raw registry value so an employee's REG_EXPAND_SZ Path
+  # retains both its value kind and expressions such as %USERPROFILE%.
+  $userEnvironmentKey = [Microsoft.Win32.Registry]::CurrentUser.CreateSubKey('Environment')
+  if (-not $userEnvironmentKey) { Die 'The current-user Environment registry key is unavailable.' }
+  try {
+    $pathExists = $userEnvironmentKey.GetValueNames() -contains 'Path'
+    $userPathKind = if ($pathExists) {
+      $userEnvironmentKey.GetValueKind('Path')
+    } else { [Microsoft.Win32.RegistryValueKind]::String }
+    if ($userPathKind -notin @([Microsoft.Win32.RegistryValueKind]::String,
+                               [Microsoft.Win32.RegistryValueKind]::ExpandString)) {
+      Die "The current-user Path has unsupported registry kind '$userPathKind'. Ask your device administrator to repair it, then re-run."
+    }
+    $userPath = if ($pathExists) {
+      [string]$userEnvironmentKey.GetValue(
+        'Path', $null, [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+    } else { '' }
+    $userParts = @($userPath -split ';' | Where-Object {
+      $_ -and -not [string]::Equals($_, $Dir, [StringComparison]::OrdinalIgnoreCase)
+    })
+    $userEnvironmentKey.SetValue(
+      'Path', ((@($Dir) + $userParts) -join ';'), $userPathKind)
+  } finally {
+    $userEnvironmentKey.Dispose()
   }
-  if (($env:Path -split ';') -notcontains $Dir) { $env:Path = "$env:Path;$Dir" }
+
+  # Windows creates a new process PATH as machine entries followed by user
+  # entries. A per-user Node/Python/uv install therefore cannot outrank an old
+  # machine-scoped copy through HKCU\Environment\Path alone. Keep a separate
+  # reviewed list and have the two shells used by T3 Code promote it at startup.
+  $preferredPath = [Environment]::GetEnvironmentVariable('OSPINA_PREFERRED_PATH','User')
+  $preferredParts = @($preferredPath -split ';' | Where-Object {
+    $_ -and -not [string]::Equals($_, $Dir, [StringComparison]::OrdinalIgnoreCase)
+  })
+  $preferredPath = ((@($Dir) + $preferredParts) -join ';')
+  [Environment]::SetEnvironmentVariable('OSPINA_PREFERRED_PATH', $preferredPath, 'User')
+  $env:OSPINA_PREFERRED_PATH = $preferredPath
+  $stateDir = Join-Path $env:USERPROFILE '.ospina'
+  New-Item -ItemType Directory -Force -Path $stateDir | Out-Null
+  [IO.File]::WriteAllText((Join-Path $stateDir 'preferred-path'), $preferredPath,
+                          (New-Object Text.UTF8Encoding($false)))
+  Install-OspinaPathProfiles
+
+  $processParts = @($env:Path -split ';' | Where-Object {
+    $_ -and -not [string]::Equals($_, $Dir, [StringComparison]::OrdinalIgnoreCase)
+  })
+  $env:Path = ((@($Dir) + $processParts) -join ';')
+}
+function Find-ByteSequence {
+  param(
+    [byte[]]$Bytes,
+    [byte[]]$Needle,
+    [int]$StartAt = 0,
+    [ValidateRange(1, 2)][int]$Alignment = 1,
+    [int]$AlignmentOffset = 0
+  )
+  if (-not $Bytes -or -not $Needle -or $Needle.Length -gt $Bytes.Length) { return -1 }
+  for ($i = [Math]::Max(0, $StartAt); $i -le $Bytes.Length - $Needle.Length; $i++) {
+    if ((($i - $AlignmentOffset) % $Alignment) -ne 0) { continue }
+    $matched = $true
+    for ($j = 0; $j -lt $Needle.Length; $j++) {
+      if ($Bytes[$i + $j] -ne $Needle[$j]) { $matched = $false; break }
+    }
+    if ($matched) { return $i }
+  }
+  return -1
+}
+function Add-OspinaProfileBlock {
+  param(
+    [Parameter(Mandatory)][string]$Path,
+    [Parameter(Mandatory)][string]$Start,
+    [Parameter(Mandatory)][string]$End,
+    [Parameter(Mandatory)][string]$Block,
+    [switch]$PowerShellProfile
+  )
+  $parent = Split-Path $Path -Parent
+  if ($parent) { New-Item -ItemType Directory -Force -Path $parent | Out-Null }
+
+  # Never decode and rewrite an employee's profile: doing so can change its
+  # encoding, line endings, BOM, or non-ASCII text. Detect the existing encoding
+  # only so the ASCII block is appended in the same representation.
+  $bytes = if (Test-Path $Path) { [IO.File]::ReadAllBytes($Path) } else { [byte[]]@() }
+  $encoding = $null
+  $preambleLength = 0
+  if ($bytes.Length -ge 3 -and $bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF) {
+    $encoding = New-Object Text.UTF8Encoding($true); $preambleLength = 3
+  } elseif ($bytes.Length -ge 2 -and $bytes[0] -eq 0xFF -and $bytes[1] -eq 0xFE) {
+    $encoding = [Text.Encoding]::Unicode; $preambleLength = 2
+  } elseif ($bytes.Length -ge 2 -and $bytes[0] -eq 0xFE -and $bytes[1] -eq 0xFF) {
+    $encoding = [Text.Encoding]::BigEndianUnicode; $preambleLength = 2
+  } elseif ($PowerShellProfile -and $bytes.Length -eq 0) {
+    # Windows PowerShell 5.1 needs a BOM to identify UTF-8 reliably.
+    $encoding = New-Object Text.UTF8Encoding($true)
+  } elseif ($PowerShellProfile) {
+    # A BOM-less Windows PowerShell 5.1 profile uses the active ANSI code page.
+    $encoding = [Text.Encoding]::Default
+  } else {
+    $encoding = New-Object Text.UTF8Encoding($false)
+  }
+  $searchAlignment = if ($encoding.CodePage -in @(1200, 1201)) { 2 } else { 1 }
+
+  $existingText = if ($bytes.Length -gt $preambleLength) {
+    $encoding.GetString($bytes, $preambleLength, $bytes.Length - $preambleLength)
+  } else { '' }
+  $blockBytes = $encoding.GetBytes($Block.Trim())
+  if ((Find-ByteSequence -Bytes $bytes -Needle $blockBytes -StartAt $preambleLength `
+                         -Alignment $searchAlignment -AlignmentOffset $preambleLength) -ge 0) {
+    return
+  }
+
+  if ($PowerShellProfile -and (Test-Path $Path)) {
+    try {
+      $signature = Get-AuthenticodeSignature -FilePath $Path -ErrorAction Stop
+    } catch {
+      Say ("  note     The PowerShell signature on '{0}' could not be checked safely." -f $Path)
+      Say  "           Ask your device administrator to add OSPINA_PREFERRED_PATH at the start of PATH."
+      return
+    }
+    if (-not $signature -or [string]$signature.Status -ne 'NotSigned') {
+      Say ("  note     The signed PowerShell profile '{0}' was not changed." -f $Path)
+      Say  "           Ask your device administrator to add OSPINA_PREFERRED_PATH at the start of PATH."
+      return
+    }
+  }
+
+  $startBytes = $encoding.GetBytes($Start)
+  $endBytes = $encoding.GetBytes($End)
+  $startIndex = Find-ByteSequence -Bytes $bytes -Needle $startBytes -StartAt $preambleLength `
+                                  -Alignment $searchAlignment -AlignmentOffset $preambleLength
+  $endIndex = if ($startIndex -ge 0) {
+    Find-ByteSequence -Bytes $bytes -Needle $endBytes `
+                      -StartAt ($startIndex + $startBytes.Length) `
+                      -Alignment $searchAlignment -AlignmentOffset $preambleLength
+  } else { -1 }
+  if ($startIndex -ge 0 -and $endIndex -lt 0) {
+    Die "The managed Ospina block in '$Path' is incomplete. Restore its closing marker, then re-run."
+  }
+
+  $managedBytes = $encoding.GetBytes($Block.Trim() + "`n")
+  if ($startIndex -ge 0) {
+    # Replace only the bytes between Ospina's markers. Every user-owned byte
+    # before and after the managed block remains byte-for-byte identical.
+    $afterIndex = $endIndex + $endBytes.Length
+    $before = if ($startIndex -gt 0) { [byte[]]$bytes[0..($startIndex - 1)] } else { [byte[]]@() }
+    $after = if ($afterIndex -lt $bytes.Length) {
+      [byte[]]$bytes[$afterIndex..($bytes.Length - 1)]
+    } else { [byte[]]@() }
+    $combined = [byte[]]@($before + $managedBytes + $after)
+    [IO.File]::WriteAllBytes($Path, $combined)
+    return
+  }
+
+  $prefix = if ($existingText -and -not $existingText.EndsWith("`n") -and
+                -not $existingText.EndsWith("`r")) { "`n" } else { '' }
+  $appendBytes = $encoding.GetBytes($prefix + $Block.Trim() + "`n")
+  $preamble = if ($bytes.Length -eq 0) { $encoding.GetPreamble() } else { [byte[]]@() }
+  # PowerShell 5.1 collapses an empty [byte[]] to $null; concatenation tolerates
+  # that representation while preserving every original byte in order.
+  $combined = [byte[]]@($bytes + $preamble + $appendBytes)
+  [IO.File]::WriteAllBytes($Path, $combined)
+}
+function Test-OspinaOnlyProfile {
+  param(
+    [Parameter(Mandatory)][string]$Path,
+    [Parameter(Mandatory)][string]$Start,
+    [Parameter(Mandatory)][string]$End
+  )
+  if (-not (Test-Path $Path)) { return $false }
+  try { $text = [IO.File]::ReadAllText($Path) } catch { return $false }
+  $pattern = '^\s*' + [regex]::Escape($Start) + '.*?' +
+             [regex]::Escape($End) + '\s*$'
+  return [regex]::IsMatch($text, $pattern, [Text.RegularExpressions.RegexOptions]::Singleline)
+}
+function Install-OspinaPathProfiles {
+  # PowerShell 5.1 and PowerShell 7 use different profile directories. Write
+  # the same small marked block to both, plus Git Bash's login profile.
+  $start = '# >>> ospina workstation PATH >>>'
+  $end = '# <<< ospina workstation PATH <<<'
+  $powerShellBlock = @'
+# >>> ospina workstation PATH >>>
+$ospinaPreferredPath = [Environment]::GetEnvironmentVariable('OSPINA_PREFERRED_PATH','User')
+if ($ospinaPreferredPath) {
+  $ospinaPreferredParts = @($ospinaPreferredPath -split ';' | Where-Object { $_ })
+  $ospinaCurrentParts = @($env:Path -split ';' | Where-Object {
+    $_ -and $_ -notin $ospinaPreferredParts
+  })
+  $env:Path = (($ospinaPreferredParts + $ospinaCurrentParts) -join ';')
+}
+# <<< ospina workstation PATH <<<
+'@
+  $documents = [Environment]::GetFolderPath('MyDocuments')
+  if (-not $documents) { $documents = Join-Path $env:USERPROFILE 'Documents' }
+  foreach ($profilePath in @(
+    (Join-Path $documents 'WindowsPowerShell\Microsoft.PowerShell_profile.ps1'),
+    (Join-Path $documents 'PowerShell\Microsoft.PowerShell_profile.ps1')
+  )) {
+    Add-OspinaProfileBlock -Path $profilePath -Start $start -End $end `
+                           -Block $powerShellBlock -PowerShellProfile
+  }
+
+  $bashBlock = @'
+# >>> ospina workstation PATH >>>
+_ospina_preferred_windows_path=
+if [ -r "$HOME/.ospina/preferred-path" ]; then
+  IFS= read -r _ospina_preferred_windows_path < "$HOME/.ospina/preferred-path" || true
+fi
+if [ -z "$_ospina_preferred_windows_path" ]; then
+  _ospina_preferred_windows_path=${OSPINA_PREFERRED_PATH:-}
+fi
+if [ -n "$_ospina_preferred_windows_path" ]; then
+  _ospina_preferred_path=$(cygpath -p "$_ospina_preferred_windows_path" 2>/dev/null || true)
+  if [ -n "$_ospina_preferred_path" ]; then
+    _ospina_current_path=
+    _ospina_old_ifs=$IFS
+    IFS=:
+    for _ospina_current_part in $PATH; do
+      _ospina_duplicate=
+      for _ospina_preferred_part in $_ospina_preferred_path; do
+        if [ "$_ospina_current_part" = "$_ospina_preferred_part" ]; then
+          _ospina_duplicate=1
+          break
+        fi
+      done
+      if [ -z "$_ospina_duplicate" ]; then
+        _ospina_current_path=${_ospina_current_path:+$_ospina_current_path:}$_ospina_current_part
+      fi
+    done
+    IFS=$_ospina_old_ifs
+    PATH=$_ospina_preferred_path${_ospina_current_path:+:$_ospina_current_path}
+    export PATH
+  fi
+fi
+unset _ospina_current_part _ospina_current_path _ospina_duplicate _ospina_old_ifs
+unset _ospina_preferred_part _ospina_preferred_path _ospina_preferred_windows_path
+# <<< ospina workstation PATH <<<
+'@
+  $bashProfiles = @('.bash_profile','.bash_login','.profile') |
+                  ForEach-Object { Join-Path $env:USERPROFILE $_ }
+  # The pre-2026-08-31 installer always created .bash_profile. If that file
+  # contains only our managed block and hides an employee's older login file,
+  # remove our obsolete file so Bash can read the employee's original one.
+  if ((Test-OspinaOnlyProfile -Path $bashProfiles[0] -Start $start -End $end) -and
+      ((Test-Path $bashProfiles[1]) -or (Test-Path $bashProfiles[2]))) {
+    Remove-Item $bashProfiles[0] -Force
+  }
+  $bashProfile = $bashProfiles | Where-Object { Test-Path $_ } | Select-Object -First 1
+  if (-not $bashProfile) { $bashProfile = $bashProfiles[0] }
+  Add-OspinaProfileBlock -Path $bashProfile -Start $start -End $end -Block $bashBlock
+  $bashRc = Join-Path $env:USERPROFILE '.bashrc'
+  if (-not [string]::Equals($bashRc, $bashProfile, [StringComparison]::OrdinalIgnoreCase)) {
+    Add-OspinaProfileBlock -Path $bashRc -Start $start -End $end -Block $bashBlock
+  }
 }
 function Test-Codex {
   if (Have codex) { return $true }
   # npm global installs land in a prefix that is not always on PATH, and a tool
   # that exists but cannot be found would otherwise be reinstalled every run.
-  $prefix = Invoke-Native-Capture cmd @('/c','npm','prefix','-g')
+  $prefix = Invoke-NodeToolCapture 'npm' @('prefix','-g')
   if ($prefix) {
     foreach ($n in @('codex.cmd','codex.ps1','codex')) {
       if (Test-Path (Join-Path $prefix $n)) { return $true }
     }
   }
-  # The standalone build lands here.
-  if ($env:LOCALAPPDATA -and (Test-Path (Join-Path $env:LOCALAPPDATA 'Programs\codex\codex.exe'))) { return $true }
+  foreach ($p in @((Join-Path $env:USERPROFILE '.local\bin\codex.exe'),
+                   (Join-Path $env:USERPROFILE '.codex\bin\codex.exe'))) {
+    if (Test-Path $p) { return $true }
+  }
   return $false
 }
 function Test-T3Code {
@@ -241,7 +725,14 @@ function Test-T3Code {
     (Join-Path $env:LOCALAPPDATA 'Programs\T3 Code'),
     (Join-Path $env:ProgramFiles 'T3 Code')
   )
-  foreach ($p in $paths) { if (Test-Path $p) { return $true } }
+  foreach ($p in $paths) {
+    if (-not (Test-Path $p -PathType Container)) { continue }
+    $executable = Get-ChildItem -LiteralPath $p -File -Filter '*.exe' -Recurse `
+      -ErrorAction SilentlyContinue | Where-Object {
+        $_.Name -like 'T3 Code*.exe' -or $_.Name -eq 't3code.exe'
+      } | Select-Object -First 1
+    if ($executable) { return $true }
+  }
   # Anything registered as installed under a matching display name.
   foreach ($k in @('HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*',
                    'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*')) {
@@ -252,44 +743,45 @@ function Test-T3Code {
   return $false
 }
 function Install-T3Code {
-  # Not on winget, so take the signed installer from the project's own
-  # GitHub releases. Falls back to the download page if anything goes wrong.
+  # T3 Code now publishes an official winget package. Use its package manifest,
+  # pinned digest and upgrade path instead of scraping the latest release.
   try {
-    Say "          finding the latest T3 Code release..."
-    $rel = Invoke-RestMethod 'https://api.github.com/repos/pingdotgg/t3code/releases/latest' `
-                             -Headers @{ 'User-Agent' = 'ospina-installer' }
-    $asset = $rel.assets | Where-Object { $_.name -like '*x64.exe' } | Select-Object -First 1
-    if (-not $asset) { throw 'no Windows installer in the latest release' }
-    $out = Join-Path $env:TEMP $asset.name
-    Get-RemoteFile -Uri $asset.browser_download_url -OutFile $out `
-                   -Label $asset.name -SizeMB ([int]($asset.size/1MB))
-    # This is a downloaded executable, so check what signed it before running.
-    # The publisher name is not asserted here because it is not documented
-    # anywhere authoritative; an unsigned or broken signature asks first.
-    $sig = Get-AuthenticodeSignature -FilePath $out
-    if ($sig.Status -eq 'Valid') {
-      Say ("          signature: valid, signed by {0}" -f $sig.SignerCertificate.Subject)
-    } else {
-      Say ""
-      Say ("          WARNING: the downloaded installer's signature is '{0}'." -f $sig.Status)
-      Say  "          It came from the official pingdotgg/t3code releases, but it is"
-      Say  "          not carrying a signature Windows trusts."
-      if (-not (Ask-YesNo "           Run it anyway?")) {
-        Remove-Item $out -ErrorAction SilentlyContinue
-        Say "          skipped. Install manually from https://t3.codes/download"
-        return $false
-      }
-    }
-    Say "          running the installer..."
-    Start-Process -FilePath $out -ArgumentList '/S' -Wait
-    Remove-Item $out -ErrorAction SilentlyContinue
-    return $true
+    $rc = Invoke-Native winget @('install','--id','T3Tools.T3Code','--exact','--source','winget','--silent',
+            '--disable-interactivity','--accept-package-agreements','--accept-source-agreements') -Interactive
+    Refresh-Path
+    return ($rc -eq 0 -or (Test-T3Code))
   } catch {
     Say "          could not install automatically: $($_.Exception.Message)"
     Say "          opening the download page instead"
     Start-Process 'https://t3.codes/download'
     return $false
   }
+}
+function Get-LibreOfficeDirectories {
+  $dirs = @()
+  if ($env:ProgramFiles) { $dirs += (Join-Path $env:ProgramFiles 'LibreOffice\program') }
+  if (${env:ProgramFiles(x86)}) {
+    $dirs += (Join-Path ${env:ProgramFiles(x86)} 'LibreOffice\program')
+  }
+  if ($env:LOCALAPPDATA) {
+    $dirs += (Join-Path $env:LOCALAPPDATA 'Programs\LibreOffice\program')
+  }
+  return $dirs
+}
+function Ensure-LibreOffice {
+  if (-not (Have soffice)) {
+    $null = Resolve-OnPath -Command 'soffice' -Directories (Get-LibreOfficeDirectories)
+  }
+  if (Have soffice) { return $true }
+
+  Say "  install  LibreOffice (document and workbook rendering)"
+  $script:OspinaLibreOfficeExitCode = Invoke-Native winget @(
+    'install','--id','TheDocumentFoundation.LibreOffice','--exact','--source','winget','--silent',
+    '--disable-interactivity','--accept-package-agreements','--accept-source-agreements'
+  ) -Interactive
+  Refresh-Path
+  $null = Resolve-OnPath -Command 'soffice' -Directories (Get-LibreOfficeDirectories)
+  return (Have soffice)
 }
 function Test-SyncedPath {
   # One definition, used by the menu, the OSPINA_WORKSPACE route and the typed
@@ -352,7 +844,17 @@ $admin = ([Security.Principal.WindowsPrincipal] `
           [Security.Principal.WindowsIdentity]::GetCurrent()
          ).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 if (-not $admin) {
-  Say "  Running without administrator rights. Tools will install per-user, which is fine."
+  Say "  Running without elevation. Most tools install per-user."
+  Say "  Windows may request administrator approval for LibreOffice."
+}
+
+if ((Get-ExecutionPolicy) -eq 'AllSigned') {
+  Die @"
+This account enforces PowerShell's AllSigned policy. Ospina setup needs a small
+per-user profile block so Node 24 and Python 3.12 outrank older machine tools.
+Ask your device administrator to approve that profile change or set a compatible
+policy, then re-run this command.
+"@
 }
 
 # ------------------------------------------------------------------ packages
@@ -368,10 +870,14 @@ Then open a new PowerShell and run this command again.
 "@
 }
 
+$NodeVersion = '24.19.0'
 $pkgs = @(
-  @{ Cmd = 'git';   Id = 'Git.Git';         Required = $true  },
-  @{ Cmd = 'gh';    Id = 'GitHub.cli';      Required = $true  },
-  @{ Cmd = 'vale';  Id = 'errata-ai.Vale';  Required = $false }
+  @{ Cmd = 'git';       Id = 'Git.Git';                 Required = $true  },
+  @{ Cmd = 'gh';        Id = 'GitHub.cli';              Required = $true  },
+  @{ Cmd = 'node';      Id = 'OpenJS.NodeJS.LTS';       Required = $true; Version = $NodeVersion },
+  @{ Cmd = 'uv';        Id = 'astral-sh.uv';            Required = $true  },
+  @{ Cmd = 'pdftotext'; Id = 'oschwartz10612.Poppler'; Required = $true  },
+  @{ Cmd = 'vale';      Id = 'errata-ai.Vale';          Required = $false }
 )
 foreach ($p in $pkgs) {
   if (Have $p.Cmd) { Say "  ok       $($p.Cmd)"; continue }
@@ -380,17 +886,25 @@ foreach ($p in $pkgs) {
   # output made a slow first-run source update indistinguishable from a hang,
   # and would hide a prompt the reader cannot then answer.
   Say "          this can take a minute; winget output follows"
-  $code = Invoke-Native winget @('install','--id',$p.Id,'--exact','--silent',
-            '--disable-interactivity',
-            '--accept-package-agreements','--accept-source-agreements') -Interactive
+  $wingetArgs = @('install','--id',$p.Id,'--exact','--source','winget','--silent',
+                  '--disable-interactivity',
+                  '--accept-package-agreements','--accept-source-agreements')
+  if ($p.Version) { $wingetArgs += @('--version',$p.Version) }
+  $code = Invoke-Native winget $wingetArgs -Interactive
   Refresh-Path
+  if ($p.Cmd -eq 'node') { $null = Resolve-NodeToolchainPath }
+  if ($p.Cmd -eq 'uv') { $null = Resolve-UvOnPath }
   # A managed laptop often blocks machine-wide installs. User scope needs no admin.
   if (-not (Have $p.Cmd)) {
     Say "  retry    $($p.Cmd) with user-scope install (no admin required)"
-    $code = Invoke-Native winget @('install','--id',$p.Id,'--exact','--silent',
-              '--scope','user','--disable-interactivity',
-              '--accept-package-agreements','--accept-source-agreements') -Interactive
+    $wingetArgs = @('install','--id',$p.Id,'--exact','--source','winget','--silent','--scope','user',
+                    '--disable-interactivity','--accept-package-agreements',
+                    '--accept-source-agreements')
+    if ($p.Version) { $wingetArgs += @('--version',$p.Version) }
+    $code = Invoke-Native winget $wingetArgs -Interactive
     Refresh-Path
+    if ($p.Cmd -eq 'node') { $null = Resolve-NodeToolchainPath }
+    if ($p.Cmd -eq 'uv') { $null = Resolve-UvOnPath }
   }
   if (Have $p.Cmd) {
     Say "  ok       $($p.Cmd) installed"
@@ -406,6 +920,113 @@ already installed.
     Say "  note     $($p.Cmd) not callable yet; a new terminal will pick it up"
   }
 }
+
+# Merely finding uv is not enough. Update it through the reviewed WinGet source
+# unless it accepts the exact default-Python preview flags used below.
+if (-not (Test-UvDefaultInstall)) {
+  $null = Resolve-UvOnPath
+}
+if (-not (Test-UvDefaultInstall)) {
+  Say "  upgrade  uv (the installed version lacks the required default-Python preview capability)"
+  $uvArgs = @('upgrade','--id','astral-sh.uv','--exact','--source','winget','--silent',
+              '--disable-interactivity','--accept-package-agreements','--accept-source-agreements')
+  $null = Invoke-Native winget $uvArgs -Interactive
+  Refresh-Path
+  $null = Resolve-UvOnPath
+  if (-not (Test-UvDefaultInstall)) {
+    $uvArgs = @('install','--id','astral-sh.uv','--exact','--source','winget','--silent',
+                '--scope','user','--force','--disable-interactivity',
+                '--accept-package-agreements','--accept-source-agreements')
+    $null = Invoke-Native winget $uvArgs -Interactive
+    Refresh-Path
+    $null = Resolve-UvOnPath
+  }
+}
+if (-not (Test-UvDefaultInstall)) {
+  Die "uv is installed, but it cannot enable the default-Python preview feature. Remove the conflicting uv installation, then re-run."
+}
+
+# Node 24 is the common version supported by T3 Code and all current Ospina
+# Node repositories. A random newer system Node is not equivalent: some repos
+# deliberately cap support below Node 25.
+$nodeMajor = Get-NodeMajor
+if ($nodeMajor -ne '24') {
+  Say "  install  Node 24 LTS (current Node major: $nodeMajor)"
+  $null = Invoke-Native winget @('install','--id','OpenJS.NodeJS.LTS','--exact','--source','winget','--silent',
+            '--version',$NodeVersion,'--force','--disable-interactivity',
+            '--accept-package-agreements','--accept-source-agreements') -Interactive
+  Refresh-Path
+  $nodeMajor = Get-NodeMajor
+  if ($nodeMajor -ne '24') {
+    $null = Invoke-Native winget @('install','--id','OpenJS.NodeJS.LTS','--exact','--source','winget','--silent',
+              '--version',$NodeVersion,'--scope','user','--force','--disable-interactivity',
+              '--accept-package-agreements','--accept-source-agreements') -Interactive
+    Refresh-Path
+    $null = Resolve-NodeToolchainPath
+  }
+  $nodeMajor = Get-NodeMajor
+}
+if ($nodeMajor -ne '24') {
+  Die "Node 24 LTS is required, but Node major '$nodeMajor' is active. Remove the conflicting Node installation, then re-run."
+}
+Say "  ok       node 24 LTS"
+$null = Resolve-NodeToolchainPath
+
+$corepackReady = $true
+if (-not (Have corepack)) {
+  Say "  install  corepack"
+  $npm = Get-NodeToolPath 'npm'
+  if ($npm) { $rc = Invoke-Native $npm @('install','-g','corepack') -Interactive }
+  else { $rc = 127 }
+  Refresh-Path
+  $installedCorepack = Get-CorepackPath
+  if ($rc -ne 0 -or -not $installedCorepack) {
+    Say "  note     Corepack did not install. pnpm repositories will not run yet."
+    $corepackReady = $false
+  } else {
+    Add-UserPathEntry (Split-Path $installedCorepack -Parent)
+  }
+}
+if ($corepackReady) {
+  $corepackDir = Join-Path $env:USERPROFILE '.local\bin'
+  New-Item -ItemType Directory -Force -Path $corepackDir | Out-Null
+  $corepack = Get-CorepackPath
+  if (-not $corepack -or
+      (Invoke-Native $corepack @('enable','--install-directory',$corepackDir)) -ne 0) {
+    Say "  note     Corepack could not enable pnpm. Setup will continue."
+    $corepackReady = $false
+  } else {
+    Add-UserPathEntry $corepackDir
+    Say "  ok       corepack enabled (each repo selects its pinned pnpm)"
+  }
+}
+
+Say "  install  Python 3.12 (managed by uv)"
+# --default creates the unversioned python/python3 shims and remains gated as a
+# uv preview feature. Enable only that feature for this invocation.
+if ((Invoke-Native uv @('python','install','3.12','--default','--preview-features','python-install-default') -Interactive) -ne 0) {
+  Die "uv could not install Python 3.12."
+}
+$uvBin = Invoke-Native-Capture uv @('python','dir','--bin')
+if ($uvBin -and (Test-Path -LiteralPath $uvBin -PathType Container)) {
+  Add-UserPathEntry $uvBin
+} else {
+  Say "  note     uv did not report an existing Python bin directory; PATH was not changed."
+}
+if ((Invoke-Native uv @('python','find','3.12')) -ne 0) {
+  Die "Python 3.12 was requested but uv cannot find it."
+}
+$pythonMinor = Get-PythonMinor
+if ($pythonMinor -ne '3.12') {
+  Die "Python 3.12 is installed, but the 'python' command resolves to '$pythonMinor'. Open a new PowerShell and re-run."
+}
+Say "  ok       python command is Python 3.12"
+
+if (-not (Ensure-LibreOffice)) {
+  Say "  note     LibreOffice is not installed (winget exit $OspinaLibreOfficeExitCode)."
+  Say "           Its official WinGet package is machine-scoped and needs administrator approval."
+  Say "           Setup will continue, but document and workbook visual QA will be unavailable."
+} else { Say "  ok       soffice" }
 
 # Several of the repositories a partner clones are pnpm / Next.js projects, and
 # npm resolves to npm.ps1. Under the default Restricted policy none of them can
@@ -432,7 +1053,9 @@ if ((Get-ExecutionPolicy) -eq 'Restricted') {
     }
   } else {
     Say "  note     left as Restricted. npm and pnpm will not run, so the Node"
-    Say "           repositories cannot be built until you change it."
+    Say "           repositories cannot be built until you change it. Ospina's"
+    Say "           PATH preference profile also cannot run, so verified user"
+    Say "           tools may not stay ahead of older machine tools in new terminals."
   }
 } else {
   Say ("  ok       execution policy: {0}" -f (Get-ExecutionPolicy))
@@ -543,35 +1166,11 @@ $agents = @(
      Manual = 'download from https://t3.codes/download' },
   @{ Name = 'Claude Code'; Command = 'claude'; Test = { Test-Claude }
      Manual = 'irm https://claude.ai/install.ps1 | iex'
-     Install = {
-       # The native installer, deliberately not winget. T3 Code updates Claude by
-       # running its native update command, and only offers that when the binary
-       # sits at ~/.local/bin/claude.exe, which is where the native installer puts
-       # it. A winget install lands outside that path, so T3 falls back to
-       # manual-only, and Anthropic documents that the native update command does
-       # not update a winget-managed install either. Native also self-updates.
-       Say "          running the official native installer..."
-       try {
-         & ([scriptblock]::Create((Invoke-RestMethod 'https://claude.ai/install.ps1')))
-         Refresh-Path
-         # Finish the job rather than telling the reader to open a new terminal:
-         # if the binary is where the native installer puts it but is not
-         # callable, put its folder on PATH ourselves.
-         $null = Resolve-OnPath -Command 'claude' -Directories @(
-           (Join-Path $env:USERPROFILE '.local\bin')
-         )
-         return (Test-Claude)
-       } catch {
-         Say ("          native install failed: {0}" -f $_.Exception.Message)
-         Say  "          Fallback: winget install Anthropic.ClaudeCode"
-         Say  "          (note: a winget install cannot be updated from T3 Code)"
-         return $false
-       }
-     } },
-  @{ Name = 'Codex'; Command = 'codex';       Test = { Test-Codex }; Manual = 'npm install -g @openai/codex';
+     Install = { Install-ClaudeOfficial } },
+  @{ Name = 'Codex'; Command = 'codex';       Test = { Test-Codex }; Manual = 'irm https://chatgpt.com/codex/install.ps1 | iex';
      Diagnose = {
        # npm can install into a prefix that is not on PATH. Show where it went.
-       $prefix = Invoke-Native-Capture cmd @('/c','npm','prefix','-g')
+       $prefix = Invoke-NodeToolCapture 'npm' @('prefix','-g')
        if ($prefix) {
          Say ("           npm global prefix: {0}" -f $prefix)
          $cand = Join-Path $prefix 'codex.cmd'
@@ -583,38 +1182,7 @@ $agents = @(
          }
        }
      };
-     Install = {
-       if (Test-Npm) {
-         # Go through cmd. On Windows `npm` resolves to npm.ps1, and a machine
-         # on the default Restricted execution policy refuses to run it, which
-         # is not something a partner should have to diagnose.
-         #
-         # -Interactive so npm's own output is visible. Swallowing it produced a
-         # run that printed "installed" while npm had done nothing useful, and
-         # left no evidence to work from.
-         Say "          running: npm install -g @openai/codex"
-         $rc = Invoke-Native cmd @('/c','npm','install','-g','@openai/codex') -Interactive
-         if ($rc -ne 0) { return $false }
-         # npm's global prefix is frequently absent from PATH on Windows.
-         Resolve-OnPath -Command 'codex' -Directories @(
-           (Invoke-Native-Capture cmd @('/c','npm','prefix','-g')),
-           (Join-Path $env:LOCALAPPDATA 'Programs\codex')
-         )
-       }
-       else {
-         # npm is unusable or absent. Codex publishes standalone Windows
-         # binaries, so there is no need to send the reader off to install Node
-         # and come back.
-         Say ""
-         Say "          npm is not usable here, so the standalone build is the only"
-         Say "          option. Note the trade: T3 Code can only update Codex in one"
-         Say "          click when it was installed through a package manager, so a"
-         Say "          standalone build has to be updated by hand."
-         Say "          Fixing the execution policy and using npm avoids that."
-         Say ""
-         Install-CodexBinary
-       }
-     } }
+     Install = { Install-CodexOfficial } }
 )
 
 foreach ($a in $agents) {
@@ -656,6 +1224,43 @@ foreach ($a in $agents) {
     Say ("           reason: {0}" -f $_.Exception.Message)
     Say  "           Setup continues. Install it later and re-run this command."
   }
+}
+Say ""
+
+$null = Resolve-OnPath -Command 'claude' -Directories @(
+  (Join-Path $env:USERPROFILE '.local\bin')
+)
+$null = Resolve-OnPath -Command 'codex' -Directories @(
+  (Join-Path $env:USERPROFILE '.local\bin'),
+  (Join-Path $env:USERPROFILE '.codex\bin'),
+  (Invoke-NodeToolCapture 'npm' @('prefix','-g'))
+)
+$providerAuthed = $false
+if (Have claude) {
+  if ((Invoke-Native claude @('auth','status')) -eq 0) {
+    Say "  ok       Claude Code signed in"
+    $providerAuthed = $true
+  } elseif (Ask-YesNo "           Sign in to Claude Code now?") {
+    $null = Invoke-Native claude @('auth','login') -Interactive
+    if ((Invoke-Native claude @('auth','status')) -eq 0) {
+      Say "  ok       Claude Code signed in"
+      $providerAuthed = $true
+    } else {
+      Say "  note     Claude Code sign-in did not complete. Re-run it later."
+    }
+  }
+}
+if (Have codex) {
+  if ((Invoke-Native codex @('login','status')) -eq 0) {
+    Say "  ok       Codex signed in"
+    $providerAuthed = $true
+  } elseif (Ask-YesNo "           Sign in to Codex now?") {
+    $null = Invoke-Native codex @('login') -Interactive
+    if ((Invoke-Native codex @('login','status')) -eq 0) { $providerAuthed = $true }
+  }
+}
+if (-not $providerAuthed) {
+  Say "  note     Sign in to at least one agent before starting work in T3 Code."
 }
 Say ""
 
@@ -725,9 +1330,54 @@ Say "  workspace: $ws"
 Step "Handbook"
 $hb = Join-Path $ws 'handbook'
 if (Test-Path (Join-Path $hb '.git')) {
-  Say "  ok       already cloned, updating"
-  $null = Invoke-Native git @('-C',$hb,'pull','-q','--ff-only')
+  Say "  ok       already cloned, verifying and updating"
+  $handbookOrigin = Invoke-Native-Capture git @('-C',$hb,'remote','get-url','origin')
+  $handbookOrigin = if ($handbookOrigin) {
+    ($handbookOrigin.TrimEnd('/') -replace '\.git$','')
+  } else { '' }
+  $officialHandbookOrigins = @(
+    'https://github.com/ospina-company/handbook',
+    'git@github.com:ospina-company/handbook',
+    'ssh://git@github.com/ospina-company/handbook'
+  )
+  if ($officialHandbookOrigins -notcontains $handbookOrigin) {
+    Die @"
+The existing handbook checkout does not use Ospina's official origin.
+Expected: https://github.com/ospina-company/handbook
+Got:      $(if ($handbookOrigin) { $handbookOrigin } else { 'no origin' })
+Its bootstrap will not run. Move that checkout aside, then re-run.
+"@
+  }
+  $handbookBranch = Invoke-Native-Capture git @('-C',$hb,'symbolic-ref','--quiet','--short','HEAD')
+  if ($handbookBranch -ne 'main') {
+    $branchLabel = if ($handbookBranch) { $handbookBranch } else { 'a detached commit' }
+    Die "The existing handbook checkout is on '$branchLabel', not main.`nIts bootstrap will not run. Preserve or commit your work, switch the handbook to main, then re-run.`nYour repositories were not touched."
+  }
+  $handbookDirty = Invoke-Native-Capture git @('-C',$hb,'status','--porcelain')
+  if ($handbookDirty) {
+    Die "The existing handbook has local changes, so its bootstrap will not run.`nPreserve or commit those changes, restore a clean main checkout, then re-run.`nYour repositories were not touched."
+  }
+  if ((Invoke-Native git @('-C',$hb,'fetch','-q','origin','main')) -ne 0) {
+    Die @"
+Could not fetch the official handbook main branch, so its existing bootstrap will not run.
+Older bootstrap versions can disclose repository names your account cannot read.
+Check the network and your access, then re-run.
+Your repositories were not touched.
+"@
+  }
+  $handbookTarget = Invoke-Native-Capture git @('-C',$hb,'rev-parse','--verify','FETCH_HEAD')
+  if (-not $handbookTarget -or
+      (Invoke-Native git @('-C',$hb,'merge','-q','--ff-only',$handbookTarget)) -ne 0) {
+    Die "The handbook main branch could not fast-forward to the official version.`nPreserve any local commits, restore main from the official origin, then re-run.`nIts existing bootstrap did not run."
+  }
+  $handbookHead = Invoke-Native-Capture git @('-C',$hb,'rev-parse','HEAD')
+  if ($handbookHead -ne $handbookTarget) {
+    Die "The handbook did not resolve to the fetched official main commit.`nIts existing bootstrap did not run. Restore a clean official main checkout, then re-run."
+  }
 } else {
+  if (Test-Path $hb) {
+    Die "'$hb' already exists but is not a Git checkout.`nMove that file or folder aside, then re-run. Nothing there was changed."
+  }
   if ((Invoke-Native gh @('repo','clone','ospina-company/handbook',$hb,'--','-q')) -ne 0) {
     Die "Could not clone the handbook."
   }
@@ -768,10 +1418,14 @@ if ($tok) {
   Say "  could not read a gh token; the bootstrap step may ask you to sign in again"
 }
 
-# --no-login is belt and braces: even if the credential does not survive, the
-# child must never start a login it has no way to finish.
+# Invoke Bash with the script path as a native argument, not a shell command
+# string. That preserves valid Windows paths containing spaces, apostrophes or
+# shell metacharacters without quoting or code-injection risk. --no-login is
+# belt and braces: even if the credential does not survive, the child must never
+# start a login it has no way to finish.
 try {
-  $rc = Invoke-Native $bash @('-lc', "sh '$hbUnix/bootstrap.sh' --no-login") -Interactive
+  $hbScriptUnix = "$hbUnix/bootstrap.sh"
+  $rc = Invoke-Native $bash @($hbScriptUnix,'--no-login') -Interactive
 } finally {
   # Restore whatever the caller had. This script runs in their session, so
   # deleting a variable we did not set would be a side effect they never asked

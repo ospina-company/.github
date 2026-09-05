@@ -11,6 +11,77 @@
 $ErrorActionPreference = 'Continue'
 
 function Have ($c) { $null -ne (Get-Command $c -ErrorAction SilentlyContinue) }
+function Test-StorePythonPackage {
+  if (-not (Get-Command Get-AppxPackage -ErrorAction SilentlyContinue |
+            Select-Object -First 1)) {
+    return $null
+  }
+  return $null -ne (Get-AppxPackage -Name 'PythonSoftwareFoundation.Python*' `
+                     -ErrorAction SilentlyContinue | Select-Object -First 1)
+}
+function Have-UsablePython ($c) {
+  $cmd = Get-Command $c -ErrorAction SilentlyContinue
+  if (-not $cmd) { return $false }
+  if ($cmd.Source -notmatch '(?i)\\Microsoft\\WindowsApps\\') { return $true }
+  # Windows creates zero-function Store aliases even when Python is absent.
+  # Count one only when this user actually has a Store Python package.
+  $storePackage = Test-StorePythonPackage
+  if ($null -eq $storePackage) {
+    # Without Appx discovery we cannot prove that the visible alias is empty.
+    # Keep the account out of the clean bucket instead of claiming it will
+    # exercise Python installation from nothing.
+    return $true
+  }
+  return $storePackage
+}
+function Test-IsUserScopedTool ($Tool, $Source) {
+  if (-not $Source) { return $false }
+  if ($Source.StartsWith('HKCU:', 'OrdinalIgnoreCase')) { return $true }
+  if ($Source.StartsWith('HKLM:', 'OrdinalIgnoreCase')) { return $false }
+  $isAlias = $Source -match '(?i)\\Microsoft\\WindowsApps\\'
+  if ($Tool -in @('python','python3') -and $isAlias) {
+    return (Test-StorePythonPackage)
+  }
+  return (-not $isAlias -and
+          $Source.StartsWith($env:USERPROFILE, 'OrdinalIgnoreCase'))
+}
+function Get-LibreOfficePath {
+  $cmd = Get-Command soffice -ErrorAction SilentlyContinue
+  if ($cmd) { return $cmd.Source }
+  foreach ($root in @($env:ProgramFiles, ${env:ProgramFiles(x86)})) {
+    if (-not $root) { continue }
+    $candidate = Join-Path $root 'LibreOffice\program\soffice.exe'
+    if (Test-Path $candidate) { return $candidate }
+  }
+  if ($env:LOCALAPPDATA) {
+    $candidate = Join-Path $env:LOCALAPPDATA 'Programs\LibreOffice\program\soffice.exe'
+    if (Test-Path $candidate) { return $candidate }
+  }
+  return $null
+}
+function Get-T3CodePath {
+  $cmd = Get-Command t3 -ErrorAction SilentlyContinue
+  if ($cmd) { return $cmd.Source }
+  foreach ($root in @($env:LOCALAPPDATA, $env:ProgramFiles)) {
+    if (-not $root) { continue }
+    foreach ($relative in @('Programs\t3code','Programs\T3 Code','T3 Code')) {
+      $candidate = Join-Path $root $relative
+      if (-not (Test-Path $candidate -PathType Container)) { continue }
+      $executable = Get-ChildItem -LiteralPath $candidate -File -Filter '*.exe' `
+        -ErrorAction SilentlyContinue | Where-Object {
+          $_.Name -like 'T3 Code*.exe' -or $_.Name -eq 't3code.exe'
+        } | Select-Object -First 1
+      if ($executable) { return $executable.FullName }
+    }
+  }
+  foreach ($key in @('HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*',
+                     'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*')) {
+    $hit = Get-ItemProperty $key -ErrorAction SilentlyContinue |
+           Where-Object { $_.DisplayName -like '*T3 Code*' } | Select-Object -First 1
+    if ($hit) { return $key.TrimEnd('*') }
+  }
+  return $null
+}
 function Line ($state, $label, $detail) {
   $color = switch ($state) { 'CLEAN' {'Green'} 'DIRTY' {'Red'} default {'Yellow'} }
   Write-Host ("  {0,-6} {1,-38} {2}" -f $state, $label, $detail) -ForegroundColor $color
@@ -48,26 +119,54 @@ if (Have gh) {
   } else { Line 'CLEAN' 'gh credentials' 'not signed in' }
 } else { Line 'CLEAN' 'gh credentials' 'gh not installed for this user' }
 
-# 2. Agent skills
-$skills = Join-Path $env:USERPROFILE '.claude\skills'
-if (Test-Path $skills) {
-  $n = (Get-ChildItem $skills -ErrorAction SilentlyContinue).Count
-  if ($n -gt 0) { Line 'DIRTY' 'agent skills' "$skills has $n item(s)"; $dirty++ }
-  else { Line 'CLEAN' 'agent skills' 'directory exists but is empty' }
-} else { Line 'CLEAN' 'agent skills' 'no ~/.claude/skills' }
+# 2. Agent skills. Bootstrap writes the Claude and Codex roots; keep the shared
+# agent root in the contamination check for older harnesses.
+foreach ($skillRoot in @('.claude\skills','.codex\skills','.agents\skills')) {
+  $skills = Join-Path $env:USERPROFILE $skillRoot
+  if (Test-Path $skills) {
+    $n = (Get-ChildItem $skills -Force -ErrorAction SilentlyContinue).Count
+    if ($n -gt 0) { Line 'DIRTY' "agent skills ($skillRoot)" "$skills has $n item(s)"; $dirty++ }
+    else { Line 'CLEAN' "agent skills ($skillRoot)" 'directory exists but is empty' }
+  } else { Line 'CLEAN' "agent skills ($skillRoot)" "no ~/$($skillRoot -replace '\\','/')" }
+}
 
 # 3. Environment variables
 if ($env:OSPINA_HANDBOOK) { Line 'DIRTY' 'OSPINA_HANDBOOK' $env:OSPINA_HANDBOOK; $dirty++ }
 else { Line 'CLEAN' 'OSPINA_HANDBOOK' 'not set' }
 if ($env:VALE_CONFIG_PATH) { Line 'DIRTY' 'VALE_CONFIG_PATH' $env:VALE_CONFIG_PATH; $dirty++ }
 else { Line 'CLEAN' 'VALE_CONFIG_PATH' 'not set' }
+$preferredPath = [Environment]::GetEnvironmentVariable('OSPINA_PREFERRED_PATH','User')
+if (-not $preferredPath) { $preferredPath = $env:OSPINA_PREFERRED_PATH }
+if ($preferredPath) { Line 'DIRTY' 'OSPINA_PREFERRED_PATH' $preferredPath; $dirty++ }
+else { Line 'CLEAN' 'OSPINA_PREFERRED_PATH' 'not set' }
+$preferredPathState = Join-Path $env:USERPROFILE '.ospina\preferred-path'
+if (Test-Path $preferredPathState -PathType Leaf) {
+  Line 'DIRTY' 'preferred PATH state' $preferredPathState; $dirty++
+} else { Line 'CLEAN' 'preferred PATH state' 'no ~/.ospina/preferred-path' }
 
 # 4. Shell profiles
 $found = @()
-foreach ($f in @('.bashrc','.bash_profile','.zshrc','.profile')) {
-  $path = Join-Path $env:USERPROFILE $f
-  if ((Test-Path $path) -and (Select-String -Path $path -Pattern 'ospina handbook' -Quiet -ErrorAction SilentlyContinue)) {
-    $found += $f
+$documents = @((Join-Path $env:USERPROFILE 'Documents'),
+               [Environment]::GetFolderPath('MyDocuments')) |
+             Where-Object { $_ } | Select-Object -Unique
+$profileCandidates = @('.bashrc','.bash_profile','.bash_login','.zshrc','.profile') |
+                     ForEach-Object {
+                       [pscustomobject]@{ Label = $_; Path = Join-Path $env:USERPROFILE $_ }
+                     }
+foreach ($documentsRoot in $documents) {
+  foreach ($relative in @('WindowsPowerShell\Microsoft.PowerShell_profile.ps1',
+                           'PowerShell\Microsoft.PowerShell_profile.ps1')) {
+    $profileCandidates += [pscustomobject]@{
+      Label = $relative
+      Path = Join-Path $documentsRoot $relative
+    }
+  }
+}
+foreach ($candidate in $profileCandidates) {
+  if ((Test-Path $candidate.Path -PathType Leaf) -and
+      (Select-String -Path $candidate.Path -Pattern 'ospina (handbook|workstation PATH)' `
+                     -Quiet -ErrorAction SilentlyContinue)) {
+    $found += $candidate.Label
   }
 }
 if ($found.Count) { Line 'DIRTY' 'shell profiles' ("ospina block in: " + ($found -join ', ')); $dirty++ }
@@ -94,18 +193,34 @@ Write-Host "  Your test will NOT exercise installing these. Scope is inferred fr
 Write-Host "  the path: something under your profile is yours alone, not the machine's." -ForegroundColor DarkGray
 
 $inherited = 0
-foreach ($t in 'git','gh','vale','winget') {
-  if (Have $t) {
-    $src = (Get-Command $t).Source
+$scopeUnknown = 0
+foreach ($t in 'git','gh','node','npm','corepack','uv','python','python3',
+                    'pdftotext','pdftoppm','pdfinfo','soffice','vale',
+                    't3','claude','codex','winget') {
+  $specialPath = $null
+  if ($t -in @('python','python3')) { $present = Have-UsablePython $t }
+  elseif ($t -eq 'soffice') { $specialPath = Get-LibreOfficePath; $present = $null -ne $specialPath }
+  elseif ($t -eq 't3') { $specialPath = Get-T3CodePath; $present = $null -ne $specialPath }
+  else { $present = Have $t }
+  if ($present) {
+    $src = if ($specialPath) { $specialPath } else {
+      (Get-Command $t -ErrorAction SilentlyContinue | Select-Object -First 1).Source
+    }
     # A binary under the user profile was installed for this account, so it is
     # not evidence that the machine provides it to everyone.
     # WindowsApps holds app execution aliases, which Windows provides. A binary
     # there sits under the profile but was not installed by this account.
-    $isAlias    = $src -and $src -match '(?i)\\Microsoft\\WindowsApps\\'
-    $userScoped = $src -and -not $isAlias -and
-                  $src.StartsWith($env:USERPROFILE, 'OrdinalIgnoreCase')
-    Line 'NOTE' $t ("{0}  [{1}]" -f $src, $(if ($userScoped) { 'this user' } else { 'machine-wide' }))
-    if ($t -ne 'winget' -and -not $userScoped) { $inherited++ }
+    $userScoped = Test-IsUserScopedTool $t $src
+    $scopeLabel = if ($null -eq $userScoped) {
+      $scopeUnknown++
+      'scope unknown'
+    } elseif ($userScoped) {
+      'this user'
+    } else {
+      'machine-wide'
+    }
+    Line 'NOTE' $t ("{0}  [{1}]" -f $src, $scopeLabel)
+    if ($t -ne 'winget' -and $false -eq $userScoped) { $inherited++ }
   } else {
     Line 'CLEAN' $t 'not installed, so the install path WILL be tested'
   }
@@ -125,6 +240,11 @@ if ($inherited -gt 0) {
   Write-Host "$inherited tool(s) are inherited machine-wide, so this test covers the" -ForegroundColor Yellow
   Write-Host "auth, profile, skills and clone paths, but not winget installing them" -ForegroundColor Yellow
   Write-Host "from nothing. Windows Sandbox or a VM is the only way to cover that." -ForegroundColor Yellow
+}
+if ($scopeUnknown -gt 0) {
+  Write-Host ""
+  Write-Host "$scopeUnknown tool scope(s) could not be verified, so preflight did not" -ForegroundColor Yellow
+  Write-Host "classify them as either per-user or machine-wide." -ForegroundColor Yellow
 }
 Write-Host ""
 Write-Host "Next, if the account is clean:"
