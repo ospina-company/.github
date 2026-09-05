@@ -124,8 +124,32 @@ can_install_homebrew() {
 }
 
 uv_supports_default() {
-  have uv && uv python install --default \
-    --preview-features python-install-default --help >/dev/null 2>&1
+  have uv || return 1
+  uv python install --default \
+    --preview-features python-install-default --help >/dev/null 2>&1 || return 1
+
+  # clap exits successfully on `--help` before it validates preview-feature
+  # names. Exercise the real parser against an impossible install directory and
+  # require uv to recognize the selective feature without touching user state.
+  local _probe_file _probe_output _probe_rc
+  _probe_file=$(mktemp 2>/dev/null) || return 1
+  if _probe_output=$(
+    UV_PYTHON_INSTALL_DIR="$_probe_file/install" \
+    UV_PYTHON_BIN_DIR="$_probe_file/bin" \
+      uv python install ospina-capability-probe-invalid --default \
+        --preview-features python-install-default --offline \
+        --no-python-downloads 2>&1
+  ); then
+    _probe_rc=0
+  else
+    _probe_rc=$?
+  fi
+  rm -f "$_probe_file"
+  [ "$_probe_rc" -ne 0 ] || return 1
+  case "$_probe_output" in
+    *preview-features*|*python-install-default*) return 1 ;;
+    *) return 0 ;;
+  esac
 }
 
 case "$(uname -s)" in
@@ -398,7 +422,17 @@ say "  agents that run inside it. You need T3 Code and at least one agent."
 say "  You bring your own Claude or Codex subscription; Ospina does not provide one."
 say ""
 
-have_t3()     { have t3 || ls -d /Applications/T3\ Code*.app >/dev/null 2>&1; }
+have_t3() {
+  have t3 && return 0
+  local _t3_app _t3_exe
+  for _t3_app in /Applications/T3\ Code*.app; do
+    [ -d "$_t3_app" ] || continue
+    for _t3_exe in "$_t3_app"/Contents/MacOS/*; do
+      [ -f "$_t3_exe" ] && [ -x "$_t3_exe" ] && return 0
+    done
+  done
+  return 1
+}
 have_claude() { have claude; }
 have_codex()  { have codex; }
 
@@ -604,6 +638,10 @@ if [ -d "$WS/handbook/.git" ]; then
     || die "The handbook did not resolve to the fetched official main commit.
   Its existing bootstrap did not run. Restore a clean official main checkout, then re-run."
 else
+  if [ -e "$WS/handbook" ] || [ -L "$WS/handbook" ]; then
+    die "$WS/handbook already exists but is not a Git checkout.
+  Move that file or folder aside, then re-run. Nothing there was changed."
+  fi
   gh repo clone ospina-company/handbook "$WS/handbook" -- -q \
     || die "Could not clone the handbook into $WS/handbook.
   Check your connection and that you still have access:
