@@ -275,16 +275,20 @@ jobs:
             New-Item -ItemType Directory -Force -Path $oldUvDir,$newUvDir | Out-Null
             Set-Content -Path (Join-Path $oldUvDir 'uv.cmd') -Encoding ASCII -Value @'
           @echo off
-          if "%*"=="python install --default --preview-features python-install-default --help" exit /b 2
-          echo   --default
+          if "%*"=="python install --default --preview-features python-install-default --help" exit /b 0
+          if "%*"=="python install ospina-capability-probe-invalid --default --preview-features python-install-default --offline --no-python-downloads" echo warning: Pass --preview-features python-install-default to disable this warning 1>&2
+          exit /b 2
           '@
             $uvSource = @'
           using System;
           public class UvFixture {
             public static int Main(string[] args) {
               var actual = String.Join(" ", args);
-              var expected = "python install --default --preview-features python-install-default --help";
-              return actual == expected ? 0 : 2;
+              var help = "python install --default --preview-features python-install-default --help";
+              var probe = "python install ospina-capability-probe-invalid --default --preview-features python-install-default --offline --no-python-downloads";
+              if (actual == help) return 0;
+              if (actual == probe) Console.Error.WriteLine("error: invalid Python request");
+              return 2;
             }
           }
           '@
@@ -770,6 +774,14 @@ jobs:
             Write-Host "::error::T3 Code must use its official winget package, not scrape latest release assets"
             $fail = 1
           }
+          $t3Detector = [regex]::Match(
+            $src, '(?s)function Test-T3Code.*?function Install-T3Code')
+          if (-not $t3Detector.Success -or
+              $t3Detector.Value -notmatch 'Get-ChildItem.*\.exe' -or
+              $t3Detector.Value -notmatch 't3code\.exe') {
+            Write-Host "::error::T3 Code detection must require an executable, not an empty install directory"
+            $fail = 1
+          }
           if ($src -notmatch 'https://chatgpt.com/codex/install.ps1') {
             Write-Host "::error::Codex must use OpenAI's official Windows installer"
             $fail = 1
@@ -862,6 +874,10 @@ jobs:
             Write-Host "::error::an unverified handbook checkout can reach the existing bootstrap"
             $fail = 1
           } else { Write-Host "handbook origin, branch, cleanliness and fetched head are verified before handoff" }
+          if ($handbookUpdate.Value -notmatch 'already exists but is not a Git checkout') {
+            Write-Host "::error::a non-git handbook path needs local-conflict guidance"
+            $fail = 1
+          }
 
           $preflight = Get-Content preflight.ps1 -Raw
           if ($preflight -notmatch 'Have-UsablePython') {
@@ -969,6 +985,19 @@ jobs:
             Write-Host "$p -> $unix"
             if ($unix -notmatch '^/[a-z]/') { Write-Host "::error::bad conversion for $p"; exit 1 }
           }
+          $bash = Join-Path $env:ProgramFiles 'Git\bin\bash.exe'
+          $special = "/c/Ospina O'Brien & partners"
+          $received = (& $bash -lc 'printf "%s" "$1"' ospina-bootstrap $special)
+          if ($received -ne $special) {
+            Write-Host "::error::Git Bash did not preserve the workspace path as a positional argument"
+            exit 1
+          }
+          $source = Get-Content install.ps1 -Raw
+          $safeHandoff = '''exec sh "\$1/bootstrap\.sh" --no-login''.*''ospina-bootstrap''.*\$hbUnix'
+          if ($source -notmatch $safeHandoff) {
+            Write-Host "::error::the installer does not pass the handbook path safely as Bash `$1"
+            exit 1
+          }
 
       - name: bootstrap.sh Windows branch runs under Git Bash
         shell: powershell
@@ -1024,6 +1053,14 @@ jobs:
           done
           if printf '%s\n' "$handbook_update_block" | grep -Fq -- '--untracked-files=no'; then
             echo "::error::untracked handbook content must invalidate the executable checkout"
+            exit 1
+          fi
+          if ! grep -Fq 'already exists but is not a Git checkout' install.sh; then
+            echo "::error::a non-git handbook path needs local-conflict guidance"
+            exit 1
+          fi
+          if ! sed -n '/^have_t3()/,/^}/p' install.sh | grep -Fq 'Contents/MacOS'; then
+            echo "::error::T3 Code detection must require an executable, not an empty app directory"
             exit 1
           fi
           echo "handbook origin, branch, cleanliness and fetched head are verified before handoff"
@@ -1113,8 +1150,8 @@ jobs:
           mkdir -p "$old_bin" "$new_bin"
           printf '#!/bin/sh\nprintf "staff\\n"\n' > "$old_bin/groups"
           printf '#!/bin/sh\ncase "${MOCK_DS_ADMIN:-0}" in 1) printf "yes fixture is a member of admin\\n";; *) printf "no fixture is NOT a member of admin\\n";; esac\n' > "$old_bin/dseditgroup"
-          printf '#!/bin/sh\ncase "$*" in "python install --help") printf "  --default\\n";; *) exit 2;; esac\n' > "$old_bin/uv"
-          printf '#!/bin/sh\n[ "$*" = "python install --default --preview-features python-install-default --help" ]\n' > "$new_bin/uv"
+          printf '#!/bin/sh\ncase "$*" in "python install --default --preview-features python-install-default --help") exit 0;; "python install ospina-capability-probe-invalid --default --preview-features python-install-default --offline --no-python-downloads") printf "warning: Pass --preview-features python-install-default to disable this warning\\n" >&2; exit 2;; *) exit 2;; esac\n' > "$old_bin/uv"
+          printf '#!/bin/sh\ncase "$*" in "python install --default --preview-features python-install-default --help") exit 0;; "python install ospina-capability-probe-invalid --default --preview-features python-install-default --offline --no-python-downloads") printf "error: invalid Python request\\n" >&2; exit 2;; *) exit 2;; esac\n' > "$new_bin/uv"
           chmod +x "$old_bin/groups" "$old_bin/dseditgroup" "$old_bin/uv" "$new_bin/uv"
           PATH="$old_bin:$new_bin:$PATH"
 

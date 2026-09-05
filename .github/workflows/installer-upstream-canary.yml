@@ -210,3 +210,18 @@ jobs:
           fi
           bash -n "$installer"
           echo 'digest and syntax ok: official Claude shell installer'
+
+      - name: Exercise the current uv default-Python contract
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          brew list --formula uv >/dev/null 2>&1 || brew install uv
+          python_root="$RUNNER_TEMP/uv-python"
+          python_bin="$RUNNER_TEMP/uv-bin"
+          UV_PYTHON_INSTALL_DIR="$python_root" UV_PYTHON_BIN_DIR="$python_bin" \
+            uv python install 3.12 --default \
+              --preview-features python-install-default
+          "$python_bin/python" -c \
+            'import sys; assert sys.version_info[:2] == (3, 12), sys.version'
+          echo 'runtime ok: uv installed a default Python 3.12'

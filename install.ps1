@@ -286,17 +286,41 @@ function Get-CorepackPath {
 function Test-UvDefaultInstall ([string] $UvExe = 'uv') {
   if ($UvExe -eq 'uv' -and -not (Have uv)) { return $false }
   if ($UvExe -ne 'uv' -and -not (Test-Path $UvExe)) { return $false }
-  # Probe the exact parser path with --help, which has no install side effect.
-  # Older uv releases can expose --default but reject selective preview flags.
+  # clap exits successfully on --help before it validates preview-feature names.
+  # Follow the help check with a real parse against an impossible directory.
+  # The temporary file makes that directory impossible and prevents any Python
+  # download or user-state change.
   $prev = $ErrorActionPreference
+  $probeFile = $null
+  $hadInstallDir = Test-Path Env:\UV_PYTHON_INSTALL_DIR
+  $hadBinDir = Test-Path Env:\UV_PYTHON_BIN_DIR
+  $previousInstallDir = if ($hadInstallDir) { $env:UV_PYTHON_INSTALL_DIR } else { $null }
+  $previousBinDir = if ($hadBinDir) { $env:UV_PYTHON_BIN_DIR } else { $null }
   $ErrorActionPreference = 'Continue'
   try {
     & $UvExe python install --default --preview-features `
       python-install-default --help *> $null
-    $supported = $LASTEXITCODE -eq 0
+    if ($LASTEXITCODE -ne 0) { return $false }
+
+    $probeFile = [IO.Path]::GetTempFileName()
+    $env:UV_PYTHON_INSTALL_DIR = Join-Path $probeFile 'install'
+    $env:UV_PYTHON_BIN_DIR = Join-Path $probeFile 'bin'
+    $probeOutput = (& $UvExe python install ospina-capability-probe-invalid `
+      --default --preview-features python-install-default --offline `
+      --no-python-downloads 2>&1 | Out-String)
+    $probeRc = $LASTEXITCODE
+    return ($probeRc -ne 0 -and
+            $probeOutput -notmatch '(?i)preview-features|python-install-default')
+  } catch {
+    return $false
+  } finally {
+    if ($hadInstallDir) { $env:UV_PYTHON_INSTALL_DIR = $previousInstallDir }
+    else { Remove-Item Env:\UV_PYTHON_INSTALL_DIR -ErrorAction SilentlyContinue }
+    if ($hadBinDir) { $env:UV_PYTHON_BIN_DIR = $previousBinDir }
+    else { Remove-Item Env:\UV_PYTHON_BIN_DIR -ErrorAction SilentlyContinue }
+    if ($probeFile) { Remove-Item $probeFile -Force -ErrorAction SilentlyContinue }
+    $ErrorActionPreference = $prev
   }
-  finally { $ErrorActionPreference = $prev }
-  return $supported
 }
 function Get-UvCandidatePaths {
   $paths = @()
@@ -701,7 +725,14 @@ function Test-T3Code {
     (Join-Path $env:LOCALAPPDATA 'Programs\T3 Code'),
     (Join-Path $env:ProgramFiles 'T3 Code')
   )
-  foreach ($p in $paths) { if (Test-Path $p) { return $true } }
+  foreach ($p in $paths) {
+    if (-not (Test-Path $p -PathType Container)) { continue }
+    $executable = Get-ChildItem -LiteralPath $p -File -Filter '*.exe' -Recurse `
+      -ErrorAction SilentlyContinue | Where-Object {
+        $_.Name -like 'T3 Code*.exe' -or $_.Name -eq 't3code.exe'
+      } | Select-Object -First 1
+    if ($executable) { return $true }
+  }
   # Anything registered as installed under a matching display name.
   foreach ($k in @('HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*',
                    'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*')) {
@@ -1022,7 +1053,9 @@ if ((Get-ExecutionPolicy) -eq 'Restricted') {
     }
   } else {
     Say "  note     left as Restricted. npm and pnpm will not run, so the Node"
-    Say "           repositories cannot be built until you change it."
+    Say "           repositories cannot be built until you change it. Ospina's"
+    Say "           PATH preference profile also cannot run, so verified user"
+    Say "           tools may not stay ahead of older machine tools in new terminals."
   }
 } else {
   Say ("  ok       execution policy: {0}" -f (Get-ExecutionPolicy))
@@ -1342,6 +1375,9 @@ Your repositories were not touched.
     Die "The handbook did not resolve to the fetched official main commit.`nIts existing bootstrap did not run. Restore a clean official main checkout, then re-run."
   }
 } else {
+  if (Test-Path $hb) {
+    Die "'$hb' already exists but is not a Git checkout.`nMove that file or folder aside, then re-run. Nothing there was changed."
+  }
   if ((Invoke-Native gh @('repo','clone','ospina-company/handbook',$hb,'--','-q')) -ne 0) {
     Die "Could not clone the handbook."
   }
@@ -1385,7 +1421,11 @@ if ($tok) {
 # --no-login is belt and braces: even if the credential does not survive, the
 # child must never start a login it has no way to finish.
 try {
-  $rc = Invoke-Native $bash @('-lc', "sh '$hbUnix/bootstrap.sh' --no-login") -Interactive
+  # Pass the path as $1 instead of interpolating it into shell syntax. A valid
+  # Windows folder may contain an apostrophe or shell metacharacter.
+  $rc = Invoke-Native $bash @(
+    '-lc', 'exec sh "$1/bootstrap.sh" --no-login', 'ospina-bootstrap', $hbUnix
+  ) -Interactive
 } finally {
   # Restore whatever the caller had. This script runs in their session, so
   # deleting a variable we did not set would be a side effect they never asked
