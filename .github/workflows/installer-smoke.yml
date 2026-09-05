@@ -1001,7 +1001,7 @@ jobs:
           $source = Get-Content install.ps1 -Raw
           if ($source -notmatch '\$hbScriptUnix\s*=\s*"\$hbUnix/bootstrap\.sh"' -or
               $source -notmatch 'Invoke-Native \$bash @\(\$hbScriptUnix,''--no-login''\)' -or
-              $source -match "Invoke-Native \$bash @\('-lc'") {
+              $source.Contains("Invoke-Native `$bash @('-lc'")) {
             Write-Host "::error::the installer does not pass the handbook script as a native Bash argument"
             exit 1
           }
