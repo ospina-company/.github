@@ -3,10 +3,10 @@
 #
 #   /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/ospina-company/.github/main/install.sh)"
 #
-# Installs the workstation baseline (Git, Node 24, Python 3.12, document tools
-# and T3 Code), signs you in to GitHub, clones the handbook, and hands off to
-# handbook/bootstrap.sh, which clones only the Ospina repos your account can
-# read and configures your agents.
+# On macOS, installs the workstation baseline (Git, Node 24, Python 3.12,
+# document tools and T3 Code). On Linux, checks those prerequisites and gives
+# installation guidance. Both paths sign in to GitHub, clone the handbook, and
+# hand off to its access-scoped bootstrap.
 #
 # Read before running. It is short on purpose.
 # Safe to re-run: every step checks before it acts.
@@ -559,7 +559,7 @@ case "$WS" in
   Choose a path outside iCloud, Dropbox, Google Drive and OneDrive." ;;
 esac
 mkdir -p "$WS"
-WS=$(CDPATH= cd -- "$WS" && pwd)
+WS=$(CDPATH='' cd -- "$WS" && pwd)
 say "  workspace: $WS"
 
 step "Handbook"
@@ -582,7 +582,7 @@ if [ -d "$WS/handbook/.git" ]; then
     || die "The existing handbook checkout is on '${_handbook_branch:-a detached commit}', not main.
   Its bootstrap will not run. Preserve or commit your work, switch the handbook to main,
   then re-run. Your repositories were not touched."
-  [ -z "$(git -C "$WS/handbook" status --porcelain --untracked-files=no)" ] \
+  [ -z "$(git -C "$WS/handbook" status --porcelain)" ] \
     || die "The existing handbook has local changes, so its bootstrap will not run.
   Preserve or commit those changes, restore a clean main checkout, then re-run.
   Your repositories were not touched."

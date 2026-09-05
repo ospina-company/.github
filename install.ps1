@@ -57,25 +57,44 @@ function Get-RemoteFile {
   } finally { $ProgressPreference = $prev }
 }
 
-function Get-VerifiedInstallerScript {
-  # Read once, then hash and decode that same byte array. A separately hashed
-  # path followed by Get-Content would leave a same-user replacement window.
+function Invoke-VerifiedInstallerScript {
+  # Hold the file open without write/delete sharing from hashing until the
+  # child exits. The child reads the same immutable file object we authenticated,
+  # while its own PowerShell process contains any vendor `exit` statements.
   param(
     [Parameter(Mandatory)][string]$Path,
     [Parameter(Mandatory)][string]$ExpectedDigest,
     [Parameter(Mandatory)][string]$Label
   )
-  [byte[]]$installerBytes = [IO.File]::ReadAllBytes($Path)
-  $sha256 = [Security.Cryptography.SHA256]::Create()
+  $installerStream = [IO.File]::Open(
+    $Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
   try {
-    $actual = ([BitConverter]::ToString(
-      $sha256.ComputeHash($installerBytes))).Replace('-','').ToLowerInvariant()
-  } finally { $sha256.Dispose() }
-  if ($actual -ne $ExpectedDigest) {
-    throw "$Label digest changed; Platform must review the new installer"
-  }
-  $utf8 = New-Object Text.UTF8Encoding($false, $true)
-  return [scriptblock]::Create($utf8.GetString($installerBytes))
+    $sha256 = [Security.Cryptography.SHA256]::Create()
+    try {
+      $actual = ([BitConverter]::ToString(
+        $sha256.ComputeHash($installerStream))).Replace('-','').ToLowerInvariant()
+    } finally { $sha256.Dispose() }
+    if ($actual -ne $ExpectedDigest) {
+      throw "$Label digest changed; Platform must review the new installer"
+    }
+
+    $powerShellName = if ($PSVersionTable.PSEdition -eq 'Core') {
+      'pwsh.exe'
+    } else {
+      'powershell.exe'
+    }
+    $powershell = Join-Path $PSHOME $powerShellName
+    if (-not (Test-Path $powershell -PathType Leaf)) {
+      throw "$Label cannot run because the current PowerShell executable was not found"
+    }
+    $prev = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+      & $powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass `
+        -File $Path 2>&1 | Out-Host
+      return $LASTEXITCODE
+    } finally { $ErrorActionPreference = $prev }
+  } finally { $installerStream.Dispose() }
 }
 
 function Invoke-Native-Capture {
@@ -316,9 +335,9 @@ function Install-CodexOfficial {
       ("ospina-codex-install-{0}.ps1" -f [IO.Path]::GetRandomFileName())
     Get-RemoteFile -Uri 'https://chatgpt.com/codex/install.ps1' -OutFile $tempInstaller `
                    -Label 'OpenAI Codex installer'
-    $installer = Get-VerifiedInstallerScript -Path $tempInstaller `
+    $rc = Invoke-VerifiedInstallerScript -Path $tempInstaller `
       -ExpectedDigest $expectedCodexDigest -Label 'OpenAI Codex installer'
-    & $installer
+    if ($rc -ne 0) { throw "OpenAI Codex installer exited with code $rc" }
     Refresh-Path
     $null = Resolve-OnPath -Command 'codex' -Directories @(
       (Join-Path $env:USERPROFILE '.local\bin'),
@@ -348,9 +367,9 @@ function Install-ClaudeOfficial {
       ("ospina-claude-install-{0}.ps1" -f [IO.Path]::GetRandomFileName())
     Get-RemoteFile -Uri 'https://claude.ai/install.ps1' -OutFile $tempInstaller `
                    -Label 'Anthropic Claude installer'
-    $installer = Get-VerifiedInstallerScript -Path $tempInstaller `
+    $rc = Invoke-VerifiedInstallerScript -Path $tempInstaller `
       -ExpectedDigest $expectedClaudeDigest -Label 'Anthropic Claude installer'
-    & $installer
+    if ($rc -ne 0) { throw "Anthropic Claude installer exited with code $rc" }
     Refresh-Path
     $null = Resolve-OnPath -Command 'claude' -Directories @(
       (Join-Path $env:USERPROFILE '.local\bin')
@@ -1293,7 +1312,7 @@ Its bootstrap will not run. Move that checkout aside, then re-run.
     $branchLabel = if ($handbookBranch) { $handbookBranch } else { 'a detached commit' }
     Die "The existing handbook checkout is on '$branchLabel', not main.`nIts bootstrap will not run. Preserve or commit your work, switch the handbook to main, then re-run.`nYour repositories were not touched."
   }
-  $handbookDirty = Invoke-Native-Capture git @('-C',$hb,'status','--porcelain','--untracked-files=no')
+  $handbookDirty = Invoke-Native-Capture git @('-C',$hb,'status','--porcelain')
   if ($handbookDirty) {
     Die "The existing handbook has local changes, so its bootstrap will not run.`nPreserve or commit those changes, restore a clean main checkout, then re-run.`nYour repositories were not touched."
   }
