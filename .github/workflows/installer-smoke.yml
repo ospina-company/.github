@@ -988,20 +988,21 @@ jobs:
           $bash = Join-Path $env:ProgramFiles 'Git\bin\bash.exe'
           $specialRoot = Join-Path $env:RUNNER_TEMP "Ospina O'Brien & partners"
           New-Item -ItemType Directory -Force -Path $specialRoot | Out-Null
-          Set-Content -Path (Join-Path $specialRoot 'bootstrap.sh') -Value '# fixture'
+          Set-Content -Path (Join-Path $specialRoot 'bootstrap.sh') -Value 'exit 0'
           $specialFull = (Resolve-Path $specialRoot).Path
           $specialDrive = $specialFull.Substring(0,1).ToLower()
           $specialRest = $specialFull.Substring(2) -replace '\\','/'
           $specialUnix = "/$specialDrive$specialRest"
-          & $bash -lc 'test -f "$1/bootstrap.sh"' ospina-bootstrap $specialUnix
+          & $bash "$specialUnix/bootstrap.sh"
           if ($LASTEXITCODE -ne 0) {
-            Write-Host "::error::Git Bash could not use the special workspace path as a positional argument"
+            Write-Host "::error::Git Bash could not run the special workspace path as a native argument"
             exit 1
           }
           $source = Get-Content install.ps1 -Raw
-          $safeHandoff = '''exec sh "\$1/bootstrap\.sh" --no-login''.*''ospina-bootstrap''.*\$hbUnix'
-          if ($source -notmatch $safeHandoff) {
-            Write-Host "::error::the installer does not pass the handbook path safely as Bash `$1"
+          if ($source -notmatch '\$hbScriptUnix\s*=\s*"\$hbUnix/bootstrap\.sh"' -or
+              $source -notmatch 'Invoke-Native \$bash @\(\$hbScriptUnix,''--no-login''\)' -or
+              $source -match "Invoke-Native \$bash @\('-lc'") {
+            Write-Host "::error::the installer does not pass the handbook script as a native Bash argument"
             exit 1
           }
 

@@ -1418,14 +1418,14 @@ if ($tok) {
   Say "  could not read a gh token; the bootstrap step may ask you to sign in again"
 }
 
-# --no-login is belt and braces: even if the credential does not survive, the
-# child must never start a login it has no way to finish.
+# Invoke Bash with the script path as a native argument, not a shell command
+# string. That preserves valid Windows paths containing spaces, apostrophes or
+# shell metacharacters without quoting or code-injection risk. --no-login is
+# belt and braces: even if the credential does not survive, the child must never
+# start a login it has no way to finish.
 try {
-  # Pass the path as $1 instead of interpolating it into shell syntax. A valid
-  # Windows folder may contain an apostrophe or shell metacharacter.
-  $rc = Invoke-Native $bash @(
-    '-lc', 'exec sh "$1/bootstrap.sh" --no-login', 'ospina-bootstrap', $hbUnix
-  ) -Interactive
+  $hbScriptUnix = "$hbUnix/bootstrap.sh"
+  $rc = Invoke-Native $bash @($hbScriptUnix,'--no-login') -Interactive
 } finally {
   # Restore whatever the caller had. This script runs in their session, so
   # deleting a variable we did not set would be a side effect they never asked
