@@ -124,7 +124,7 @@ if (Have gh) {
 foreach ($skillRoot in @('.claude\skills','.codex\skills','.agents\skills')) {
   $skills = Join-Path $env:USERPROFILE $skillRoot
   if (Test-Path $skills) {
-    $n = (Get-ChildItem $skills -ErrorAction SilentlyContinue).Count
+    $n = (Get-ChildItem $skills -Force -ErrorAction SilentlyContinue).Count
     if ($n -gt 0) { Line 'DIRTY' "agent skills ($skillRoot)" "$skills has $n item(s)"; $dirty++ }
     else { Line 'CLEAN' "agent skills ($skillRoot)" 'directory exists but is empty' }
   } else { Line 'CLEAN' "agent skills ($skillRoot)" "no ~/$($skillRoot -replace '\\','/')" }

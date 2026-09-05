@@ -286,13 +286,17 @@ function Get-CorepackPath {
 function Test-UvDefaultInstall ([string] $UvExe = 'uv') {
   if ($UvExe -eq 'uv' -and -not (Have uv)) { return $false }
   if ($UvExe -ne 'uv' -and -not (Test-Path $UvExe)) { return $false }
-  # Invoke-Native-Capture intentionally returns one line, so use a direct
-  # capture here because --default may appear anywhere in multi-line help.
+  # Probe the exact parser path with --help, which has no install side effect.
+  # Older uv releases can expose --default but reject selective preview flags.
   $prev = $ErrorActionPreference
   $ErrorActionPreference = 'Continue'
-  try { $help = (& $UvExe python install --help 2>$null | Out-String) }
+  try {
+    & $UvExe python install --default --preview-features `
+      python-install-default --help *> $null
+    $supported = $LASTEXITCODE -eq 0
+  }
   finally { $ErrorActionPreference = $prev }
-  return ($help -match '(?m)--default\b')
+  return $supported
 }
 function Get-UvCandidatePaths {
   $paths = @()
@@ -886,14 +890,13 @@ already installed.
   }
 }
 
-# uv 0.5 introduced the --default behavior used below. Merely finding an old
-# uv binary is not enough; update it through the reviewed WinGet source and
-# verify the capability before depending on it.
+# Merely finding uv is not enough. Update it through the reviewed WinGet source
+# unless it accepts the exact default-Python preview flags used below.
 if (-not (Test-UvDefaultInstall)) {
   $null = Resolve-UvOnPath
 }
 if (-not (Test-UvDefaultInstall)) {
-  Say "  upgrade  uv (the installed version lacks 'python install --default')"
+  Say "  upgrade  uv (the installed version lacks the required default-Python preview capability)"
   $uvArgs = @('upgrade','--id','astral-sh.uv','--exact','--source','winget','--silent',
               '--disable-interactivity','--accept-package-agreements','--accept-source-agreements')
   $null = Invoke-Native winget $uvArgs -Interactive
@@ -909,7 +912,7 @@ if (-not (Test-UvDefaultInstall)) {
   }
 }
 if (-not (Test-UvDefaultInstall)) {
-  Die "uv is installed, but it is too old to manage the default Python. Remove the conflicting uv installation, then re-run."
+  Die "uv is installed, but it cannot enable the default-Python preview feature. Remove the conflicting uv installation, then re-run."
 }
 
 # Node 24 is the common version supported by T3 Code and all current Ospina
@@ -1206,7 +1209,12 @@ if (Have claude) {
     $providerAuthed = $true
   } elseif (Ask-YesNo "           Sign in to Claude Code now?") {
     $null = Invoke-Native claude @('auth','login') -Interactive
-    $providerAuthed = (Invoke-Native claude @('auth','status')) -eq 0
+    if ((Invoke-Native claude @('auth','status')) -eq 0) {
+      Say "  ok       Claude Code signed in"
+      $providerAuthed = $true
+    } else {
+      Say "  note     Claude Code sign-in did not complete. Re-run it later."
+    }
   }
 }
 if (Have codex) {

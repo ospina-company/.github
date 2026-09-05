@@ -113,16 +113,19 @@ can_install_homebrew() {
   # Homebrew's supported macOS installer requires sudo access. Starting its
   # prompts on a managed standard account can never succeed, so detect that
   # condition before downloading anything and give the reader the IT handoff.
+  local _admin_user _admin_result
   _admin_user=$(id -un)
-  if have dseditgroup \
-    && dseditgroup -o checkmember -m "$_admin_user" admin >/dev/null 2>&1; then
-    return 0
+  if have dseditgroup; then
+    _admin_result=$(dseditgroup -o checkmember -m "$_admin_user" admin 2>/dev/null) \
+      || _admin_result=
+    case "$_admin_result" in yes\ *) return 0 ;; esac
   fi
   groups "$_admin_user" 2>/dev/null | tr ' ' '\n' | grep -qx admin
 }
 
 uv_supports_default() {
-  have uv && uv python install --help 2>/dev/null | grep -q -- '--default'
+  have uv && uv python install --default \
+    --preview-features python-install-default --help >/dev/null 2>&1
 }
 
 case "$(uname -s)" in
@@ -199,15 +202,15 @@ Ask your device administrator to install Homebrew from https://brew.sh, then re-
   brew_formula uv uv required
   brew_formula pdftotext poppler required
 
-  # uv 0.5 introduced the --default behavior used below. Presence alone does
-  # not make an old uv compatible, so upgrade/replace it before proceeding.
+  # Presence alone does not prove uv accepts the exact default-Python preview
+  # flags used below, so upgrade or replace an incompatible copy first.
   if ! uv_supports_default; then
-    say "  upgrade  uv (the installed version lacks 'python install --default')"
+    say "  upgrade  uv (the installed version lacks the required default-Python preview capability)"
     brew upgrade uv || brew install uv || die "Could not install a current uv."
     add_path "$_brew_bin"
     persist_path_front "$_brew_bin"
     hash -r
-    uv_supports_default || die "A conflicting old uv is still first on PATH. Remove it, then re-run."
+    uv_supports_default || die "A conflicting incompatible uv is still first on PATH. Remove it, then re-run."
   fi
 
   _node_major=$(node -p 'process.versions.node.split(".")[0]' 2>/dev/null || true)
@@ -296,7 +299,7 @@ if have node; then
 fi
 
 if have uv; then
-  uv_supports_default || die "uv is too old; version 0.5 or newer is required."
+  uv_supports_default || die "uv lacks the default-Python preview capability. Update uv, then re-run."
   say "  install  Python 3.12 (managed by uv)"
   # --default creates the unversioned python/python3 shims and remains gated as
   # a uv preview feature. Enable only that feature for this invocation.

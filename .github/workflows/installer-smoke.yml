@@ -273,13 +273,18 @@ jobs:
             $oldUvDir = Join-Path $uvRoot 'old'
             $newUvDir = Join-Path $uvRoot 'localapp\Microsoft\WinGet\Packages\astral-sh.uv_fixture'
             New-Item -ItemType Directory -Force -Path $oldUvDir,$newUvDir | Out-Null
-            Set-Content -Path (Join-Path $oldUvDir 'uv.cmd') -Value '@echo old-uv-help' -Encoding ASCII
+            Set-Content -Path (Join-Path $oldUvDir 'uv.cmd') -Encoding ASCII -Value @'
+          @echo off
+          if "%*"=="python install --default --preview-features python-install-default --help" exit /b 2
+          echo   --default
+          '@
             $uvSource = @'
           using System;
           public class UvFixture {
             public static int Main(string[] args) {
-              Console.WriteLine("  --default");
-              return 0;
+              var actual = String.Join(" ", args);
+              var expected = "python install --default --preview-features python-install-default --help";
+              return actual == expected ? 0 : 2;
             }
           }
           '@
@@ -622,8 +627,11 @@ jobs:
           try {
             $env:USERPROFILE = Join-Path $fixture 'User'
             $env:OSPINA_PREFERRED_PATH = 'C:\fixture\python;C:\fixture\node'
-            $codexSkill = Join-Path $env:USERPROFILE '.codex\skills\humanizer'
+            $codexSkill = Join-Path $env:USERPROFILE '.codex\skills\.hidden-fixture'
             New-Item -ItemType Directory -Force -Path $codexSkill | Out-Null
+            (Get-Item -LiteralPath $codexSkill -Force).Attributes = `
+              (Get-Item -LiteralPath $codexSkill -Force).Attributes -bor `
+              [IO.FileAttributes]::Hidden
             $preferredState = Join-Path $env:USERPROFILE '.ospina\preferred-path'
             New-Item -ItemType Directory -Force -Path (Split-Path $preferredState -Parent) | Out-Null
             Set-Content -LiteralPath $preferredState -Value 'C:\fixture\python' -Encoding ASCII
@@ -776,8 +784,9 @@ jobs:
             Write-Host "::error::both WinGet attempts must resolve portable Node before the generic required-tool failure"
             $fail = 1
           }
-          if ($src -notmatch 'Test-UvDefaultInstall') {
-            Write-Host "::error::the installer must reject or upgrade uv versions without --default support"
+          if ($src -notmatch 'Test-UvDefaultInstall' -or
+              $src -notmatch 'python install --default --preview-features') {
+            Write-Host "::error::the installer must reject uv without the exact default-Python preview capability"
             $fail = 1
           }
           if ($src -notmatch "'python','install','3\.12','--default','--preview-features','python-install-default'") {
@@ -1103,9 +1112,9 @@ jobs:
           new_bin="$RUNNER_TEMP/ospina-mocks-new"
           mkdir -p "$old_bin" "$new_bin"
           printf '#!/bin/sh\nprintf "staff\\n"\n' > "$old_bin/groups"
-          printf '#!/bin/sh\ncase "${MOCK_DS_ADMIN:-0}" in 1) exit 0;; *) exit 1;; esac\n' > "$old_bin/dseditgroup"
-          printf '#!/bin/sh\nprintf "old uv help\\n"\n' > "$old_bin/uv"
-          printf '#!/bin/sh\nprintf "  --default\\n"\n' > "$new_bin/uv"
+          printf '#!/bin/sh\ncase "${MOCK_DS_ADMIN:-0}" in 1) printf "yes fixture is a member of admin\\n";; *) printf "no fixture is NOT a member of admin\\n";; esac\n' > "$old_bin/dseditgroup"
+          printf '#!/bin/sh\ncase "$*" in "python install --help") printf "  --default\\n";; *) exit 2;; esac\n' > "$old_bin/uv"
+          printf '#!/bin/sh\n[ "$*" = "python install --default --preview-features python-install-default --help" ]\n' > "$new_bin/uv"
           chmod +x "$old_bin/groups" "$old_bin/dseditgroup" "$old_bin/uv" "$new_bin/uv"
           PATH="$old_bin:$new_bin:$PATH"
 
