@@ -702,8 +702,8 @@ jobs:
             Write-Host "::error::the installer must reject or upgrade uv versions without --default support"
             $fail = 1
           }
-          if ($src -notmatch "'python','install','3\.12','--default','--preview'") {
-            Write-Host "::error::the Windows installer must opt into uv's preview-gated --default behavior"
+          if ($src -notmatch "'python','install','3\.12','--default','--preview-features','python-install-default'") {
+            Write-Host "::error::the Windows installer must enable only uv's python-install-default preview feature"
             $fail = 1
           }
           if ($src -notmatch 'function Get-VerifiedInstallerScript' -or
@@ -968,7 +968,7 @@ jobs:
         run: |
           bash -n install.sh
           for required in 'node@24' 'corepack enable' 'uv python install 3.12' \
-                          'uv python install 3.12 --default --preview' \
+                          'uv python install 3.12 --default --preview-features python-install-default' \
                           'brew install --cask libreoffice' 'pdftotext' \
                           'if [ "$PLATFORM" = mac ] && have brew; then brew install --cask codex' \
                           'brew install --cask t3-code' \

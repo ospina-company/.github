@@ -950,8 +950,8 @@ if ($corepackReady) {
 
 Say "  install  Python 3.12 (managed by uv)"
 # --default creates the unversioned python/python3 shims and remains gated as a
-# uv preview feature. Scope the opt-in to this one command.
-if ((Invoke-Native uv @('python','install','3.12','--default','--preview') -Interactive) -ne 0) {
+# uv preview feature. Enable only that feature for this invocation.
+if ((Invoke-Native uv @('python','install','3.12','--default','--preview-features','python-install-default') -Interactive) -ne 0) {
   Die "uv could not install Python 3.12."
 }
 $uvBin = Invoke-Native-Capture uv @('python','dir','--bin')

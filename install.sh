@@ -299,8 +299,9 @@ if have uv; then
   uv_supports_default || die "uv is too old; version 0.5 or newer is required."
   say "  install  Python 3.12 (managed by uv)"
   # --default creates the unversioned python/python3 shims and remains gated as
-  # a uv preview feature. Scope the opt-in to this one command.
-  uv python install 3.12 --default --preview || die "uv could not install Python 3.12."
+  # a uv preview feature. Enable only that feature for this invocation.
+  uv python install 3.12 --default --preview-features python-install-default \
+    || die "uv could not install Python 3.12."
   _uv_bin=$(uv python dir --bin 2>/dev/null || true)
   if [ -n "$_uv_bin" ]; then
     add_path "$_uv_bin"
