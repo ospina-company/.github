@@ -706,6 +706,17 @@ jobs:
             Write-Host "::error::the Windows installer must opt into uv's preview-gated --default behavior"
             $fail = 1
           }
+          if ($src -notmatch 'function Get-VerifiedInstallerScript' -or
+              $src -notmatch 'ComputeHash\(\$installerBytes\)' -or
+              $src -notmatch 'GetString\(\$installerBytes\)' -or
+              $src -match 'Get-Content \$tempInstaller') {
+            Write-Host "::error::vendor installers must hash and execute the same in-memory bytes"
+            $fail = 1
+          }
+          if ($src -notmatch 'GetRandomFileName\(\)') {
+            Write-Host "::error::vendor installer staging names must be unpredictable"
+            $fail = 1
+          }
           $shellSrc = Get-Content install.sh -Raw
           foreach ($digest in @(
             '12479a24be3f5307eecac7cde670fad7118640f031229e964f544b1367b52a41',

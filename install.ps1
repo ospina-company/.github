@@ -57,6 +57,27 @@ function Get-RemoteFile {
   } finally { $ProgressPreference = $prev }
 }
 
+function Get-VerifiedInstallerScript {
+  # Read once, then hash and decode that same byte array. A separately hashed
+  # path followed by Get-Content would leave a same-user replacement window.
+  param(
+    [Parameter(Mandatory)][string]$Path,
+    [Parameter(Mandatory)][string]$ExpectedDigest,
+    [Parameter(Mandatory)][string]$Label
+  )
+  [byte[]]$installerBytes = [IO.File]::ReadAllBytes($Path)
+  $sha256 = [Security.Cryptography.SHA256]::Create()
+  try {
+    $actual = ([BitConverter]::ToString(
+      $sha256.ComputeHash($installerBytes))).Replace('-','').ToLowerInvariant()
+  } finally { $sha256.Dispose() }
+  if ($actual -ne $ExpectedDigest) {
+    throw "$Label digest changed; Platform must review the new installer"
+  }
+  $utf8 = New-Object Text.UTF8Encoding($false, $true)
+  return [scriptblock]::Create($utf8.GetString($installerBytes))
+}
+
 function Invoke-Native-Capture {
   # Same stderr problem, but we want stdout back as a string.
   param([Parameter(Mandatory)][string] $Exe, [string[]] $Arguments = @())
@@ -291,15 +312,13 @@ function Install-CodexOfficial {
     # Reviewed on 2026-08-31. The official endpoint is mutable, so authenticate
     # the content before executing it and fail closed on an upstream change.
     $expectedCodexDigest = '391f247de2c70c7e99041979ec02dae7e76be27ac9cfc1dfe7c1eb21d48d8b97'
-    $tempInstaller = Join-Path ([IO.Path]::GetTempPath()) ("ospina-codex-install-{0}.ps1" -f $PID)
+    $tempInstaller = Join-Path ([IO.Path]::GetTempPath()) `
+      ("ospina-codex-install-{0}.ps1" -f [IO.Path]::GetRandomFileName())
     Get-RemoteFile -Uri 'https://chatgpt.com/codex/install.ps1' -OutFile $tempInstaller `
                    -Label 'OpenAI Codex installer'
-    $actual = (Get-FileHash -Algorithm SHA256 $tempInstaller).Hash.ToLowerInvariant()
-    if ($actual -ne $expectedCodexDigest) {
-      throw "OpenAI Codex installer digest changed; Platform must review the new installer"
-    }
-    $installer = Get-Content $tempInstaller -Raw
-    & ([scriptblock]::Create($installer))
+    $installer = Get-VerifiedInstallerScript -Path $tempInstaller `
+      -ExpectedDigest $expectedCodexDigest -Label 'OpenAI Codex installer'
+    & $installer
     Refresh-Path
     $null = Resolve-OnPath -Command 'codex' -Directories @(
       (Join-Path $env:USERPROFILE '.local\bin'),
@@ -325,15 +344,13 @@ function Install-ClaudeOfficial {
     # Reviewed on 2026-09-04. The endpoint is mutable, so authenticate the
     # downloaded bytes before executing them and fail closed on a change.
     $expectedClaudeDigest = 'cd17c6b555f761d60373659824bf805e1510538226e4c7028e19d7494937a333'
-    $tempInstaller = Join-Path ([IO.Path]::GetTempPath()) ("ospina-claude-install-{0}.ps1" -f $PID)
+    $tempInstaller = Join-Path ([IO.Path]::GetTempPath()) `
+      ("ospina-claude-install-{0}.ps1" -f [IO.Path]::GetRandomFileName())
     Get-RemoteFile -Uri 'https://claude.ai/install.ps1' -OutFile $tempInstaller `
                    -Label 'Anthropic Claude installer'
-    $actual = (Get-FileHash -Algorithm SHA256 $tempInstaller).Hash.ToLowerInvariant()
-    if ($actual -ne $expectedClaudeDigest) {
-      throw "Anthropic Claude installer digest changed; Platform must review the new installer"
-    }
-    $installer = Get-Content $tempInstaller -Raw
-    & ([scriptblock]::Create($installer))
+    $installer = Get-VerifiedInstallerScript -Path $tempInstaller `
+      -ExpectedDigest $expectedClaudeDigest -Label 'Anthropic Claude installer'
+    & $installer
     Refresh-Path
     $null = Resolve-OnPath -Command 'claude' -Directories @(
       (Join-Path $env:USERPROFILE '.local\bin')
