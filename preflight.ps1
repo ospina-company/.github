@@ -114,8 +114,9 @@ if (Have gh) {
   } else { Line 'CLEAN' 'gh credentials' 'not signed in' }
 } else { Line 'CLEAN' 'gh credentials' 'gh not installed for this user' }
 
-# 2. Agent skills. Claude and Codex use different user-level discovery roots.
-foreach ($skillRoot in @('.claude\skills','.agents\skills')) {
+# 2. Agent skills. Bootstrap writes the Claude and Codex roots; keep the shared
+# agent root in the contamination check for older harnesses.
+foreach ($skillRoot in @('.claude\skills','.codex\skills','.agents\skills')) {
   $skills = Join-Path $env:USERPROFILE $skillRoot
   if (Test-Path $skills) {
     $n = (Get-ChildItem $skills -ErrorAction SilentlyContinue).Count

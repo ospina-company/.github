@@ -573,6 +573,27 @@ jobs:
           }
           Write-Host "preflight application and Store-scope fixtures pass"
 
+      - name: Preflight rejects existing Codex bootstrap state
+        shell: powershell
+        run: |
+          $fixture = Join-Path $env:RUNNER_TEMP 'preflight-codex-state'
+          $savedUserProfile = $env:USERPROFILE
+          try {
+            $env:USERPROFILE = Join-Path $fixture 'User'
+            $codexSkill = Join-Path $env:USERPROFILE '.codex\skills\humanizer'
+            New-Item -ItemType Directory -Force -Path $codexSkill | Out-Null
+            $output = (& powershell.exe -NoProfile -ExecutionPolicy Bypass `
+                         -File (Resolve-Path preflight.ps1) 2>&1 | Out-String)
+            if ($output -notmatch '(?m)DIRTY\s+agent skills \(\.codex\\skills\)') {
+              Write-Host "::error::preflight approved an account with existing Codex skills"
+              exit 1
+            }
+          } finally {
+            $env:USERPROFILE = $savedUserProfile
+            Remove-Item $fixture -Recurse -Force -ErrorAction SilentlyContinue
+          }
+          Write-Host "existing Codex skills invalidate the clean-account preflight"
+
       - name: Native stderr does not kill the script (regression)
         shell: powershell
         run: |
