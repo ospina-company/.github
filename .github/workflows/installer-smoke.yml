@@ -68,6 +68,41 @@ jobs:
           if (-not $env:Path) { Write-Host "::error::Refresh-Path produced an empty PATH"; exit 1 }
           Write-Host "Refresh-Path ok"
 
+          # Vendor launchers use `exit` on failure. They must run in a child so
+          # an optional-agent failure cannot terminate the onboarding shell, and
+          # the authenticated file must remain immutable until that child exits.
+          $vendorFixture = Join-Path $env:RUNNER_TEMP 'vendor-exit-fixture.ps1'
+          Set-Content -LiteralPath $vendorFixture -Encoding ASCII -Value @'
+          Write-Output 'vendor failure fixture'
+          exit 23
+          '@
+          $vendorDigest = (Get-FileHash -LiteralPath $vendorFixture -Algorithm SHA256).Hash.ToLowerInvariant()
+          $vendorRc = Invoke-VerifiedInstallerScript -Path $vendorFixture `
+            -ExpectedDigest $vendorDigest -Label 'vendor failure fixture'
+          if ($vendorRc -ne 23) {
+            Write-Host "::error::isolated vendor exit returned $vendorRc instead of 23"; exit 1
+          }
+          Write-Host "vendor exit stayed inside its child process"
+
+          $lockedFixture = Join-Path $env:RUNNER_TEMP 'vendor-lock-fixture.ps1'
+          Set-Content -LiteralPath $lockedFixture -Encoding ASCII -Value @'
+          try {
+            Set-Content -LiteralPath $MyInvocation.MyCommand.Path -Value 'tampered' -ErrorAction Stop
+            exit 99
+          } catch {
+            Write-Output 'authenticated installer remained write-locked'
+            exit 0
+          }
+          '@
+          $lockedDigest = (Get-FileHash -LiteralPath $lockedFixture -Algorithm SHA256).Hash.ToLowerInvariant()
+          $lockedRc = Invoke-VerifiedInstallerScript -Path $lockedFixture `
+            -ExpectedDigest $lockedDigest -Label 'vendor lock fixture'
+          if ($lockedRc -ne 0 -or
+              (Get-FileHash -LiteralPath $lockedFixture -Algorithm SHA256).Hash.ToLowerInvariant() -ne $lockedDigest) {
+            Write-Host "::error::authenticated installer changed while its child was running"; exit 1
+          }
+          Write-Host "vendor installer bytes remain locked from digest through child exit"
+
           $bash = Find-GitBash
           if (-not $bash) { Write-Host "::error::Find-GitBash found nothing on a runner that has Git"; exit 1 }
           Write-Host "Find-GitBash -> $bash"
@@ -515,8 +550,13 @@ jobs:
             if ((Get-LibreOfficePath) -ne $lo) {
               Write-Host "::error::preflight missed an inherited LibreOffice installation"; exit 1
             }
-            if ((Get-T3CodePath) -ne $t3) {
-              Write-Host "::error::preflight missed an inherited T3 Code installation"; exit 1
+            if (Get-T3CodePath) {
+              Write-Host "::error::an empty T3 Code directory was treated as an application"; exit 1
+            }
+            $t3Executable = Join-Path $t3 'T3 Code (Alpha).exe'
+            New-Item -ItemType File -Force -Path $t3Executable | Out-Null
+            if ((Get-T3CodePath) -ne $t3Executable) {
+              Write-Host "::error::preflight missed an inherited T3 Code executable"; exit 1
             }
 
             $storeAlias = Join-Path $env:USERPROFILE 'AppData\Local\Microsoft\WindowsApps\python.exe'
@@ -573,26 +613,43 @@ jobs:
           }
           Write-Host "preflight application and Store-scope fixtures pass"
 
-      - name: Preflight rejects existing Codex bootstrap state
+      - name: Preflight rejects partial bootstrap state
         shell: powershell
         run: |
           $fixture = Join-Path $env:RUNNER_TEMP 'preflight-codex-state'
           $savedUserProfile = $env:USERPROFILE
+          $savedPreferredPath = $env:OSPINA_PREFERRED_PATH
           try {
             $env:USERPROFILE = Join-Path $fixture 'User'
+            $env:OSPINA_PREFERRED_PATH = 'C:\fixture\python;C:\fixture\node'
             $codexSkill = Join-Path $env:USERPROFILE '.codex\skills\humanizer'
             New-Item -ItemType Directory -Force -Path $codexSkill | Out-Null
+            $preferredState = Join-Path $env:USERPROFILE '.ospina\preferred-path'
+            New-Item -ItemType Directory -Force -Path (Split-Path $preferredState -Parent) | Out-Null
+            Set-Content -LiteralPath $preferredState -Value 'C:\fixture\python' -Encoding ASCII
+            $powerShellProfile = Join-Path $env:USERPROFILE `
+              'Documents\WindowsPowerShell\Microsoft.PowerShell_profile.ps1'
+            New-Item -ItemType Directory -Force -Path (Split-Path $powerShellProfile -Parent) | Out-Null
+            Set-Content -LiteralPath $powerShellProfile `
+              -Value '# >>> ospina workstation PATH >>>' -Encoding ASCII
             $output = (& powershell.exe -NoProfile -ExecutionPolicy Bypass `
                          -File (Resolve-Path preflight.ps1) 2>&1 | Out-String)
-            if ($output -notmatch '(?m)DIRTY\s+agent skills \(\.codex\\skills\)') {
-              Write-Host "::error::preflight approved an account with existing Codex skills"
-              exit 1
+            foreach ($requiredDirty in @(
+              'agent skills \(\.codex\\skills\)',
+              'OSPINA_PREFERRED_PATH',
+              'preferred PATH state',
+              'shell profiles.*Microsoft\.PowerShell_profile\.ps1')) {
+              if ($output -notmatch "(?m)DIRTY\s+$requiredDirty") {
+                Write-Host "::error::preflight missed partial bootstrap state: $requiredDirty"
+                exit 1
+              }
             }
           } finally {
             $env:USERPROFILE = $savedUserProfile
+            $env:OSPINA_PREFERRED_PATH = $savedPreferredPath
             Remove-Item $fixture -Recurse -Force -ErrorAction SilentlyContinue
           }
-          Write-Host "existing Codex skills invalidate the clean-account preflight"
+          Write-Host "all partial bootstrap state invalidates the clean-account preflight"
 
       - name: Native stderr does not kill the script (regression)
         shell: powershell
@@ -727,11 +784,13 @@ jobs:
             Write-Host "::error::the Windows installer must enable only uv's python-install-default preview feature"
             $fail = 1
           }
-          if ($src -notmatch 'function Get-VerifiedInstallerScript' -or
-              $src -notmatch 'ComputeHash\(\$installerBytes\)' -or
-              $src -notmatch 'GetString\(\$installerBytes\)' -or
+          if ($src -notmatch 'function Invoke-VerifiedInstallerScript' -or
+              $src -notmatch 'ComputeHash\(\$installerStream\)' -or
+              $src -notmatch '\[IO\.FileShare\]::Read' -or
+              $src -notmatch '\$PSVersionTable\.PSEdition' -or
+              $src -notmatch '\-File \$Path' -or
               $src -match 'Get-Content \$tempInstaller') {
-            Write-Host "::error::vendor installers must hash and execute the same in-memory bytes"
+            Write-Host "::error::vendor installers must hash, lock and execute the same file in an isolated child"
             $fail = 1
           }
           if ($src -notmatch 'GetRandomFileName\(\)') {
@@ -785,7 +844,8 @@ jobs:
           if (-not $handbookUpdate.Success -or
               $handbookUpdate.Value -notmatch '''remote'',''get-url'',''origin''' -or
               $handbookUpdate.Value -notmatch '''symbolic-ref'',''--quiet'',''--short'',''HEAD''' -or
-              $handbookUpdate.Value -notmatch '''status'',''--porcelain'',''--untracked-files=no''' -or
+              $handbookUpdate.Value -notmatch '''status'',''--porcelain''' -or
+              $handbookUpdate.Value -match '--untracked-files=no' -or
               $handbookUpdate.Value -notmatch '''fetch'',''-q'',''origin'',''main''' -or
               $handbookUpdate.Value -notmatch '''merge'',''-q'',''--ff-only'',\$handbookTarget' -or
               $handbookUpdate.Value -notmatch '\$handbookHead -ne \$handbookTarget' -or
@@ -944,7 +1004,7 @@ jobs:
           for required in \
             'remote get-url origin' \
             'symbolic-ref --quiet --short HEAD' \
-            'status --porcelain --untracked-files=no' \
+            'status --porcelain' \
             'fetch -q origin main' \
             'merge -q --ff-only "$_handbook_target"' \
             '[ "$_handbook_head" = "$_handbook_target" ]'; do
@@ -953,6 +1013,10 @@ jobs:
               exit 1
             fi
           done
+          if printf '%s\n' "$handbook_update_block" | grep -Fq -- '--untracked-files=no'; then
+            echo "::error::untracked handbook content must invalidate the executable checkout"
+            exit 1
+          fi
           echo "handbook origin, branch, cleanliness and fetched head are verified before handoff"
           echo "all installers in install.sh stream their output"
           eval "$(sed -n '/^install_codex()/,/^}/p' install.sh)"
@@ -976,7 +1040,7 @@ jobs:
           unset -f brew npm
           echo "Linux Codex uses npm even when Linuxbrew is present"
           sudo apt-get update -qq && sudo apt-get install -y shellcheck -qq
-          shellcheck -S warning install.sh || true
+          shellcheck -S warning install.sh
 
   macos:
     runs-on: macos-latest

@@ -66,7 +66,12 @@ function Get-T3CodePath {
     if (-not $root) { continue }
     foreach ($relative in @('Programs\t3code','Programs\T3 Code','T3 Code')) {
       $candidate = Join-Path $root $relative
-      if (Test-Path $candidate) { return $candidate }
+      if (-not (Test-Path $candidate -PathType Container)) { continue }
+      $executable = Get-ChildItem -LiteralPath $candidate -File -Filter '*.exe' `
+        -ErrorAction SilentlyContinue | Where-Object {
+          $_.Name -like 'T3 Code*.exe' -or $_.Name -eq 't3code.exe'
+        } | Select-Object -First 1
+      if ($executable) { return $executable.FullName }
     }
   }
   foreach ($key in @('HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*',
@@ -130,13 +135,38 @@ if ($env:OSPINA_HANDBOOK) { Line 'DIRTY' 'OSPINA_HANDBOOK' $env:OSPINA_HANDBOOK;
 else { Line 'CLEAN' 'OSPINA_HANDBOOK' 'not set' }
 if ($env:VALE_CONFIG_PATH) { Line 'DIRTY' 'VALE_CONFIG_PATH' $env:VALE_CONFIG_PATH; $dirty++ }
 else { Line 'CLEAN' 'VALE_CONFIG_PATH' 'not set' }
+$preferredPath = [Environment]::GetEnvironmentVariable('OSPINA_PREFERRED_PATH','User')
+if (-not $preferredPath) { $preferredPath = $env:OSPINA_PREFERRED_PATH }
+if ($preferredPath) { Line 'DIRTY' 'OSPINA_PREFERRED_PATH' $preferredPath; $dirty++ }
+else { Line 'CLEAN' 'OSPINA_PREFERRED_PATH' 'not set' }
+$preferredPathState = Join-Path $env:USERPROFILE '.ospina\preferred-path'
+if (Test-Path $preferredPathState -PathType Leaf) {
+  Line 'DIRTY' 'preferred PATH state' $preferredPathState; $dirty++
+} else { Line 'CLEAN' 'preferred PATH state' 'no ~/.ospina/preferred-path' }
 
 # 4. Shell profiles
 $found = @()
-foreach ($f in @('.bashrc','.bash_profile','.zshrc','.profile')) {
-  $path = Join-Path $env:USERPROFILE $f
-  if ((Test-Path $path) -and (Select-String -Path $path -Pattern 'ospina handbook' -Quiet -ErrorAction SilentlyContinue)) {
-    $found += $f
+$documents = @((Join-Path $env:USERPROFILE 'Documents'),
+               [Environment]::GetFolderPath('MyDocuments')) |
+             Where-Object { $_ } | Select-Object -Unique
+$profileCandidates = @('.bashrc','.bash_profile','.bash_login','.zshrc','.profile') |
+                     ForEach-Object {
+                       [pscustomobject]@{ Label = $_; Path = Join-Path $env:USERPROFILE $_ }
+                     }
+foreach ($documentsRoot in $documents) {
+  foreach ($relative in @('WindowsPowerShell\Microsoft.PowerShell_profile.ps1',
+                           'PowerShell\Microsoft.PowerShell_profile.ps1')) {
+    $profileCandidates += [pscustomobject]@{
+      Label = $relative
+      Path = Join-Path $documentsRoot $relative
+    }
+  }
+}
+foreach ($candidate in $profileCandidates) {
+  if ((Test-Path $candidate.Path -PathType Leaf) -and
+      (Select-String -Path $candidate.Path -Pattern 'ospina (handbook|workstation PATH)' `
+                     -Quiet -ErrorAction SilentlyContinue)) {
+    $found += $candidate.Label
   }
 }
 if ($found.Count) { Line 'DIRTY' 'shell profiles' ("ospina block in: " + ($found -join ', ')); $dirty++ }
