@@ -986,10 +986,16 @@ jobs:
             if ($unix -notmatch '^/[a-z]/') { Write-Host "::error::bad conversion for $p"; exit 1 }
           }
           $bash = Join-Path $env:ProgramFiles 'Git\bin\bash.exe'
-          $special = "/c/Ospina O'Brien & partners"
-          $received = (& $bash -lc 'printf "%s" "$1"' ospina-bootstrap $special)
-          if ($received -ne $special) {
-            Write-Host "::error::Git Bash did not preserve the workspace path as a positional argument"
+          $specialRoot = Join-Path $env:RUNNER_TEMP "Ospina O'Brien & partners"
+          New-Item -ItemType Directory -Force -Path $specialRoot | Out-Null
+          Set-Content -Path (Join-Path $specialRoot 'bootstrap.sh') -Value '# fixture'
+          $specialFull = (Resolve-Path $specialRoot).Path
+          $specialDrive = $specialFull.Substring(0,1).ToLower()
+          $specialRest = $specialFull.Substring(2) -replace '\\','/'
+          $specialUnix = "/$specialDrive$specialRest"
+          & $bash -lc 'test -f "$1/bootstrap.sh"' ospina-bootstrap $specialUnix
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "::error::Git Bash could not use the special workspace path as a positional argument"
             exit 1
           }
           $source = Get-Content install.ps1 -Raw
