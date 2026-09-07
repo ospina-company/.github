@@ -323,24 +323,31 @@ if have node; then
 fi
 
 if have uv; then
-  uv_supports_default || die "uv lacks the default-Python preview capability. Update uv, then re-run."
-  say "  install  Python 3.12 (managed by uv)"
-  # --default creates the unversioned python/python3 shims and remains gated as
-  # a uv preview feature. Enable only that feature for this invocation.
-  uv python install 3.12 --default --preview-features python-install-default \
-    || die "uv could not install Python 3.12."
-  _uv_bin=$(uv python dir --bin 2>/dev/null || true)
-  if [ -n "$_uv_bin" ]; then
-    add_path "$_uv_bin"
-    if [ "$PLATFORM" = mac ]; then persist_path_front "$_uv_bin"; fi
-  fi
-  if uv python find 3.12 >/dev/null 2>&1; then
-    _python_minor=$(python -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")' 2>/dev/null || true)
-    [ "$_python_minor" = 3.12 ] \
-      || die "Python 3.12 is installed, but the 'python' command resolves to ${_python_minor:-nothing}. Open a new terminal and re-run."
-    say "  ok       Python $(python -c 'import platform; print(platform.python_version())')"
+  if ! uv_supports_default; then
+    if [ "$PLATFORM" = mac ]; then
+      die "uv lacks the default-Python preview capability. Update uv, then re-run."
+    fi
+    say "  ${DIM}note: uv is outdated and cannot install the required default Python 3.12.${RESET}"
+    say "  ${DIM}      Update it from https://docs.astral.sh/uv/, then re-run.${RESET}"
   else
-    die "Python 3.12 was requested but uv cannot find it."
+    say "  install  Python 3.12 (managed by uv)"
+    # --default creates the unversioned python/python3 shims and remains gated as
+    # a uv preview feature. Enable only that feature for this invocation.
+    uv python install 3.12 --default --preview-features python-install-default \
+      || die "uv could not install Python 3.12."
+    _uv_bin=$(uv python dir --bin 2>/dev/null || true)
+    if [ -n "$_uv_bin" ]; then
+      add_path "$_uv_bin"
+      if [ "$PLATFORM" = mac ]; then persist_path_front "$_uv_bin"; fi
+    fi
+    if uv python find 3.12 >/dev/null 2>&1; then
+      _python_minor=$(python -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")' 2>/dev/null || true)
+      [ "$_python_minor" = 3.12 ] \
+        || die "Python 3.12 is installed, but the 'python' command resolves to ${_python_minor:-nothing}. Open a new terminal and re-run."
+      say "  ok       Python $(python -c 'import platform; print(platform.python_version())')"
+    else
+      die "Python 3.12 was requested but uv cannot find it."
+    fi
   fi
 fi
 
