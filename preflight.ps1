@@ -67,7 +67,7 @@ function Get-T3CodePath {
     foreach ($relative in @('Programs\t3code','Programs\T3 Code','T3 Code')) {
       $candidate = Join-Path $root $relative
       if (-not (Test-Path $candidate -PathType Container)) { continue }
-      $executable = Get-ChildItem -LiteralPath $candidate -File -Filter '*.exe' `
+      $executable = Get-ChildItem -LiteralPath $candidate -File -Filter '*.exe' -Recurse `
         -ErrorAction SilentlyContinue | Where-Object {
           $_.Name -like 'T3 Code*.exe' -or $_.Name -eq 't3code.exe'
         } | Select-Object -First 1

@@ -562,7 +562,8 @@ jobs:
             if (Get-T3CodePath) {
               Write-Host "::error::an empty T3 Code directory was treated as an application"; exit 1
             }
-            $t3Executable = Join-Path $t3 'T3 Code (Alpha).exe'
+            $t3Executable = Join-Path $t3 'current\T3 Code (Alpha).exe'
+            New-Item -ItemType Directory -Force -Path (Split-Path $t3Executable -Parent) | Out-Null
             New-Item -ItemType File -Force -Path $t3Executable | Out-Null
             if ((Get-T3CodePath) -ne $t3Executable) {
               Write-Host "::error::preflight missed an inherited T3 Code executable"; exit 1
@@ -1068,6 +1069,25 @@ jobs:
           fi
           if ! sed -n '/^have_t3()/,/^}/p' install.sh | grep -Fq 'Contents/MacOS'; then
             echo "::error::T3 Code detection must require an executable, not an empty app directory"
+            exit 1
+          fi
+          python_block=$(sed -n \
+            '/^if have uv; then$/,/^# --------------------------------------------------------------------- auth/p' \
+            install.sh | sed '$d')
+          if ! linux_uv_output=$(
+            have() { [ "$1" = uv ]; }
+            uv_supports_default() { return 1; }
+            die() { return 99; }
+            say() { printf '%s\n' "$*"; }
+            PLATFORM=linux DIM= RESET=
+            eval "$python_block"
+          ); then
+            echo "::error::an outdated Linux uv aborted the guidance-only installer path"
+            exit 1
+          fi
+          if ! printf '%s\n' "$linux_uv_output" |
+               grep -Fq 'uv is outdated and cannot install the required default Python 3.12'; then
+            echo "::error::an outdated Linux uv did not emit actionable guidance"
             exit 1
           fi
           echo "handbook origin, branch, cleanliness and fetched head are verified before handoff"
