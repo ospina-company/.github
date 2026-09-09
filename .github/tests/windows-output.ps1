@@ -11,6 +11,28 @@ foreach ($f in $ast.FindAll({
 }, $true)) { Invoke-Expression $f.Extent.Text }
 function Assert($Condition, $Message) { if (-not $Condition) { throw $Message } }
 
+$preflightAst = [System.Management.Automation.Language.Parser]::ParseFile(
+  (Join-Path $root 'preflight.ps1'), [ref]$null, [ref]$parseErrors)
+if ($parseErrors.Count) { throw ($parseErrors | Out-String) }
+$storeProbe = $preflightAst.Find({
+  $args[0] -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+  $args[0].Name -eq 'Test-StorePythonPackage'
+}, $true)
+Invoke-Expression $storeProbe.Extent.Text
+function Get-AppxPackage { param($Name,$ErrorAction) throw 'synthetic unsupported Appx query' }
+try { Assert ($null -eq (Test-StorePythonPackage)) 'failed Appx query treated as absence' }
+finally { Remove-Item Function:\Get-AppxPackage }
+
+$setupEntry = $ast.Find({
+  $args[0] -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+  $args[0].Name -eq 'Invoke-OspinaInstall'
+}, $true).Extent.Text
+$loIndex = $setupEntry.IndexOf('if (-not (Ensure-LibreOffice))')
+$uvPriorityIndex = $setupEntry.IndexOf('Add-UserPathEntry $uvBin')
+$pythonCheckIndex = $setupEntry.IndexOf('$pythonMinor = Get-PythonMinor')
+Assert ($loIndex -ge 0 -and $uvPriorityIndex -gt $loIndex -and
+        $pythonCheckIndex -gt $uvPriorityIndex) 'LibreOffice can shadow verified Python priority'
+
 Assert ((Format-DownloadReceipt 512 0.04) -eq 'downloaded 512 B in under 1s') 'small receipt'
 Assert ((Format-DownloadReceipt 0 0) -eq 'downloaded 0 B in under 1s') 'zero-byte formatting'
 Assert ((Format-DownloadReceipt 4096 0.8) -match '4[.,]0 KiB in under 1s') 'KiB receipt'
