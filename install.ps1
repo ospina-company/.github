@@ -32,6 +32,15 @@ function Have ($c) { $null -ne (Get-Command $c -ErrorAction SilentlyContinue) }
 # even when the command only printed a diagnostic. `gh auth status` on a machine
 # that is not logged in does exactly that, and it is not a failure: it is the
 # answer. Judge native tools by exit code, never by whether they wrote to stderr.
+function Format-DownloadReceipt {
+  param([long]$Bytes, [double]$Seconds)
+  $size = if ($Bytes -lt 1KB) { "${Bytes} B" }
+          elseif ($Bytes -lt 1MB) { '{0:N1} KiB' -f ($Bytes / 1KB) }
+          else { '{0:N1} MiB' -f ($Bytes / 1MB) }
+  $duration = if ($Seconds -lt 1) { 'under 1s' } else { '{0:N1}s' -f $Seconds }
+  return "downloaded $size in $duration"
+}
+
 function Get-RemoteFile {
   # Invoke-WebRequest renders a progress bar per chunk, and in Windows
   # PowerShell 5.x that costs roughly a factor of ten on a large file
@@ -49,11 +58,11 @@ function Get-RemoteFile {
   try {
     if ($SizeMB -gt 0) { Say ("          downloading {0} ({1} MB)..." -f $Label, $SizeMB) }
     else               { Say ("          downloading {0}..." -f $Label) }
-    $t0 = Get-Date
+    $timer = [Diagnostics.Stopwatch]::StartNew()
     Invoke-WebRequest $Uri -OutFile $OutFile -UseBasicParsing
-    $secs = [int]((Get-Date) - $t0).TotalSeconds
-    $mb = [int]((Get-Item $OutFile).Length / 1MB)
-    Say ("          downloaded {0} MB in {1}s" -f $mb, $secs)
+    $bytes = (Get-Item -LiteralPath $OutFile).Length
+    if ($bytes -eq 0) { throw "$Label download was empty" }
+    Say ("          " + (Format-DownloadReceipt $bytes $timer.Elapsed.TotalSeconds))
   } finally { $ProgressPreference = $prev }
 }
 
@@ -91,7 +100,7 @@ function Invoke-VerifiedInstallerScript {
     $ErrorActionPreference = 'Continue'
     try {
       & $powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass `
-        -File $Path 2>&1 | Out-Host
+        -File $Path 2>&1 | ForEach-Object { Write-Host ([string]$_) }
       return $LASTEXITCODE
     } finally { $ErrorActionPreference = $prev }
   } finally { $installerStream.Dispose() }
@@ -104,6 +113,45 @@ function Invoke-Native-Capture {
   $ErrorActionPreference = 'Continue'
   try { return (& $Exe @Arguments 2>$null | Select-Object -First 1) }
   finally { $ErrorActionPreference = $prev }
+}
+
+function Get-WingetDisplayUpdate {
+  # Only known animation frames are reduced. Unknown text, warnings and prompts
+  # pass through unchanged. State belongs to one invocation, never a profile.
+  param([string]$Line, [hashtable]$State, [double]$Seconds)
+  $lineText = ($Line -replace '\x1b\[[0-?]*[ -/]*[@-~]', '').Trim()
+  $animation = (-not $lineText -or $lineText -match '^[-\\|/]$')
+  $progress = $lineText -match '^[\u2580-\u259f\s]+(?<value>\d[\d.,]*\s*%|\d[\d.,]*\s*[KMGT]?B\s*/\s*\d[\d.,]*\s*[KMGT]?B)$'
+  if ($progress) {
+    $lineText = $Matches['value']
+    $complete = $lineText -eq '100%'
+    if ($State.LastProgress -eq $lineText -or
+        (-not $complete -and ($Seconds - $State.LastOutput) -lt 5)) { return }
+    $State.LastProgress = $lineText
+    $State.LastOutput = $Seconds
+    return "          progress: $lineText"
+  }
+  if ($animation) {
+    if (($Seconds - $State.LastOutput) -ge 15) {
+      $State.LastOutput = $Seconds
+      return ('          still working ({0:N0}s elapsed); check for an approval prompt' -f $Seconds)
+    }
+    return
+  }
+  $State.LastOutput = $Seconds
+  $State.LastProgress = $null
+  return $lineText
+}
+
+function Get-ToolInstallFailure {
+  param([string]$Tool, [int]$Code)
+  if ($Code -eq -1978335138) {
+    return "$Tool is not callable. WinGet rejected a server certificate (exit $Code). Update App Installer through Microsoft Store and retry; do not disable certificate validation."
+  }
+  if ($Code -ne 0) {
+    return "$Tool is not callable and WinGet returned exit $Code. Read the package error above; installation was not confirmed. Resolve that error before retrying."
+  }
+  return "$Tool is not callable although WinGet reported success. Open a new PowerShell and retry. If it is still missing, report the install location and output to Carlos."
 }
 
 function Invoke-Native {
@@ -119,7 +167,17 @@ function Invoke-Native {
     # otherwise capture the child's stdout into the variable instead of showing
     # it, which silently hid every line bootstrap.sh printed. stderr was
     # unaffected, which is why gh's prompts appeared and bash's output did not.
-    if ($Interactive) { & $Exe @Arguments | Out-Host }
+    if ($Interactive -and (Split-Path $Exe -Leaf) -in @('winget','winget.exe')) {
+      $timer = [Diagnostics.Stopwatch]::StartNew()
+      $display = @{ LastOutput = -5.0; LastProgress = $null }
+      & $Exe @Arguments 2>&1 | ForEach-Object {
+        foreach ($line in ([string]$_ -split '\r?\n|\r')) {
+          $update = Get-WingetDisplayUpdate $line $display $timer.Elapsed.TotalSeconds
+          if ($update) { Write-Host $update }
+        }
+      }
+    }
+    elseif ($Interactive) { & $Exe @Arguments | Out-Host }
     else              { & $Exe @Arguments 2>&1 | Out-Null }
     return $LASTEXITCODE
   } finally { $ErrorActionPreference = $prev }
@@ -844,8 +902,9 @@ $admin = ([Security.Principal.WindowsPrincipal] `
           [Security.Principal.WindowsIdentity]::GetCurrent()
          ).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 if (-not $admin) {
-  Say "  Running without elevation. Most tools install per-user."
-  Say "  Windows may request administrator approval for LibreOffice."
+  Say "  Running as your current user. Keep this shell non-elevated."
+  Say "  Some packages and dependencies may request administrator approval."
+  Say "  Enter setup-admin credentials only in the Windows approval prompt."
 }
 
 if ((Get-ExecutionPolicy) -eq 'AllSigned') {
@@ -885,7 +944,7 @@ foreach ($p in $pkgs) {
   # -Interactive so winget's progress and any prompt are visible. Hiding this
   # output made a slow first-run source update indistinguishable from a hang,
   # and would hide a prompt the reader cannot then answer.
-  Say "          this can take a minute; winget output follows"
+  Say "          installing; progress and any required approval appear below"
   $wingetArgs = @('install','--id',$p.Id,'--exact','--source','winget','--silent',
                   '--disable-interactivity',
                   '--accept-package-agreements','--accept-source-agreements')
@@ -909,15 +968,9 @@ foreach ($p in $pkgs) {
   if (Have $p.Cmd) {
     Say "  ok       $($p.Cmd) installed"
   } elseif ($p.Required) {
-    Die @"
-$($p.Cmd) was installed but is not callable in this session (winget exit $code).
-
-Windows does not propagate PATH to already-open terminals. Close this window,
-open a new PowerShell, and run the command again. It will skip whatever is
-already installed.
-"@
+    Die (Get-ToolInstallFailure $p.Cmd $code)
   } else {
-    Say "  note     $($p.Cmd) not callable yet; a new terminal will pick it up"
+    Say ("  note     " + (Get-ToolInstallFailure $p.Cmd $code))
   }
 }
 
@@ -1095,8 +1148,9 @@ if ($authed) {
     return
   }
   Say ""
-  Say "  A browser window will open. Choose GitHub.com, then HTTPS, then"
-  Say "  'Login with a web browser' and paste the code shown here."
+  Say "  Follow GitHub's browser sign-in instructions below."
+  Say "  Choose GitHub.com, HTTPS and web browser login if asked."
+  Say "  Keep sign-in codes and authentication URLs out of shared logs."
   $rc = Invoke-Native gh @('auth','login') -Interactive
   if ($rc -ne 0) { Die "GitHub sign-in did not complete. Run 'gh auth login' and try again." }
 }
@@ -1142,7 +1196,7 @@ if ((Invoke-Native gh @('repo','view','ospina-company/handbook','--json','name')
   Say "  ------------------------------------------------------------------"
   return
 }
-Say "  ok       access to Ospina repositories confirmed"
+Say "  ok       access to Ospina handbook confirmed"
 
 # ------------------------------------------------------------ coding agent
 Step "Coding agent"
@@ -1446,7 +1500,16 @@ if ($rc -ne 0) {
 
 } # end Invoke-OspinaInstall
 
+$OspinaPrevConsoleOutputEncoding = [Console]::OutputEncoding
+$OspinaPrevConsoleInputEncoding = [Console]::InputEncoding
+$OspinaPrevOutputEncoding = $OutputEncoding
 try {
+  # Native tools emit UTF-8. PowerShell 5.1 otherwise decodes redirected output
+  # with the legacy console code page, turning block bars/checkmarks into garbage.
+  # Restore all three settings even on failure; never alter the user's profile.
+  [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)
+  [Console]::InputEncoding = [Text.UTF8Encoding]::new($false)
+  $OutputEncoding = [Text.UTF8Encoding]::new($false)
   Invoke-OspinaInstall
 }
 catch {
@@ -1461,6 +1524,9 @@ catch {
   }
 }
 finally {
+  [Console]::OutputEncoding = $OspinaPrevConsoleOutputEncoding
+  [Console]::InputEncoding = $OspinaPrevConsoleInputEncoding
+  $OutputEncoding = $OspinaPrevOutputEncoding
   $ErrorActionPreference = $OspinaPrevEAP
   Write-Host ""
   Write-Host "This window stays open so you can read the output above." -ForegroundColor DarkGray

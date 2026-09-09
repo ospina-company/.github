@@ -5,9 +5,9 @@ name: Installer smoke test
 on:
   push:
     branches: [ main ]
-    paths: [ 'install.ps1', 'install.sh', 'preflight.ps1', '.github/workflows/installer-smoke.yml' ]
+    paths: [ 'install.ps1', 'install.sh', 'preflight.ps1', '.github/tests/**', '.github/workflows/installer-smoke.yml' ]
   pull_request:
-    paths: [ 'install.ps1', 'install.sh', 'preflight.ps1', '.github/workflows/installer-smoke.yml' ]
+    paths: [ 'install.ps1', 'install.sh', 'preflight.ps1', '.github/tests/**', '.github/workflows/installer-smoke.yml' ]
   workflow_dispatch:
 
 # Least privilege: this workflow only reads the repository.
@@ -36,6 +36,10 @@ jobs:
             }
             Write-Host "$f parses cleanly under PowerShell $($PSVersionTable.PSVersion)"
           }
+
+      - name: Clean Windows terminal output regressions
+        shell: powershell
+        run: ./.github/tests/windows-output.ps1
 
       - name: PSScriptAnalyzer
         shell: powershell
