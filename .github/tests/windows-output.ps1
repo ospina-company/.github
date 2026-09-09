@@ -19,6 +19,61 @@ Assert ((Get-ToolInstallFailure git -1978335138) -match 'certificate') 'certific
 Assert ((Get-ToolInstallFailure git 23) -match 'installation was not confirmed') 'failed install diagnostic'
 Assert ((Get-ToolInstallFailure git 0) -match 'WinGet reported success') 'successful exit but missing tool'
 
+# Never change host policy: model the scope precedence and a temporary Bypass.
+$script:policyFixture = @{}
+function Get-ExecutionPolicy {
+  param([string]$Scope)
+  if (-not $Scope -or $Scope -eq 'Process') { return 'Bypass' }
+  if ($script:policyFixture.ContainsKey($Scope)) { return $script:policyFixture[$Scope] }
+  return 'Undefined'
+}
+try {
+  Assert ((Get-NextShellExecutionPolicy).Policy -eq 'Restricted') 'Process Bypass hid client default'
+  $script:policyFixture.LocalMachine = 'RemoteSigned'
+  Assert ((Get-NextShellExecutionPolicy).Policy -eq 'RemoteSigned') 'machine policy fallback'
+  $script:policyFixture.CurrentUser = 'Restricted'
+  Assert ((Get-NextShellExecutionPolicy).Policy -eq 'Restricted') 'current user precedence'
+  $script:policyFixture.UserPolicy = 'AllSigned'
+  Assert ((Get-NextShellExecutionPolicy).Scope -eq 'UserPolicy') 'user group policy precedence'
+  $script:policyFixture.MachinePolicy = 'Restricted'
+  Assert ((Get-NextShellExecutionPolicy).Scope -eq 'MachinePolicy') 'machine group policy precedence'
+
+  # Exercise the actual consent block with mocked policy writes, including the
+  # misleading Process-override error that can follow a successful persistence.
+  $policySource = [IO.File]::ReadAllText($source)
+  $start = $policySource.IndexOf('# Several of the repositories')
+  $end = $policySource.IndexOf('# Git Bash is what actually runs')
+  Assert ($start -ge 0 -and $end -gt $start) 'policy block not found'
+  $policyBlock = [scriptblock]::Create($policySource.Substring($start, $end - $start))
+  function Ask-YesNo { return $script:policyConsent }
+  function Set-ExecutionPolicy {
+    param($Scope,$ExecutionPolicy,[switch]$Force,$ErrorAction)
+    Assert ($Scope -eq 'CurrentUser' -and $ExecutionPolicy -eq 'RemoteSigned') 'policy write scope widened'
+    $script:policyWrites++
+    if ($script:policySave) { $script:policyFixture.CurrentUser = 'RemoteSigned' }
+    throw 'synthetic override or write failure'
+  }
+  foreach ($scenario in @('consent','decline','write-failure')) {
+    $script:policyFixture = @{}
+    $script:policyWrites = 0
+    $script:policyConsent = $scenario -ne 'decline'
+    $script:policySave = $scenario -eq 'consent'
+    $nextShellPolicy = Get-NextShellExecutionPolicy
+    $stopped = $false
+    try { $null = & $policyBlock 6>&1 } catch { $stopped = $true }
+    if ($scenario -eq 'consent') {
+      Assert (-not $stopped -and $script:policyWrites -eq 1) 'saved policy misreported as failure'
+    } else {
+      Assert $stopped 'Restricted policy allowed false success'
+      if ($scenario -eq 'decline') { Assert ($script:policyWrites -eq 0) 'policy changed without consent' }
+    }
+  }
+} finally {
+  Remove-Item Function:\Get-ExecutionPolicy
+  Remove-Item Function:\Set-ExecutionPolicy -ErrorAction SilentlyContinue
+  Remove-Item Function:\Ask-YesNo -ErrorAction SilentlyContinue
+}
+
 $state = @{LastOutput=0.0;LastProgress=$null}
 foreach ($frame in @('', '  ', '-', '\', '|', '/')) {
   Assert ($null -eq (Get-WingetDisplayUpdate $frame $state 1)) 'spinner/blank leaked'

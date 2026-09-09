@@ -154,6 +154,19 @@ function Get-ToolInstallFailure {
   return "$Tool is not callable although WinGet reported success. Open a new PowerShell and retry. If it is still missing, report the install location and output to Carlos."
 }
 
+function Get-NextShellExecutionPolicy {
+  # Process Bypass is only the installer launch, not a durable workstation
+  # setting. Respect Group Policy before the per-user and machine scopes.
+  foreach ($scope in @('MachinePolicy','UserPolicy','CurrentUser','LocalMachine')) {
+    $policy = [string](Get-ExecutionPolicy -Scope $scope)
+    if ($policy -ne 'Undefined') {
+      return [pscustomobject]@{ Policy = $policy; Scope = $scope }
+    }
+  }
+  # This installer targets Windows client desktops, whose default is Restricted.
+  return [pscustomobject]@{ Policy = 'Restricted'; Scope = 'Default' }
+}
+
 function Invoke-Native {
   param(
     [Parameter(Mandatory)][string] $Exe,
@@ -904,12 +917,16 @@ $admin = ([Security.Principal.WindowsPrincipal] `
 if (-not $admin) {
   Say "  Running as your current user. Keep this shell non-elevated."
   Say "  Some packages and dependencies may request administrator approval."
-  Say "  Enter setup-admin credentials only in the Windows approval prompt."
+  Say "  Enter authorized administrator credentials only in the approval prompt."
 }
 
-if ((Get-ExecutionPolicy) -eq 'AllSigned') {
+$nextShellPolicy = Get-NextShellExecutionPolicy
+if ($nextShellPolicy.Policy -eq 'AllSigned' -or
+    ($nextShellPolicy.Scope -in @('MachinePolicy','UserPolicy') -and
+     $nextShellPolicy.Policy -eq 'Restricted')) {
   Die @"
-This account enforces PowerShell's AllSigned policy. Ospina setup needs a small
+The next PowerShell session is governed by $($nextShellPolicy.Policy) at
+$($nextShellPolicy.Scope) scope. Ospina setup needs a small
 per-user profile block so Node 24 and Python 3.12 outrank older machine tools.
 Ask your device administrator to approve that profile change or set a compatible
 policy, then re-run this command.
@@ -1085,33 +1102,44 @@ if (-not (Ensure-LibreOffice)) {
 # npm resolves to npm.ps1. Under the default Restricted policy none of them can
 # be built or run. That makes this a prerequisite for the work itself, not a
 # detail of installing one agent.
-if ((Get-ExecutionPolicy) -eq 'Restricted') {
+if ($nextShellPolicy.Policy -eq 'Restricted') {
   Say ""
-  Say "  PowerShell's execution policy is Restricted."
-  Say "  That blocks .ps1 files, and npm on Windows is npm.ps1, so npm and pnpm"
-  Say "  cannot run at all. Several Ospina repositories are Node projects and"
-  Say "  will not build until this is changed."
+  Say "  New PowerShell windows use Restricted policy, even if setup uses Bypass."
+  Say "  That blocks .ps1 profiles and may block npm/pnpm PowerShell launchers."
+  Say "  Direct .cmd launchers still work, but profile-based PATH setup will not."
   Say ""
   Say "  The standard developer setting, for your account only. It still refuses"
   Say "  unsigned scripts downloaded from the internet:"
   Say "    Set-ExecutionPolicy -Scope CurrentUser -ExecutionPolicy RemoteSigned"
   Say ""
   if (Ask-YesNo "  Apply it now?") {
+    $policyError = $null
     try {
-      Set-ExecutionPolicy -Scope CurrentUser -ExecutionPolicy RemoteSigned -Force
-      Say ("  ok       execution policy is now {0}" -f (Get-ExecutionPolicy -Scope CurrentUser))
+      Set-ExecutionPolicy -Scope CurrentUser -ExecutionPolicy RemoteSigned -Force -ErrorAction Stop
     } catch {
-      Say ("  note     could not change it: {0}" -f $_.Exception.Message)
-      Say  "           Node tooling will not work until you set it yourself."
+      $policyError = $_.Exception.Message
+    }
+    # Set-ExecutionPolicy can report a Process-scope override even after saving
+    # CurrentUser successfully. Verify the durable result, not the launch scope.
+    $nextShellPolicy = Get-NextShellExecutionPolicy
+    if ($nextShellPolicy.Policy -eq 'RemoteSigned') {
+      Say "  ok       new PowerShell windows will use RemoteSigned"
+    } else {
+      Say "  note     next-shell policy remains $($nextShellPolicy.Policy)"
+      if ($policyError) { Say "           $policyError" }
+      Say "           Profile and PowerShell launcher readiness is not confirmed."
     }
   } else {
-    Say "  note     left as Restricted. npm and pnpm will not run, so the Node"
-    Say "           repositories cannot be built until you change it. Ospina's"
-    Say "           PATH preference profile also cannot run, so verified user"
+    Say "  note     left as Restricted. PowerShell .ps1 launchers remain blocked."
+    Say "           Ospina's PATH preference profile also cannot run, so user"
     Say "           tools may not stay ahead of older machine tools in new terminals."
   }
 } else {
-  Say ("  ok       execution policy: {0}" -f (Get-ExecutionPolicy))
+  Say ("  ok       next-shell execution policy: {0} ({1})" -f
+       $nextShellPolicy.Policy, $nextShellPolicy.Scope)
+}
+if ($nextShellPolicy.Policy -eq 'Restricted') {
+  Die "Setup paused: new PowerShell windows still block profiles and .ps1 launchers. Approve the per-user RemoteSigned setting or consult your device administrator, then rerun. Installed tools are preserved."
 }
 
 # Git Bash is what actually runs the bootstrap script.
