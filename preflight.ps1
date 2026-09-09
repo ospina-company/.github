@@ -16,8 +16,14 @@ function Test-StorePythonPackage {
             Select-Object -First 1)) {
     return $null
   }
-  return $null -ne (Get-AppxPackage -Name 'PythonSoftwareFoundation.Python*' `
-                     -ErrorAction SilentlyContinue | Select-Object -First 1)
+  try {
+    $package = Get-AppxPackage -Name 'PythonSoftwareFoundation.Python*' `
+                 -ErrorAction Stop | Select-Object -First 1
+    return $null -ne $package
+  } catch {
+    # A discoverable but unsupported/broken Appx module is not proof of absence.
+    return $null
+  }
 }
 function Have-UsablePython ($c) {
   $cmd = Get-Command $c -ErrorAction SilentlyContinue

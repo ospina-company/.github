@@ -1071,6 +1071,14 @@ if ($corepackReady) {
   }
 }
 
+# LibreOffice can bundle its own python.exe. Add its renderer path BEFORE
+# promoting uv's Python directory, so current and persisted shell PATHs agree.
+if (-not (Ensure-LibreOffice)) {
+  Say "  note     LibreOffice is not installed (winget exit $OspinaLibreOfficeExitCode)."
+  Say "           Its official WinGet package is machine-scoped and needs administrator approval."
+  Say "           Setup will continue, but document and workbook visual QA will be unavailable."
+} else { Say "  ok       soffice" }
+
 Say "  install  Python 3.12 (managed by uv)"
 # --default creates the unversioned python/python3 shims and remains gated as a
 # uv preview feature. Enable only that feature for this invocation.
@@ -1091,12 +1099,6 @@ if ($pythonMinor -ne '3.12') {
   Die "Python 3.12 is installed, but the 'python' command resolves to '$pythonMinor'. Open a new PowerShell and re-run."
 }
 Say "  ok       python command is Python 3.12"
-
-if (-not (Ensure-LibreOffice)) {
-  Say "  note     LibreOffice is not installed (winget exit $OspinaLibreOfficeExitCode)."
-  Say "           Its official WinGet package is machine-scoped and needs administrator approval."
-  Say "           Setup will continue, but document and workbook visual QA will be unavailable."
-} else { Say "  ok       soffice" }
 
 # Several of the repositories a partner clones are pnpm / Next.js projects, and
 # npm resolves to npm.ps1. Under the default Restricted policy none of them can
