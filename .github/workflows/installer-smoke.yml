@@ -283,6 +283,12 @@ jobs:
           $found = Find-ExistingHandbook
           if (-not $found -or $found.Path -ne $hb) { Fail "profile route returned '$($found.Path)'" }
 
+          # A HOME naming a drive that is gone must not end the search.
+          $env:HOME = 'Q:\gone'
+          $found = Find-ExistingHandbook
+          if (-not $found -or $found.Path -ne $hb) { Fail "a missing HOME drive broke discovery: '$($found.Path)'" }
+          Remove-Item Env:\HOME
+
           # The location bootstrap records.
           Remove-Item -LiteralPath (Join-Path $env:USERPROFILE '.bashrc')
           $state = Join-Path $env:USERPROFILE '.config\ospina-handbook\bootstrap-state'
