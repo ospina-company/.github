@@ -345,6 +345,9 @@ function Test-HandbookCheckout {
   # have validated. A folder that merely has the right name is not enough.
   param([string]$Path)
   if (-not $Path) { return $false }
+  # A trailing separator makes a linked folder look like its target.
+  $Path = $Path.TrimEnd('\', '/')
+  if (-not $Path) { return $false }
   # Path strings, not Join-Path: Join-Path throws for a drive that is gone,
   # and a stale record must not stop the search for a valid setup.
   try {
@@ -386,8 +389,9 @@ function Find-ExistingHandbook {
   foreach ($h in $homes) {
     $record = [IO.Path]::Combine($h, '.config\ospina-handbook\bootstrap-state\handbook-dir')
     if (Test-Path -LiteralPath $record) {
-      $p = Get-Content -LiteralPath $record -TotalCount 1 -ErrorAction SilentlyContinue
-      if ($p) { $p = ConvertFrom-GitBashPath $p.Trim() }
+      # Bootstrap writes UTF-8 without a BOM; Windows PowerShell 5.1 would read ANSI.
+      $p = Get-Content -LiteralPath $record -TotalCount 1 -Encoding UTF8 -ErrorAction SilentlyContinue
+      if ($p) { $p = (ConvertFrom-GitBashPath $p.Trim()).TrimEnd('\', '/') }
       if (Test-HandbookCheckout $p) {
         return [pscustomobject]@{ Path = $p; Source = 'recorded by an earlier setup' }
       }
@@ -396,10 +400,10 @@ function Find-ExistingHandbook {
   foreach ($h in $homes) {
     $rc = [IO.Path]::Combine($h, '.bashrc')
     if (-not (Test-Path -LiteralPath $rc)) { continue }
-    foreach ($line in (Get-Content -LiteralPath $rc -ErrorAction SilentlyContinue)) {
+    foreach ($line in (Get-Content -LiteralPath $rc -Encoding UTF8 -ErrorAction SilentlyContinue)) {
       # Bootstrap single-quotes the path and writes an apostrophe as '\''.
       if ($line -match "^export OSPINA_HANDBOOK='(.+)'$") {
-        $p = ConvertFrom-GitBashPath ($Matches[1].Replace("'\''", "'"))
+        $p = (ConvertFrom-GitBashPath ($Matches[1].Replace("'\''", "'"))).TrimEnd('\', '/')
         if (Test-HandbookCheckout $p) {
           return [pscustomobject]@{ Path = $p; Source = 'found in your Git Bash profile' }
         }
@@ -819,6 +823,9 @@ if ($env:OSPINA_WORKSPACE) {
 
 # Literal paths from here on: PowerShell reads [ and ] in -Path as wildcards,
 # so C:\Work\[a] could otherwise resolve to C:\Work\a.
+# .NET resolves a relative path against the process directory, not PowerShell's
+# location, so make it absolute first.
+$ws = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($ws)
 $null = [IO.Directory]::CreateDirectory($ws)
 $ws = (Resolve-Path -LiteralPath $ws).Path
 Say "  workspace: $ws"

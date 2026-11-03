@@ -22,6 +22,8 @@ have() { command -v "$1" >/dev/null 2>&1; }
 
 # Only a Git checkout of ospina-company/handbook counts as an existing setup.
 handbook_checkout_ok() {
+  # A trailing slash makes a linked folder look like its target; strip it.
+  set -- "$(printf '%s' "${1:-}" | sed 's|/*$||')"
   # Setup uses <workspace>/handbook, so only a checkout by that name counts.
   [ -n "${1:-}" ] && [ "$(basename "$1")" = handbook ] || return 1
   # A linked handbook folder could point at any checkout.
@@ -45,18 +47,16 @@ handbook_checkout_ok() {
 find_existing_handbook() {
   _record="$HOME/.config/ospina-handbook/bootstrap-state/handbook-dir"
   if [ -f "$_record" ]; then
-    _found=$(sed -n '1p' "$_record")
+    _found=$(sed -n '1p' "$_record" | sed 's|/*$||')
     if handbook_checkout_ok "$_found"; then printf '%s\n' "$_found"; return 0; fi
   fi
-  if handbook_checkout_ok "${OSPINA_HANDBOOK:-}"; then
-    printf '%s\n' "$OSPINA_HANDBOOK"
-    return 0
-  fi
+  _found=$(printf '%s' "${OSPINA_HANDBOOK:-}" | sed 's|/*$||')
+  if handbook_checkout_ok "$_found"; then printf '%s\n' "$_found"; return 0; fi
   for _profile in "$HOME/.zshrc" "$HOME/.bashrc" "$HOME/.bash_profile" "$HOME/.profile"; do
     [ -f "$_profile" ] || continue
     # Bootstrap single-quotes the path and writes an apostrophe as '\''.
     _found=$(sed -n "s/^export OSPINA_HANDBOOK='\(.*\)'\$/\1/p" "$_profile" | head -n 1 |
-      sed "s/'\\\\''/'/g")
+      sed -e "s/'\\\\''/'/g" -e 's|/*$||')
     if handbook_checkout_ok "$_found"; then printf '%s\n' "$_found"; return 0; fi
   done
   for _dir in Software/Projects Projects projects Developer dev code repos git src; do

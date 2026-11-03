@@ -119,5 +119,6 @@ grep -Fq "found your existing setup at $WS2" "$T/out" || fail "a profile path wi
 mkdir -p "$T/linked"
 ln -s "$WS2/handbook" "$T/linked/handbook"
 if handbook_checkout_ok "$T/linked/handbook"; then fail "a linked handbook folder was accepted"; fi
+if handbook_checkout_ok "$T/linked/handbook/"; then fail "a trailing slash let a linked handbook folder through"; fi
 
 echo "install.sh re-runs update an existing setup without prompting"
