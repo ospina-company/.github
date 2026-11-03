@@ -47,7 +47,7 @@ export FIXTURE_ORIGIN="$T/origin.git"
 
 run_installer() {
   rc=0
-  HOME="$T/home" PATH="$T/bin:$PATH" GIT_TERMINAL_PROMPT=0 OSPINA_HANDBOOK= \
+  HOME="$T/home" PATH="$T/bin:$PATH" GIT_TERMINAL_PROMPT=0 OSPINA_HANDBOOK='' \
     bash "$ROOT/install.sh" < /dev/null > "$T/out" 2>&1 || rc=$?
 }
 
@@ -101,9 +101,23 @@ if handbook_checkout_ok "$WS/handbook"; then fail "a linked bootstrap.sh was acc
 rm "$WS/handbook/bootstrap.sh"; mv "$T/real-bootstrap.sh" "$WS/handbook/bootstrap.sh"
 
 # A workspace path with an apostrophe reaches bootstrap intact.
+make_origin "$T/origin.git" "$CURRENT"
 WS2="$T/O'Brien/Ospina"
 OSPINA_WORKSPACE="$WS2" run_installer
 [ "$rc" -eq 0 ] || fail "a workspace with an apostrophe exited $rc"
 [ -f "$WS2/handbook/args.txt" ] || fail "bootstrap did not run in a workspace with an apostrophe"
+
+# Found again through the profile line bootstrap wrote, quoting and all.
+printf "export OSPINA_HANDBOOK='%s'\n" "$(printf '%s' "$WS2/handbook" | sed "s/'/'\\\\''/g")" > "$T/home/.zshrc"
+rm -f "$WS2/handbook/args.txt"
+run_installer
+[ "$rc" -eq 0 ] || fail "re-run of a workspace with an apostrophe exited $rc"
+grep -Fq "found your existing setup at $WS2" "$T/out" || fail "a profile path with an apostrophe was not found"
+[ "$(cat "$WS2/handbook/args.txt")" = "--no-login --update" ] || fail "the apostrophe workspace was not updated"
+
+# A handbook folder that is a link could point at any checkout: not a setup.
+mkdir -p "$T/linked"
+ln -s "$WS2/handbook" "$T/linked/handbook"
+if handbook_checkout_ok "$T/linked/handbook"; then fail "a linked handbook folder was accepted"; fi
 
 echo "install.sh re-runs update an existing setup without prompting"

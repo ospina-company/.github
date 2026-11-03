@@ -24,6 +24,8 @@ have() { command -v "$1" >/dev/null 2>&1; }
 handbook_checkout_ok() {
   # Setup uses <workspace>/handbook, so only a checkout by that name counts.
   [ -n "${1:-}" ] && [ "$(basename "$1")" = handbook ] || return 1
+  # A linked handbook folder could point at any checkout.
+  [ ! -L "$1" ] || return 1
   [ -d "$1/.git" ] && [ -f "$1/bootstrap.sh" ] || return 1
   # A link could point anywhere. The script that runs must live in the checkout.
   [ ! -L "$1/bootstrap.sh" ] || return 1
@@ -52,7 +54,9 @@ find_existing_handbook() {
   fi
   for _profile in "$HOME/.zshrc" "$HOME/.bashrc" "$HOME/.bash_profile" "$HOME/.profile"; do
     [ -f "$_profile" ] || continue
-    _found=$(sed -n "s/^export OSPINA_HANDBOOK='\([^']*\)'\$/\1/p" "$_profile" | head -n 1)
+    # Bootstrap single-quotes the path and writes an apostrophe as '\''.
+    _found=$(sed -n "s/^export OSPINA_HANDBOOK='\(.*\)'\$/\1/p" "$_profile" | head -n 1 |
+      sed "s/'\\\\''/'/g")
     if handbook_checkout_ok "$_found"; then printf '%s\n' "$_found"; return 0; fi
   done
   for _dir in Software/Projects Projects projects Developer dev code repos git src; do

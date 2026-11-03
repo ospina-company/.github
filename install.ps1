@@ -350,6 +350,10 @@ function Test-HandbookCheckout {
   try {
     $leaf = [IO.Path]::GetFileName($Path.TrimEnd('\', '/'))
     if ($leaf -ne 'handbook') { return $false }
+    # A linked or junctioned handbook folder could point at any checkout.
+    $dirItem = Get-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
+    if (-not $dirItem -or -not $dirItem.PSIsContainer) { return $false }
+    if ($dirItem.Attributes -band [IO.FileAttributes]::ReparsePoint) { return $false }
     if (-not (Test-Path -LiteralPath ([IO.Path]::Combine($Path, '.git')))) { return $false }
     $bootstrapItem = Get-Item -LiteralPath ([IO.Path]::Combine($Path, 'bootstrap.sh')) -Force -ErrorAction SilentlyContinue
     if (-not $bootstrapItem) { return $false }
@@ -393,8 +397,9 @@ function Find-ExistingHandbook {
     $rc = [IO.Path]::Combine($h, '.bashrc')
     if (-not (Test-Path -LiteralPath $rc)) { continue }
     foreach ($line in (Get-Content -LiteralPath $rc -ErrorAction SilentlyContinue)) {
-      if ($line -match "^export OSPINA_HANDBOOK='([^']+)'$") {
-        $p = ConvertFrom-GitBashPath $Matches[1]
+      # Bootstrap single-quotes the path and writes an apostrophe as '\''.
+      if ($line -match "^export OSPINA_HANDBOOK='(.+)'$") {
+        $p = ConvertFrom-GitBashPath ($Matches[1].Replace("'\''", "'"))
         if (Test-HandbookCheckout $p) {
           return [pscustomobject]@{ Path = $p; Source = 'found in your Git Bash profile' }
         }
@@ -812,15 +817,17 @@ if ($env:OSPINA_WORKSPACE) {
   }
 }
 
-New-Item -ItemType Directory -Force -Path $ws | Out-Null
-$ws = (Resolve-Path $ws).Path
+# Literal paths from here on: PowerShell reads [ and ] in -Path as wildcards,
+# so C:\Work\[a] could otherwise resolve to C:\Work\a.
+$null = [IO.Directory]::CreateDirectory($ws)
+$ws = (Resolve-Path -LiteralPath $ws).Path
 Say "  workspace: $ws"
 # Decided before the handbook step can create a checkout here.
 $isUpdate = Test-HandbookCheckout (Join-Path $ws 'handbook')
 
 Step "Handbook"
 $hb = Join-Path $ws 'handbook'
-if (Test-Path (Join-Path $hb '.git')) {
+if (Test-Path -LiteralPath (Join-Path $hb '.git')) {
   Say "  ok       already cloned, updating"
   $null = Invoke-Native git @('-C',$hb,'pull','-q','--ff-only')
 } else {
@@ -834,7 +841,7 @@ if (Test-Path (Join-Path $hb '.git')) {
 Step "Running bootstrap"
 Say ""
 # Convert C:\Ospina\handbook to /c/Ospina/handbook for Git Bash.
-$full = (Resolve-Path $hb).Path
+$full = (Resolve-Path -LiteralPath $hb).Path
 # Git Bash addresses drives as /c/..., so a UNC path has no representation here
 # and the conversion below would silently produce nonsense.
 if ($full -notmatch '^[A-Za-z]:\\') {
