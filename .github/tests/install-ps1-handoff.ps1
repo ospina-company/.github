@@ -58,7 +58,7 @@ try {
     Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force
     $out = & ([scriptblock]::Create($installer)) *>&1 | Out-String -Width 8192
     $env:Path = $savedPath
-    if ($out -match 'Unexpected error|ERROR:') { Fail "installer failed:`n$out" }
+    if ($out -match 'Unexpected error|ERROR:|finished with warnings or errors') { Fail "installer failed:`n$out" }
     return $out
   }
   function Args-Seen { (Get-Content -Raw (Join-Path $hb 'args.txt')).Trim() }
@@ -109,6 +109,14 @@ exit /b 0
   $out = Invoke-Installer
   if ((Args-Seen) -ne '--no-login') { Fail "an older bootstrap was given '$(Args-Seen)'" }
   if ($out -notmatch 'this handbook predates updates') { Fail 'the older-bootstrap fallback was not explained' }
+
+  # A workspace path with an apostrophe reaches Git Bash intact.
+  $origin = New-Origin $current
+  $ws2 = Join-Path $T "O'Brien\Ospina"
+  $env:OSPINA_WORKSPACE = $ws2
+  $out = Invoke-Installer
+  Remove-Item Env:\OSPINA_WORKSPACE
+  if (-not (Test-Path -LiteralPath (Join-Path $ws2 'handbook\args.txt'))) { Fail "bootstrap did not run in a workspace with an apostrophe:`n$out" }
 
   Write-Host 'install.ps1 re-runs update an existing setup without prompting'
 } finally {

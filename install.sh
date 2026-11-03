@@ -25,6 +25,8 @@ handbook_checkout_ok() {
   # Setup uses <workspace>/handbook, so only a checkout by that name counts.
   [ -n "${1:-}" ] && [ "$(basename "$1")" = handbook ] || return 1
   [ -d "$1/.git" ] && [ -f "$1/bootstrap.sh" ] || return 1
+  # A link could point anywhere. The script that runs must live in the checkout.
+  [ ! -L "$1/bootstrap.sh" ] || return 1
   _origin=$(git -C "$1" config --get remote.origin.url 2>/dev/null || true)
   _origin=${_origin%/}
   _origin=${_origin%.git}
