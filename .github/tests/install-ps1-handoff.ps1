@@ -136,6 +136,27 @@ exit /b 0
   if (-not (Test-Path -LiteralPath (Join-Path $ws3 'handbook\args.txt'))) { Fail "bootstrap did not run in a bracketed workspace:`n$out" }
   if (Test-Path -LiteralPath (Join-Path $T 'a\Ospina\handbook')) { Fail 'a bracketed workspace resolved to a sibling folder' }
 
+  # A relative OSPINA_WORKSPACE is taken relative to PowerShell's location.
+  Push-Location $T
+  try {
+    $env:OSPINA_WORKSPACE = '.\Rel\Ospina'
+    $out = Invoke-Installer
+  } finally { Pop-Location; Remove-Item Env:\OSPINA_WORKSPACE -ErrorAction SilentlyContinue }
+  if (-not (Test-Path -LiteralPath (Join-Path $T 'Rel\Ospina\handbook\args.txt'))) { Fail "a relative workspace was not set up where PowerShell was:`n$out" }
+
+  # A recorded path with non-ASCII characters is read as the UTF-8 bootstrap writes.
+  $ws4 = Join-Path $T ("{0}quipe\Ospina" -f [char]0x00C9)
+  $env:OSPINA_WORKSPACE = $ws4
+  $out = Invoke-Installer
+  Remove-Item Env:\OSPINA_WORKSPACE
+  $hb4 = Join-Path $ws4 'handbook'
+  Remove-Item -LiteralPath (Join-Path $env:USERPROFILE '.bashrc') -ErrorAction SilentlyContinue
+  [IO.File]::WriteAllText((Join-Path $state 'handbook-dir'), $hb4, (New-Object Text.UTF8Encoding $false))
+  Remove-Item -LiteralPath (Join-Path $hb4 'args.txt')
+  $out = Invoke-Installer
+  if ($out -notmatch [regex]::Escape("found your existing setup at $ws4")) { Fail "a non-ASCII recorded path was not found:`n$out" }
+  if ((Get-Content -Raw -LiteralPath (Join-Path $hb4 'args.txt')).Trim() -ne '--no-login --update') { Fail 'the non-ASCII workspace was not updated' }
+
   Write-Host 'install.ps1 re-runs update an existing setup without prompting'
 } finally {
   $env:Path = $savedPath
