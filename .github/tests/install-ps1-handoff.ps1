@@ -118,6 +118,24 @@ exit /b 0
   Remove-Item Env:\OSPINA_WORKSPACE
   if (-not (Test-Path -LiteralPath (Join-Path $ws2 'handbook\args.txt'))) { Fail "bootstrap did not run in a workspace with an apostrophe:`n$out" }
 
+  # Found again through the profile line bootstrap wrote, quoting and all.
+  $hb2 = Join-Path $ws2 'handbook'
+  $unix2 = '/' + $hb2.Substring(0, 1).ToLower() + ($hb2.Substring(2) -replace '\\', '/')
+  Set-Content -Path (Join-Path $env:USERPROFILE '.bashrc') -Value ("export OSPINA_HANDBOOK='{0}'" -f ($unix2 -replace "'", "'\''"))
+  Remove-Item -LiteralPath (Join-Path $hb2 'args.txt')
+  $out = Invoke-Installer
+  if ($out -notmatch [regex]::Escape("found your existing setup at $ws2")) { Fail "a profile path with an apostrophe was not found:`n$out" }
+  if ((Get-Content -Raw -LiteralPath (Join-Path $hb2 'args.txt')).Trim() -ne '--no-login --update') { Fail 'the apostrophe workspace was not updated' }
+
+  # Brackets are literal: [a] must never resolve to a sibling folder named a.
+  $ws3 = Join-Path $T '[a]\Ospina'
+  New-Item -ItemType Directory -Force -Path (Join-Path $T 'a\Ospina') | Out-Null
+  $env:OSPINA_WORKSPACE = $ws3
+  $out = Invoke-Installer
+  Remove-Item Env:\OSPINA_WORKSPACE
+  if (-not (Test-Path -LiteralPath (Join-Path $ws3 'handbook\args.txt'))) { Fail "bootstrap did not run in a bracketed workspace:`n$out" }
+  if (Test-Path -LiteralPath (Join-Path $T 'a\Ospina\handbook')) { Fail 'a bracketed workspace resolved to a sibling folder' }
+
   Write-Host 'install.ps1 re-runs update an existing setup without prompting'
 } finally {
   $env:Path = $savedPath
