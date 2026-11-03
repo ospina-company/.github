@@ -1,0 +1,90 @@
+#!/usr/bin/env bash
+# Runs install.sh end to end with stub GitHub and agent commands and a fixture
+# handbook whose bootstrap.sh records how it was called. Proves a re-run finds
+# an existing setup, never prompts for a workspace, and hands off with --update;
+# a first run and an older bootstrap get no --update.
+set -euo pipefail
+
+ROOT=$(CDPATH='' cd -- "$(dirname -- "$0")/../.." && pwd)
+T=$(mktemp -d)
+trap 'rm -rf "$T"' EXIT
+fail() { echo "FAIL: $*" >&2; sed 's/^/  | /' "$T/out" >&2 || true; exit 1; }
+
+mkdir -p "$T/bin" "$T/home"
+cat > "$T/bin/gh" <<'GH'
+#!/usr/bin/env sh
+case "$1 $2" in
+  "auth status"|"repo view") exit 0 ;;
+  "api user") echo tester; exit 0 ;;
+  "repo clone") git clone -q "$FIXTURE_ORIGIN" "$4" && \
+                git -C "$4" remote set-url origin https://github.com/ospina-company/handbook.git && \
+                git -C "$4" config url."$FIXTURE_ORIGIN".insteadOf https://github.com/ospina-company/handbook.git
+                exit $? ;;
+esac
+exit 1
+GH
+for agent in t3 claude codex; do printf '#!/usr/bin/env sh\nexit 0\n' > "$T/bin/$agent"; done
+chmod +x "$T/bin"/*
+
+# The fixture handbook: a bootstrap that records its arguments.
+make_origin() {
+  # $1 = origin dir, $2 = bootstrap body
+  rm -rf "$T/src" "$1"
+  mkdir -p "$T/src"
+  printf '%s\n' "$2" > "$T/src/bootstrap.sh"
+  git -C "$T/src" init -q -b main
+  git -C "$T/src" -c user.name=t -c user.email=t@example.com add -A
+  git -C "$T/src" -c user.name=t -c user.email=t@example.com commit -qm fixture
+  git clone -q --bare "$T/src" "$1"
+}
+CURRENT='#!/bin/sh
+# case "$arg" in --update) UPDATE=1 ;; esac
+printf "%s\n" "$*" > "$(dirname "$0")/args.txt"'
+OLDER='#!/bin/sh
+printf "%s\n" "$*" > "$(dirname "$0")/args.txt"'
+make_origin "$T/origin.git" "$CURRENT"
+export FIXTURE_ORIGIN="$T/origin.git"
+
+run_installer() {
+  rc=0
+  HOME="$T/home" PATH="$T/bin:$PATH" GIT_TERMINAL_PROMPT=0 OSPINA_HANDBOOK= \
+    bash "$ROOT/install.sh" < /dev/null > "$T/out" 2>&1 || rc=$?
+}
+
+# First run: no setup anywhere, workspace given explicitly. No --update.
+WS="$T/first/Ospina"
+OSPINA_WORKSPACE="$WS" run_installer
+[ "$rc" -eq 0 ] || fail "first run exited $rc"
+[ "$(cat "$WS/handbook/args.txt")" = "--no-login" ] || fail "first run passed: $(cat "$WS/handbook/args.txt")"
+
+# Re-run: the profile bootstrap wrote names the setup. No prompt, --update.
+printf "export OSPINA_HANDBOOK='%s'\n" "$WS/handbook" > "$T/home/.zshrc"
+rm -f "$WS/handbook/args.txt"
+run_installer
+[ "$rc" -eq 0 ] || fail "re-run exited $rc"
+grep -Fq "found your existing setup at $WS" "$T/out" || fail "re-run did not report the existing setup"
+if grep -Fq 'Where should the Ospina repositories live?' "$T/out"; then fail "re-run asked for a workspace"; fi
+[ "$(cat "$WS/handbook/args.txt")" = "--no-login --update" ] || fail "re-run passed: $(cat "$WS/handbook/args.txt")"
+
+# A record pointing at a checkout not named handbook is not trusted, and its
+# sibling handbook is not run in its place.
+mkdir -p "$T/home/.config/ospina-handbook/bootstrap-state"
+git clone -q "$T/origin.git" "$T/other/custom"
+git -C "$T/other/custom" remote set-url origin https://github.com/ospina-company/handbook.git
+printf '%s\n' "$T/other/custom" > "$T/home/.config/ospina-handbook/bootstrap-state/handbook-dir"
+rm -f "$WS/handbook/args.txt"
+run_installer
+grep -Fq "found your existing setup at $WS" "$T/out" || fail "an untrusted record displaced the real setup"
+[ ! -e "$T/other/args.txt" ] && [ ! -e "$T/other/custom/args.txt" ] || fail "an untrusted checkout ran"
+rm "$T/home/.config/ospina-handbook/bootstrap-state/handbook-dir"
+
+# A handbook that predates --update gets the standard setup.
+make_origin "$T/origin.git" "$OLDER"
+rm -rf "$WS/handbook"
+OSPINA_WORKSPACE="$WS" run_installer
+rm -f "$WS/handbook/args.txt"
+run_installer
+[ "$(cat "$WS/handbook/args.txt")" = "--no-login" ] || fail "an older bootstrap was given: $(cat "$WS/handbook/args.txt")"
+grep -Fq 'this handbook predates updates' "$T/out" || fail "the older-bootstrap fallback was not explained"
+
+echo "install.sh re-runs update an existing setup without prompting"

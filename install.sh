@@ -8,7 +8,9 @@
 # GitHub account can see and configures your agent.
 #
 # Read before running. It is short on purpose.
-# Safe to re-run: every step checks before it acts.
+# Safe to re-run: every step checks before it acts. Once you are set up,
+# re-running finds your workspace and updates it: the handbook, tools, agent
+# skills and repositories.
 
 set -euo pipefail
 
@@ -17,6 +19,52 @@ say()  { printf '%s\n' "$*"; }
 step() { printf '\n%s==>%s %s\n' "$BOLD" "$RESET" "$*"; }
 die()  { printf '\nERROR: %s\n' "$*" >&2; exit 1; }
 have() { command -v "$1" >/dev/null 2>&1; }
+
+# Only a Git checkout of ospina-company/handbook counts as an existing setup.
+handbook_checkout_ok() {
+  # Setup uses <workspace>/handbook, so only a checkout by that name counts.
+  [ -n "${1:-}" ] && [ "$(basename "$1")" = handbook ] || return 1
+  [ -d "$1/.git" ] && [ -f "$1/bootstrap.sh" ] || return 1
+  _origin=$(git -C "$1" config --get remote.origin.url 2>/dev/null || true)
+  _origin=${_origin%/}
+  _origin=${_origin%.git}
+  case "$_origin" in
+    https://github.com/ospina-company/handbook|\
+    git@github.com:ospina-company/handbook|\
+    ssh://git@github.com/ospina-company/handbook) return 0 ;;
+  esac
+  return 1
+}
+
+# Where an earlier setup put the handbook: the location bootstrap records, the
+# variable it exports, the profiles it wrote, then the usual workspace folders.
+find_existing_handbook() {
+  _record="$HOME/.config/ospina-handbook/bootstrap-state/handbook-dir"
+  if [ -f "$_record" ]; then
+    _found=$(sed -n '1p' "$_record")
+    if handbook_checkout_ok "$_found"; then printf '%s\n' "$_found"; return 0; fi
+  fi
+  if handbook_checkout_ok "${OSPINA_HANDBOOK:-}"; then
+    printf '%s\n' "$OSPINA_HANDBOOK"
+    return 0
+  fi
+  for _profile in "$HOME/.zshrc" "$HOME/.bashrc" "$HOME/.bash_profile" "$HOME/.profile"; do
+    [ -f "$_profile" ] || continue
+    _found=$(sed -n "s/^export OSPINA_HANDBOOK='\([^']*\)'\$/\1/p" "$_profile" | head -n 1)
+    if handbook_checkout_ok "$_found"; then printf '%s\n' "$_found"; return 0; fi
+  done
+  for _dir in Software/Projects Projects projects Developer dev code repos git src; do
+    if handbook_checkout_ok "$HOME/$_dir/Ospina/handbook"; then
+      printf '%s\n' "$HOME/$_dir/Ospina/handbook"
+      return 0
+    fi
+  done
+  if handbook_checkout_ok "$HOME/Ospina/handbook"; then
+    printf '%s\n' "$HOME/Ospina/handbook"
+    return 0
+  fi
+  return 1
+}
 
 case "$(uname -s)" in
   Darwin) PLATFORM=mac ;;
@@ -207,6 +255,11 @@ step "Workspace location"
 if [ -n "${OSPINA_WORKSPACE:-}" ]; then
   WS="$OSPINA_WORKSPACE"
   say "  using OSPINA_WORKSPACE=$WS"
+elif EXISTING_HANDBOOK=$(find_existing_handbook); then
+  WS=$(dirname "$EXISTING_HANDBOOK")
+  say "  found your existing setup at $WS"
+  say "  updating it: the handbook, tools, agent skills and repositories"
+  say "  ${DIM}to set up somewhere else instead, set OSPINA_WORKSPACE and re-run${RESET}"
 else
   # Newline-delimited in a temp file, not a space-separated string: a
   # candidate like "~/My Projects/Ospina" would otherwise word-split into two.
@@ -279,6 +332,9 @@ esac
 mkdir -p "$WS"
 WS=$(CDPATH= cd -- "$WS" && pwd)
 say "  workspace: $WS"
+# Decided before the handbook step can create a checkout here.
+IS_UPDATE=0
+handbook_checkout_ok "$WS/handbook" && IS_UPDATE=1
 
 step "Handbook"
 if [ -d "$WS/handbook/.git" ]; then
@@ -299,4 +355,12 @@ fi
 # ---------------------------------------------------------------- handoff
 step "Running bootstrap"
 say ""
+if [ "$IS_UPDATE" -eq 1 ]; then
+  # A handbook that could not be pulled may predate --update, and bootstrap
+  # stops on an option it does not know.
+  if grep -Fq -- '--update)' "$WS/handbook/bootstrap.sh"; then
+    exec sh "$WS/handbook/bootstrap.sh" --no-login --update "$@"
+  fi
+  say "  this handbook predates updates; running the standard setup instead"
+fi
 exec sh "$WS/handbook/bootstrap.sh" --no-login "$@"
