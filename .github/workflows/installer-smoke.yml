@@ -298,6 +298,10 @@ jobs:
           Set-Content -LiteralPath (Join-Path $hb 'bootstrap.sh') -Value 'an older bootstrap'
           if (Test-BootstrapSupportsUpdate $hb) { Fail 'an older bootstrap would be given --update' }
           Write-Host 'existing setups are found by record and by profile; other checkouts are not'
+          # Every failure above exits through Fail. The runner's wrapper would
+          # otherwise exit with the last native command's status, and the
+          # discovery helper's early-stopping git capture can leave that non-zero.
+          exit 0
 
       - name: A re-run updates an existing setup end to end
         shell: powershell
@@ -305,6 +309,8 @@ jobs:
           # Runs install.ps1 as iex does, with stub GitHub, WinGet and agents,
           # and asserts the arguments bootstrap.sh actually receives.
           & .\.github\tests\install-ps1-handoff.ps1
+          # The suite throws on any failure; reaching here is a pass.
+          exit 0
 
       - name: Windows path conversion is correct
         shell: powershell
