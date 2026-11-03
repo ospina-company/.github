@@ -7,6 +7,8 @@
 # Bash that Git for Windows installs.
 #
 # Read before running. Safe to re-run: every step checks before it acts.
+# Once you are set up, re-running finds your workspace and updates it: the
+# handbook, tools, agent skills and repositories.
 
 # Saved and restored in the wrapper: this evaluates in the caller's session,
 # so leaving their preference changed is a side effect they did not ask for.
@@ -335,6 +337,80 @@ function Get-WorkspaceCandidates {
       Add-Candidate ("{0}:\Ospina" -f $_.Name) ("more free space ({0:N0} GB)" -f ($_.Free/1GB)) 15
     }
   $script:cands | Sort-Object Rank, Path | Group-Object Path | ForEach-Object { $_.Group[0] }
+}
+
+function Test-HandbookCheckout {
+  # Only a Git checkout of ospina-company/handbook in a folder named handbook
+  # counts: setup uses <workspace>\handbook, so that is the checkout it must
+  # have validated. A folder that merely has the right name is not enough.
+  param([string]$Path)
+  if (-not $Path) { return $false }
+  # Path strings, not Join-Path: Join-Path throws for a drive that is gone,
+  # and a stale record must not stop the search for a valid setup.
+  try {
+    $leaf = [IO.Path]::GetFileName($Path.TrimEnd('\', '/'))
+    if ($leaf -ne 'handbook') { return $false }
+    if (-not (Test-Path -LiteralPath ([IO.Path]::Combine($Path, '.git')))) { return $false }
+    if (-not (Test-Path -LiteralPath ([IO.Path]::Combine($Path, 'bootstrap.sh')))) { return $false }
+  } catch { return $false }
+  $origin = Invoke-Native-Capture git @('-C', $Path, 'config', '--get', 'remote.origin.url')
+  if (-not $origin) { return $false }
+  $origin = $origin.Trim().TrimEnd('/')
+  if ($origin.EndsWith('.git')) { $origin = $origin.Substring(0, $origin.Length - 4) }
+  return (@('https://github.com/ospina-company/handbook',
+            'git@github.com:ospina-company/handbook',
+            'ssh://git@github.com/ospina-company/handbook') -contains $origin)
+}
+function ConvertFrom-GitBashPath {
+  # /c/Ospina/handbook -> C:\Ospina\handbook. Anything else is returned as is.
+  param([string]$Path)
+  if ($Path -match '^/([A-Za-z])/(.*)$') {
+    return ('{0}:\{1}' -f $Matches[1].ToUpper(), ($Matches[2] -replace '/', '\'))
+  }
+  return $Path
+}
+function Find-ExistingHandbook {
+  # An existing setup, so a re-run updates it instead of asking where the
+  # workspace should go. Bootstrap records its location; older setups are found
+  # through the Git Bash profile it wrote, then the usual workspace folders.
+  $homes = @($env:HOME, $env:USERPROFILE) | Where-Object { $_ } | Select-Object -Unique
+  foreach ($h in $homes) {
+    $record = Join-Path $h '.config\ospina-handbook\bootstrap-state\handbook-dir'
+    if (Test-Path -LiteralPath $record) {
+      $p = Get-Content -LiteralPath $record -TotalCount 1 -ErrorAction SilentlyContinue
+      if ($p) { $p = ConvertFrom-GitBashPath $p.Trim() }
+      if (Test-HandbookCheckout $p) {
+        return [pscustomobject]@{ Path = $p; Source = 'recorded by an earlier setup' }
+      }
+    }
+  }
+  foreach ($h in $homes) {
+    $rc = Join-Path $h '.bashrc'
+    if (-not (Test-Path -LiteralPath $rc)) { continue }
+    foreach ($line in (Get-Content -LiteralPath $rc -ErrorAction SilentlyContinue)) {
+      if ($line -match "^export OSPINA_HANDBOOK='([^']+)'$") {
+        $p = ConvertFrom-GitBashPath $Matches[1]
+        if (Test-HandbookCheckout $p) {
+          return [pscustomobject]@{ Path = $p; Source = 'found in your Git Bash profile' }
+        }
+      }
+    }
+  }
+  foreach ($c in @(Get-WorkspaceCandidates)) {
+    $p = Join-Path $c.Path 'handbook'
+    if (Test-HandbookCheckout $p) {
+      return [pscustomobject]@{ Path = $p; Source = 'found in a standard location' }
+    }
+  }
+  return $null
+}
+function Test-BootstrapSupportsUpdate {
+  # A handbook that could not be pulled may predate --update, and an unknown
+  # option makes bootstrap.sh stop before doing anything.
+  param([string]$HandbookPath)
+  $script = Join-Path $HandbookPath 'bootstrap.sh'
+  if (-not (Test-Path -LiteralPath $script)) { return $false }
+  return [bool](Select-String -LiteralPath $script -SimpleMatch -Pattern '--update)' -Quiet)
 }
 
 function Invoke-OspinaInstall {
@@ -668,12 +744,25 @@ Step "Workspace location"
 # who has no idea what the constraints are.
 
 
+$existing = $null
+if (-not $env:OSPINA_WORKSPACE) { $existing = Find-ExistingHandbook }
+
 if ($env:OSPINA_WORKSPACE) {
   $ws = $env:OSPINA_WORKSPACE
   Say "  using OSPINA_WORKSPACE=$ws"
   # The env-var route must not skip the sync-folder check the menu applies.
   if (Test-SyncedPath $ws) {
     Die "OSPINA_WORKSPACE points inside a cloud-synced folder. Sync clients and git both write to .git and will corrupt the repositories. Choose a path outside OneDrive, Dropbox, Google Drive and Box."
+  }
+} elseif ($existing) {
+  $ws = Split-Path -Parent $existing.Path
+  Say "  found your existing setup at $ws ($($existing.Source))"
+  Say "  updating it: the handbook, tools, agent skills and repositories"
+  Say "  to set up somewhere else instead, set OSPINA_WORKSPACE and re-run" -ForegroundColor DarkGray
+  if (Test-SyncedPath $ws) {
+    Say "  WARNING: this workspace is inside a cloud-synced folder. Sync clients and git" -ForegroundColor Yellow
+    Say "  both write to .git and will eventually corrupt the repositories. Move it out" -ForegroundColor Yellow
+    Say "  of OneDrive, Dropbox, Google Drive and Box when you can." -ForegroundColor Yellow
   }
 } else {
   $cands = @(Get-WorkspaceCandidates)
@@ -721,6 +810,8 @@ if ($env:OSPINA_WORKSPACE) {
 New-Item -ItemType Directory -Force -Path $ws | Out-Null
 $ws = (Resolve-Path $ws).Path
 Say "  workspace: $ws"
+# Decided before the handbook step can create a checkout here.
+$isUpdate = Test-HandbookCheckout (Join-Path $ws 'handbook')
 
 Step "Handbook"
 $hb = Join-Path $ws 'handbook'
@@ -770,8 +861,13 @@ if ($tok) {
 
 # --no-login is belt and braces: even if the credential does not survive, the
 # child must never start a login it has no way to finish.
+$bootstrapArgs = '--no-login'
+if ($isUpdate) {
+  if (Test-BootstrapSupportsUpdate $hb) { $bootstrapArgs = '--no-login --update' }
+  else { Say "  this handbook predates updates; running the standard setup instead" }
+}
 try {
-  $rc = Invoke-Native $bash @('-lc', "sh '$hbUnix/bootstrap.sh' --no-login") -Interactive
+  $rc = Invoke-Native $bash @('-lc', "sh '$hbUnix/bootstrap.sh' $bootstrapArgs") -Interactive
 } finally {
   # Restore whatever the caller had. This script runs in their session, so
   # deleting a variable we did not set would be a side effect they never asked
