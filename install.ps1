@@ -373,9 +373,11 @@ function Find-ExistingHandbook {
   # An existing setup, so a re-run updates it instead of asking where the
   # workspace should go. Bootstrap records its location; older setups are found
   # through the Git Bash profile it wrote, then the usual workspace folders.
+  # Paths are joined as strings: HOME can name a drive that is gone, and
+  # Join-Path would throw and end the install.
   $homes = @($env:HOME, $env:USERPROFILE) | Where-Object { $_ } | Select-Object -Unique
   foreach ($h in $homes) {
-    $record = Join-Path $h '.config\ospina-handbook\bootstrap-state\handbook-dir'
+    $record = [IO.Path]::Combine($h, '.config\ospina-handbook\bootstrap-state\handbook-dir')
     if (Test-Path -LiteralPath $record) {
       $p = Get-Content -LiteralPath $record -TotalCount 1 -ErrorAction SilentlyContinue
       if ($p) { $p = ConvertFrom-GitBashPath $p.Trim() }
@@ -385,7 +387,7 @@ function Find-ExistingHandbook {
     }
   }
   foreach ($h in $homes) {
-    $rc = Join-Path $h '.bashrc'
+    $rc = [IO.Path]::Combine($h, '.bashrc')
     if (-not (Test-Path -LiteralPath $rc)) { continue }
     foreach ($line in (Get-Content -LiteralPath $rc -ErrorAction SilentlyContinue)) {
       if ($line -match "^export OSPINA_HANDBOOK='([^']+)'$") {
@@ -397,7 +399,7 @@ function Find-ExistingHandbook {
     }
   }
   foreach ($c in @(Get-WorkspaceCandidates)) {
-    $p = Join-Path $c.Path 'handbook'
+    $p = [IO.Path]::Combine($c.Path, 'handbook')
     if (Test-HandbookCheckout $p) {
       return [pscustomobject]@{ Path = $p; Source = 'found in a standard location' }
     }
