@@ -74,6 +74,7 @@ git -C "$T/other/custom" remote set-url origin https://github.com/ospina-company
 printf '%s\n' "$T/other/custom" > "$T/home/.config/ospina-handbook/bootstrap-state/handbook-dir"
 rm -f "$WS/handbook/args.txt"
 run_installer
+[ "$rc" -eq 0 ] || fail "run with an untrusted record exited $rc"
 grep -Fq "found your existing setup at $WS" "$T/out" || fail "an untrusted record displaced the real setup"
 [ ! -e "$T/other/args.txt" ] && [ ! -e "$T/other/custom/args.txt" ] || fail "an untrusted checkout ran"
 rm "$T/home/.config/ospina-handbook/bootstrap-state/handbook-dir"
@@ -82,9 +83,27 @@ rm "$T/home/.config/ospina-handbook/bootstrap-state/handbook-dir"
 make_origin "$T/origin.git" "$OLDER"
 rm -rf "$WS/handbook"
 OSPINA_WORKSPACE="$WS" run_installer
+[ "$rc" -eq 0 ] || fail "setup with an older bootstrap exited $rc"
 rm -f "$WS/handbook/args.txt"
 run_installer
+[ "$rc" -eq 0 ] || fail "re-run with an older bootstrap exited $rc"
 [ "$(cat "$WS/handbook/args.txt")" = "--no-login" ] || fail "an older bootstrap was given: $(cat "$WS/handbook/args.txt")"
 grep -Fq 'this handbook predates updates' "$T/out" || fail "the older-bootstrap fallback was not explained"
+
+# A bootstrap.sh that is a link to a script elsewhere is never run.
+mkdir -p "$T/elsewhere"
+printf '#!/bin/sh\ntouch "%s/ran"\n' "$T/elsewhere" > "$T/elsewhere/bootstrap.sh"
+mv "$WS/handbook/bootstrap.sh" "$T/real-bootstrap.sh"
+ln -s "$T/elsewhere/bootstrap.sh" "$WS/handbook/bootstrap.sh"
+handbook_ok_line=$(sed -n '/^handbook_checkout_ok()/,/^}/p' "$ROOT/install.sh")
+eval "$handbook_ok_line"
+if handbook_checkout_ok "$WS/handbook"; then fail "a linked bootstrap.sh was accepted"; fi
+rm "$WS/handbook/bootstrap.sh"; mv "$T/real-bootstrap.sh" "$WS/handbook/bootstrap.sh"
+
+# A workspace path with an apostrophe reaches bootstrap intact.
+WS2="$T/O'Brien/Ospina"
+OSPINA_WORKSPACE="$WS2" run_installer
+[ "$rc" -eq 0 ] || fail "a workspace with an apostrophe exited $rc"
+[ -f "$WS2/handbook/args.txt" ] || fail "bootstrap did not run in a workspace with an apostrophe"
 
 echo "install.sh re-runs update an existing setup without prompting"

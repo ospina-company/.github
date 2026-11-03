@@ -351,7 +351,10 @@ function Test-HandbookCheckout {
     $leaf = [IO.Path]::GetFileName($Path.TrimEnd('\', '/'))
     if ($leaf -ne 'handbook') { return $false }
     if (-not (Test-Path -LiteralPath ([IO.Path]::Combine($Path, '.git')))) { return $false }
-    if (-not (Test-Path -LiteralPath ([IO.Path]::Combine($Path, 'bootstrap.sh')))) { return $false }
+    $bootstrapItem = Get-Item -LiteralPath ([IO.Path]::Combine($Path, 'bootstrap.sh')) -Force -ErrorAction SilentlyContinue
+    if (-not $bootstrapItem) { return $false }
+    # A link could point anywhere. The script that runs must live in the checkout.
+    if ($bootstrapItem.Attributes -band [IO.FileAttributes]::ReparsePoint) { return $false }
   } catch { return $false }
   $origin = Invoke-Native-Capture git @('-C', $Path, 'config', '--get', 'remote.origin.url')
   if (-not $origin) { return $false }
@@ -869,7 +872,10 @@ if ($isUpdate) {
   else { Say "  this handbook predates updates; running the standard setup instead" }
 }
 try {
-  $rc = Invoke-Native $bash @('-lc', "sh '$hbUnix/bootstrap.sh' $bootstrapArgs") -Interactive
+  # The path reaches Bash inside single quotes. A discovered path comes from a
+  # file, so close and reopen the quotes around any apostrophe in it.
+  $hbQuoted = $hbUnix -replace "'", "'\''"
+  $rc = Invoke-Native $bash @('-lc', "sh '$hbQuoted/bootstrap.sh' $bootstrapArgs") -Interactive
 } finally {
   # Restore whatever the caller had. This script runs in their session, so
   # deleting a variable we did not set would be a side effect they never asked
