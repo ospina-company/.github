@@ -371,7 +371,12 @@ jobs:
         run: |
           set -eu
           eval "$(sed -n '/^handbook_checkout_ok()/,/^}/p' install.sh)"
+          eval "$(sed -n '/^physical_dir()/p' install.sh)"
+          eval "$(sed -n '/^try_handbook()/,/^}/p' install.sh)"
           eval "$(sed -n '/^find_existing_handbook()/,/^}/p' install.sh)"
+          for f in handbook_checkout_ok physical_dir try_handbook find_existing_handbook; do
+            command -v "$f" >/dev/null || { echo "::error::install.sh no longer defines $f"; exit 1; }
+          done
           HOME="$RUNNER_TEMP/home"
           export HOME
           unset OSPINA_HANDBOOK || true
