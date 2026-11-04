@@ -4,9 +4,9 @@ name: Installer smoke test
 # the only reason we can afford to test on a real Windows runner at all.
 on:
   push:
-    paths: [ 'install.ps1', 'install.sh', 'preflight.ps1', '.github/workflows/installer-smoke.yml' ]
+    paths: [ 'install.ps1', 'install.sh', 'preflight.ps1', '.github/tests/**', '.github/workflows/installer-smoke.yml' ]
   pull_request:
-    paths: [ 'install.ps1', 'install.sh', 'preflight.ps1' ]
+    paths: [ 'install.ps1', 'install.sh', 'preflight.ps1', '.github/tests/**', '.github/workflows/installer-smoke.yml' ]
   workflow_dispatch:
 
 # Least privilege: this workflow only reads the repository.
@@ -249,6 +249,75 @@ jobs:
           }
           Write-Host "proved: -Interactive streams to the console, non-interactive does not"
 
+      - name: An existing setup is found and updated, never re-prompted
+        shell: powershell
+        run: |
+          $ast = [System.Management.Automation.Language.Parser]::ParseFile(
+                   (Resolve-Path install.ps1), [ref]$null, [ref]$null)
+          $OSPINA_HALT = '[ospina-halt] '
+          foreach ($f in $ast.FindAll({
+            $args[0] -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true)) {
+            Invoke-Expression $f.Extent.Text
+          }
+          $ErrorActionPreference = 'Stop'
+          function Fail($m) { Write-Host "::error::$m"; exit 1 }
+
+          $root = Join-Path $env:RUNNER_TEMP 'discovery'
+          $env:USERPROFILE = Join-Path $root 'home'
+          Remove-Item Env:\HOME -ErrorAction SilentlyContinue
+          $hb = Join-Path $root 'ws\handbook'
+          New-Item -ItemType Directory -Force -Path $env:USERPROFILE, $hb | Out-Null
+          $null = Invoke-Native git @('init', '-q', $hb)
+          Set-Content -LiteralPath (Join-Path $hb 'bootstrap.sh') -Value '    --update) UPDATE=1 ;;'
+
+          if (Find-ExistingHandbook) { Fail 'found a setup that does not exist' }
+
+          # A checkout of some other repository named handbook is not a setup.
+          $null = Invoke-Native git @('-C', $hb, 'remote', 'add', 'origin', 'https://github.com/someone-else/handbook.git')
+          $unix = '/' + $hb.Substring(0, 1).ToLower() + ($hb.Substring(2) -replace '\\', '/')
+          Set-Content -LiteralPath (Join-Path $env:USERPROFILE '.bashrc') -Value ("export OSPINA_HANDBOOK='{0}'" -f $unix)
+          if (Find-ExistingHandbook) { Fail 'accepted a checkout of another repository' }
+
+          # Setups made before bootstrap recorded its location: the profile.
+          $null = Invoke-Native git @('-C', $hb, 'remote', 'set-url', 'origin', 'https://github.com/ospina-company/handbook.git')
+          $found = Find-ExistingHandbook
+          if (-not $found -or $found.Path -ne $hb) { Fail "profile route returned '$($found.Path)'" }
+
+          # A HOME naming a drive that is gone must not end the search.
+          $env:HOME = 'Q:\gone'
+          $found = Find-ExistingHandbook
+          if (-not $found -or $found.Path -ne $hb) { Fail "a missing HOME drive broke discovery: '$($found.Path)'" }
+          Remove-Item Env:\HOME
+
+          # The location bootstrap records.
+          Remove-Item -LiteralPath (Join-Path $env:USERPROFILE '.bashrc')
+          $state = Join-Path $env:USERPROFILE '.config\ospina-handbook\bootstrap-state'
+          New-Item -ItemType Directory -Force -Path $state | Out-Null
+          Set-Content -LiteralPath (Join-Path $state 'handbook-dir') -Value $hb
+          $found = Find-ExistingHandbook
+          if (-not $found -or $found.Path -ne $hb -or $found.Source -notmatch 'recorded') {
+            Fail "recorded route returned '$($found.Path)' ($($found.Source))"
+          }
+
+          # --update is passed only to a bootstrap that understands it.
+          if (-not (Test-BootstrapSupportsUpdate $hb)) { Fail 'a current bootstrap was not offered --update' }
+          Set-Content -LiteralPath (Join-Path $hb 'bootstrap.sh') -Value 'an older bootstrap'
+          if (Test-BootstrapSupportsUpdate $hb) { Fail 'an older bootstrap would be given --update' }
+          Write-Host 'existing setups are found by record and by profile; other checkouts are not'
+          # Every failure above exits through Fail. The runner's wrapper would
+          # otherwise exit with the last native command's status, and the
+          # discovery helper's early-stopping git capture can leave that non-zero.
+          exit 0
+
+      - name: A re-run updates an existing setup end to end
+        shell: powershell
+        run: |
+          # Runs install.ps1 as iex does, with stub GitHub, WinGet and agents,
+          # and asserts the arguments bootstrap.sh actually receives.
+          & .\.github\tests\install-ps1-handoff.ps1
+          # The suite throws on any failure; reaching here is a pass.
+          exit 0
+
       - name: Windows path conversion is correct
         shell: powershell
         run: |
@@ -297,3 +366,39 @@ jobs:
           echo "all installers in install.sh stream their output"
           sudo apt-get update -qq && sudo apt-get install -y shellcheck -qq
           shellcheck -S warning install.sh || true
+
+      - name: An existing setup is found and updated, never re-prompted
+        run: |
+          set -eu
+          eval "$(sed -n '/^handbook_checkout_ok()/,/^}/p' install.sh)"
+          eval "$(sed -n '/^physical_dir()/p' install.sh)"
+          eval "$(sed -n '/^try_handbook()/,/^}/p' install.sh)"
+          eval "$(sed -n '/^find_existing_handbook()/,/^}/p' install.sh)"
+          for f in handbook_checkout_ok physical_dir try_handbook find_existing_handbook; do
+            command -v "$f" >/dev/null || { echo "::error::install.sh no longer defines $f"; exit 1; }
+          done
+          HOME="$RUNNER_TEMP/home"
+          export HOME
+          unset OSPINA_HANDBOOK || true
+          mkdir -p "$HOME"
+          hb="$RUNNER_TEMP/ws/handbook"
+          git init -q "$hb"
+          printf '    --update) UPDATE=1 ;;\n' > "$hb/bootstrap.sh"
+          if find_existing_handbook >/dev/null; then
+            echo "::error::found a setup that does not exist"; exit 1
+          fi
+          git -C "$hb" remote add origin https://github.com/someone-else/handbook.git
+          printf "export OSPINA_HANDBOOK='%s'\n" "$hb" > "$HOME/.zshrc"
+          if find_existing_handbook >/dev/null; then
+            echo "::error::accepted a checkout of another repository"; exit 1
+          fi
+          git -C "$hb" remote set-url origin https://github.com/ospina-company/handbook.git
+          [ "$(find_existing_handbook)" = "$hb" ] || { echo "::error::profile route failed"; exit 1; }
+          rm "$HOME/.zshrc"
+          mkdir -p "$HOME/.config/ospina-handbook/bootstrap-state"
+          printf '%s\n' "$hb" > "$HOME/.config/ospina-handbook/bootstrap-state/handbook-dir"
+          [ "$(find_existing_handbook)" = "$hb" ] || { echo "::error::recorded route failed"; exit 1; }
+          echo "existing setups are found by record and by profile; other checkouts are not"
+
+      - name: A re-run updates an existing setup end to end
+        run: bash .github/tests/install-sh-handoff.sh

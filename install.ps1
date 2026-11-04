@@ -7,6 +7,8 @@
 # Bash that Git for Windows installs.
 #
 # Read before running. Safe to re-run: every step checks before it acts.
+# Once you are set up, re-running finds your workspace and updates it: the
+# handbook, tools, agent skills and repositories.
 
 # Saved and restored in the wrapper: this evaluates in the caller's session,
 # so leaving their preference changed is a side effect they did not ask for.
@@ -335,6 +337,94 @@ function Get-WorkspaceCandidates {
       Add-Candidate ("{0}:\Ospina" -f $_.Name) ("more free space ({0:N0} GB)" -f ($_.Free/1GB)) 15
     }
   $script:cands | Sort-Object Rank, Path | Group-Object Path | ForEach-Object { $_.Group[0] }
+}
+
+function Test-HandbookCheckout {
+  # Only a Git checkout of ospina-company/handbook in a folder named handbook
+  # counts: setup uses <workspace>\handbook, so that is the checkout it must
+  # have validated. A folder that merely has the right name is not enough.
+  param([string]$Path)
+  if (-not $Path) { return $false }
+  # A trailing separator makes a linked folder look like its target.
+  $Path = $Path.TrimEnd('\', '/')
+  if (-not $Path) { return $false }
+  # Path strings, not Join-Path: Join-Path throws for a drive that is gone,
+  # and a stale record must not stop the search for a valid setup.
+  try {
+    $leaf = [IO.Path]::GetFileName($Path.TrimEnd('\', '/'))
+    if ($leaf -ne 'handbook') { return $false }
+    # A linked or junctioned handbook folder could point at any checkout.
+    $dirItem = Get-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
+    if (-not $dirItem -or -not $dirItem.PSIsContainer) { return $false }
+    if ($dirItem.Attributes -band [IO.FileAttributes]::ReparsePoint) { return $false }
+    if (-not (Test-Path -LiteralPath ([IO.Path]::Combine($Path, '.git')))) { return $false }
+    $bootstrapItem = Get-Item -LiteralPath ([IO.Path]::Combine($Path, 'bootstrap.sh')) -Force -ErrorAction SilentlyContinue
+    if (-not $bootstrapItem) { return $false }
+    # A link could point anywhere. The script that runs must live in the checkout.
+    if ($bootstrapItem.Attributes -band [IO.FileAttributes]::ReparsePoint) { return $false }
+  } catch { return $false }
+  $origin = Invoke-Native-Capture git @('-C', $Path, 'config', '--get', 'remote.origin.url')
+  if (-not $origin) { return $false }
+  $origin = $origin.Trim().TrimEnd('/')
+  if ($origin.EndsWith('.git')) { $origin = $origin.Substring(0, $origin.Length - 4) }
+  return (@('https://github.com/ospina-company/handbook',
+            'git@github.com:ospina-company/handbook',
+            'ssh://git@github.com/ospina-company/handbook') -contains $origin)
+}
+function ConvertFrom-GitBashPath {
+  # /c/Ospina/handbook -> C:\Ospina\handbook. Anything else is returned as is.
+  param([string]$Path)
+  if ($Path -match '^/([A-Za-z])/(.*)$') {
+    return ('{0}:\{1}' -f $Matches[1].ToUpper(), ($Matches[2] -replace '/', '\'))
+  }
+  return $Path
+}
+function Find-ExistingHandbook {
+  # An existing setup, so a re-run updates it instead of asking where the
+  # workspace should go. Bootstrap records its location; older setups are found
+  # through the Git Bash profile it wrote, then the usual workspace folders.
+  # Paths are joined as strings: HOME can name a drive that is gone, and
+  # Join-Path would throw and end the install.
+  $homes = @($env:HOME, $env:USERPROFILE) | Where-Object { $_ } | Select-Object -Unique
+  foreach ($h in $homes) {
+    $record = [IO.Path]::Combine($h, '.config\ospina-handbook\bootstrap-state\handbook-dir')
+    if (Test-Path -LiteralPath $record) {
+      # Bootstrap writes UTF-8 without a BOM; Windows PowerShell 5.1 would read ANSI.
+      $p = Get-Content -LiteralPath $record -TotalCount 1 -Encoding UTF8 -ErrorAction SilentlyContinue
+      if ($p) { $p = (ConvertFrom-GitBashPath $p.Trim()).TrimEnd('\', '/') }
+      if (Test-HandbookCheckout $p) {
+        return [pscustomobject]@{ Path = $p; Source = 'recorded by an earlier setup' }
+      }
+    }
+  }
+  foreach ($h in $homes) {
+    $rc = [IO.Path]::Combine($h, '.bashrc')
+    if (-not (Test-Path -LiteralPath $rc)) { continue }
+    foreach ($line in (Get-Content -LiteralPath $rc -Encoding UTF8 -ErrorAction SilentlyContinue)) {
+      # Bootstrap single-quotes the path and writes an apostrophe as '\''.
+      if ($line -match "^export OSPINA_HANDBOOK='(.+)'$") {
+        $p = (ConvertFrom-GitBashPath ($Matches[1].Replace("'\''", "'"))).TrimEnd('\', '/')
+        if (Test-HandbookCheckout $p) {
+          return [pscustomobject]@{ Path = $p; Source = 'found in your Git Bash profile' }
+        }
+      }
+    }
+  }
+  foreach ($c in @(Get-WorkspaceCandidates)) {
+    $p = [IO.Path]::Combine($c.Path, 'handbook')
+    if (Test-HandbookCheckout $p) {
+      return [pscustomobject]@{ Path = $p; Source = 'found in a standard location' }
+    }
+  }
+  return $null
+}
+function Test-BootstrapSupportsUpdate {
+  # A handbook that could not be pulled may predate --update, and an unknown
+  # option makes bootstrap.sh stop before doing anything.
+  param([string]$HandbookPath)
+  $script = Join-Path $HandbookPath 'bootstrap.sh'
+  if (-not (Test-Path -LiteralPath $script)) { return $false }
+  return [bool](Select-String -LiteralPath $script -SimpleMatch -Pattern '--update)' -Quiet)
 }
 
 function Invoke-OspinaInstall {
@@ -668,12 +758,25 @@ Step "Workspace location"
 # who has no idea what the constraints are.
 
 
+$existing = $null
+if (-not $env:OSPINA_WORKSPACE) { $existing = Find-ExistingHandbook }
+
 if ($env:OSPINA_WORKSPACE) {
   $ws = $env:OSPINA_WORKSPACE
   Say "  using OSPINA_WORKSPACE=$ws"
   # The env-var route must not skip the sync-folder check the menu applies.
   if (Test-SyncedPath $ws) {
     Die "OSPINA_WORKSPACE points inside a cloud-synced folder. Sync clients and git both write to .git and will corrupt the repositories. Choose a path outside OneDrive, Dropbox, Google Drive and Box."
+  }
+} elseif ($existing) {
+  $ws = Split-Path -Parent $existing.Path
+  Say "  found your existing setup at $ws ($($existing.Source))"
+  Say "  updating it: the handbook, tools, agent skills and repositories"
+  Say "  to set up somewhere else instead, set OSPINA_WORKSPACE and re-run" -ForegroundColor DarkGray
+  if (Test-SyncedPath $ws) {
+    Say "  WARNING: this workspace is inside a cloud-synced folder. Sync clients and git" -ForegroundColor Yellow
+    Say "  both write to .git and will eventually corrupt the repositories. Move it out" -ForegroundColor Yellow
+    Say "  of OneDrive, Dropbox, Google Drive and Box when you can." -ForegroundColor Yellow
   }
 } else {
   $cands = @(Get-WorkspaceCandidates)
@@ -718,13 +821,27 @@ if ($env:OSPINA_WORKSPACE) {
   }
 }
 
-New-Item -ItemType Directory -Force -Path $ws | Out-Null
-$ws = (Resolve-Path $ws).Path
+# Literal paths from here on: PowerShell reads [ and ] in -Path as wildcards,
+# so C:\Work\[a] could otherwise resolve to C:\Work\a.
+# .NET resolves a relative path against the process directory, not PowerShell's
+# location, so make it absolute first.
+$ws = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($ws)
+$null = [IO.Directory]::CreateDirectory($ws)
+$ws = (Resolve-Path -LiteralPath $ws).Path
 Say "  workspace: $ws"
+# Decided before the handbook step can create a checkout here.
+$isUpdate = Test-HandbookCheckout (Join-Path $ws 'handbook')
+# The checkout discovery validated must be the one that runs.
+if ($existing) {
+  $found = (Resolve-Path -LiteralPath $existing.Path).Path.TrimEnd('\')
+  if ($found -ne (Join-Path $ws 'handbook').TrimEnd('\') -or -not $isUpdate) {
+    Die "The handbook found at $($existing.Path) is not the one at $(Join-Path $ws 'handbook').`nSet OSPINA_WORKSPACE to the folder that contains your handbook and re-run."
+  }
+}
 
 Step "Handbook"
 $hb = Join-Path $ws 'handbook'
-if (Test-Path (Join-Path $hb '.git')) {
+if (Test-Path -LiteralPath (Join-Path $hb '.git')) {
   Say "  ok       already cloned, updating"
   $null = Invoke-Native git @('-C',$hb,'pull','-q','--ff-only')
 } else {
@@ -738,7 +855,7 @@ if (Test-Path (Join-Path $hb '.git')) {
 Step "Running bootstrap"
 Say ""
 # Convert C:\Ospina\handbook to /c/Ospina/handbook for Git Bash.
-$full = (Resolve-Path $hb).Path
+$full = (Resolve-Path -LiteralPath $hb).Path
 # Git Bash addresses drives as /c/..., so a UNC path has no representation here
 # and the conversion below would silently produce nonsense.
 if ($full -notmatch '^[A-Za-z]:\\') {
@@ -770,8 +887,16 @@ if ($tok) {
 
 # --no-login is belt and braces: even if the credential does not survive, the
 # child must never start a login it has no way to finish.
+$bootstrapArgs = '--no-login'
+if ($isUpdate) {
+  if (Test-BootstrapSupportsUpdate $hb) { $bootstrapArgs = '--no-login --update' }
+  else { Say "  this handbook predates updates; running the standard setup instead" }
+}
 try {
-  $rc = Invoke-Native $bash @('-lc', "sh '$hbUnix/bootstrap.sh' --no-login") -Interactive
+  # The path reaches Bash inside single quotes. A discovered path comes from a
+  # file, so close and reopen the quotes around any apostrophe in it.
+  $hbQuoted = $hbUnix -replace "'", "'\''"
+  $rc = Invoke-Native $bash @('-lc', "sh '$hbQuoted/bootstrap.sh' $bootstrapArgs") -Interactive
 } finally {
   # Restore whatever the caller had. This script runs in their session, so
   # deleting a variable we did not set would be a side effect they never asked
