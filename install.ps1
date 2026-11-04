@@ -831,6 +831,13 @@ $ws = (Resolve-Path -LiteralPath $ws).Path
 Say "  workspace: $ws"
 # Decided before the handbook step can create a checkout here.
 $isUpdate = Test-HandbookCheckout (Join-Path $ws 'handbook')
+# The checkout discovery validated must be the one that runs.
+if ($existing) {
+  $found = (Resolve-Path -LiteralPath $existing.Path).Path.TrimEnd('\')
+  if ($found -ne (Join-Path $ws 'handbook').TrimEnd('\') -or -not $isUpdate) {
+    Die "The handbook found at $($existing.Path) is not the one at $(Join-Path $ws 'handbook').`nSet OSPINA_WORKSPACE to the folder that contains your handbook and re-run."
+  }
+}
 
 Step "Handbook"
 $hb = Join-Path $ws 'handbook'

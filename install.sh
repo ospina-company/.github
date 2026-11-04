@@ -42,33 +42,36 @@ handbook_checkout_ok() {
   return 1
 }
 
+# The physical location of a directory, with every link and .. resolved.
+physical_dir() { (CDPATH='' cd -P -- "$1" 2>/dev/null && pwd -P); }
+
+# A candidate counts only as its physical path, so the checkout validated here
+# is the one that runs: a link or .. in a recorded path cannot validate one
+# folder while the shell later resolves another.
+try_handbook() {
+  _candidate=$(printf '%s' "${1:-}" | sed 's|/*$||')
+  [ -n "$_candidate" ] && [ ! -L "$_candidate" ] || return 1
+  _physical=$(physical_dir "$_candidate") || return 1
+  handbook_checkout_ok "$_physical" || return 1
+  printf '%s\n' "$_physical"
+}
+
 # Where an earlier setup put the handbook: the location bootstrap records, the
 # variable it exports, the profiles it wrote, then the usual workspace folders.
 find_existing_handbook() {
   _record="$HOME/.config/ospina-handbook/bootstrap-state/handbook-dir"
-  if [ -f "$_record" ]; then
-    _found=$(sed -n '1p' "$_record" | sed 's|/*$||')
-    if handbook_checkout_ok "$_found"; then printf '%s\n' "$_found"; return 0; fi
-  fi
-  _found=$(printf '%s' "${OSPINA_HANDBOOK:-}" | sed 's|/*$||')
-  if handbook_checkout_ok "$_found"; then printf '%s\n' "$_found"; return 0; fi
+  if [ -f "$_record" ] && try_handbook "$(sed -n '1p' "$_record")"; then return 0; fi
+  try_handbook "${OSPINA_HANDBOOK:-}" && return 0
   for _profile in "$HOME/.zshrc" "$HOME/.bashrc" "$HOME/.bash_profile" "$HOME/.profile"; do
     [ -f "$_profile" ] || continue
     # Bootstrap single-quotes the path and writes an apostrophe as '\''.
-    _found=$(sed -n "s/^export OSPINA_HANDBOOK='\(.*\)'\$/\1/p" "$_profile" | head -n 1 |
-      sed -e "s/'\\\\''/'/g" -e 's|/*$||')
-    if handbook_checkout_ok "$_found"; then printf '%s\n' "$_found"; return 0; fi
+    try_handbook "$(sed -n "s/^export OSPINA_HANDBOOK='\(.*\)'\$/\1/p" "$_profile" | head -n 1 |
+      sed "s/'\\\\''/'/g")" && return 0
   done
   for _dir in Software/Projects Projects projects Developer dev code repos git src; do
-    if handbook_checkout_ok "$HOME/$_dir/Ospina/handbook"; then
-      printf '%s\n' "$HOME/$_dir/Ospina/handbook"
-      return 0
-    fi
+    try_handbook "$HOME/$_dir/Ospina/handbook" && return 0
   done
-  if handbook_checkout_ok "$HOME/Ospina/handbook"; then
-    printf '%s\n' "$HOME/Ospina/handbook"
-    return 0
-  fi
+  try_handbook "$HOME/Ospina/handbook" && return 0
   return 1
 }
 
@@ -338,6 +341,11 @@ esac
 mkdir -p "$WS"
 WS=$(CDPATH= cd -- "$WS" && pwd)
 say "  workspace: $WS"
+# The checkout discovery validated must be the one that runs.
+if [ -n "${EXISTING_HANDBOOK:-}" ] && [ "$(physical_dir "$WS/handbook")" != "$EXISTING_HANDBOOK" ]; then
+  die "The handbook found at $EXISTING_HANDBOOK is not the one at $WS/handbook.
+  Set OSPINA_WORKSPACE to the folder that contains your handbook and re-run."
+fi
 # Decided before the handbook step can create a checkout here.
 IS_UPDATE=0
 handbook_checkout_ok "$WS/handbook" && IS_UPDATE=1
