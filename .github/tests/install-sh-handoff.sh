@@ -6,7 +6,7 @@
 set -euo pipefail
 
 ROOT=$(CDPATH='' cd -- "$(dirname -- "$0")/../.." && pwd)
-T=$(mktemp -d)
+T=$(cd "$(mktemp -d)" && pwd -P)
 trap 'rm -rf "$T"' EXIT
 fail() { echo "FAIL: $*" >&2; sed 's/^/  | /' "$T/out" >&2 || true; exit 1; }
 
@@ -120,5 +120,22 @@ mkdir -p "$T/linked"
 ln -s "$WS2/handbook" "$T/linked/handbook"
 if handbook_checkout_ok "$T/linked/handbook"; then fail "a linked handbook folder was accepted"; fi
 if handbook_checkout_ok "$T/linked/handbook/"; then fail "a trailing slash let a linked handbook folder through"; fi
+
+# A recorded path that reaches the handbook through a link and .. is taken at
+# its physical location, so the checkout validated is the checkout that runs.
+mkdir -p "$T/real/child" "$T/other"
+git clone -q "$T/origin.git" "$T/real/handbook"
+git -C "$T/real/handbook" remote set-url origin https://github.com/ospina-company/handbook.git
+git -C "$T/real/handbook" config url."$T/origin.git".insteadOf https://github.com/ospina-company/handbook.git
+mkdir -p "$T/other/handbook"
+printf '#!/bin/sh\ntouch "%s/untrusted-ran"\n' "$T" > "$T/other/handbook/bootstrap.sh"
+ln -s "$T/real/child" "$T/other/jump"
+rm -f "$T/home/.zshrc"
+printf '%s\n' "$T/other/jump/../handbook" > "$T/home/.config/ospina-handbook/bootstrap-state/handbook-dir"
+run_installer
+[ ! -e "$T/untrusted-ran" ] || fail "a link and .. ran a checkout other than the validated one"
+[ -f "$T/real/handbook/args.txt" ] || fail "the validated checkout did not run: $(cat "$T/out")"
+[ "$(cat "$T/real/handbook/args.txt")" = "--no-login --update" ] || fail "the validated checkout was not updated"
+rm "$T/home/.config/ospina-handbook/bootstrap-state/handbook-dir"
 
 echo "install.sh re-runs update an existing setup without prompting"
